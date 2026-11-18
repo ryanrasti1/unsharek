@@ -515,15 +515,17 @@ pub struct Config {
 }
 
 /// The images the guest mounts for `config`'s program and allowed paths, built where the cache
-/// lacks them. Host-side, before lockdown; nothing is opened or mapped yet.
+/// lacks them (the closure too is cached there: [`store::Cache::closure`]). Host-side, before
+/// lockdown; nothing is opened or mapped yet.
 pub fn store(config: &Config) -> Result<store::Store, Error> {
     let program = config.argv.first().ok_or(Error::NoProgram)?;
-    let closure = store::closure(Path::new(program), &config.allow_paths)?;
     let dir = match &config.image_cache {
         Some(dir) => dir.clone(),
         None => store::Cache::default_dir()?,
     };
-    Ok(store::Cache::new(&dir).images(&closure)?)
+    let cache = store::Cache::new(&dir);
+    let closure = cache.closure(Path::new(program), &config.allow_paths)?;
+    Ok(cache.images(&closure)?)
 }
 
 /// Become the sandbox: [`Sandbox::boot`], the closure's images (and `config.images`) mapped,
