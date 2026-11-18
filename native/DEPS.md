@@ -28,21 +28,16 @@ release build ~3.4 s. Nearly all of it is clap; object's code in the binary is ~
 | thiserror 2 | the library's error type | library | none at run time (a derive) |
 | tempfile 3 | scratch trees and images | test | test-only |
 
-## exobox-rt (2026-11-18): the syscall table (native/rt: sysmap, xabi)
-No new runtime dependency; the table is ~7.5 KB of routes plus its names.
+## exobox-rt (2026-11-18): the in-sandbox runtime (native/rt)
+Not linked into a binary yet, so no size to measure. 3 crates in the normal dependency tree; cold
+release build ~2.9 s (nearly all rustix and linux-raw-sys). The syscall table (sysmap) is ~7.5 KB
+of routes plus its names.
 
 | Crate | For | Where | Cost noted |
 |---|---|---|---|
-| libc 0.2 | x86-64 struct layouts (`stat`, `statfs`, `epoll_event`, `utsname`) and constants the translations are checked against | test | test-only (already in the tree for the suite) |
+| rustix 1 (no default features; thread, mm) | raw Linux syscalls, no libc: no_new_privs before the filter's install (seccomp itself is one inline `syscall`: rustix has no wrapper), `mprotect` for the coroutine stacks' guard pages | library | only the calls used are linked; pulls bitflags and linux-raw-sys (constants) |
+| libc 0.2 | x86-64 struct layouts and constants the translations are checked against; fork/waitpid for the filter's kernel test | test | test-only (already in the tree for the suite) |
 
 Tools in the devshell (not linked): cargo-nextest (per-test processes and timeouts), erofs-utils
 (store images for programs outside the store; `fsck.erofs`/`dump.erofs` are the test oracle for
 native/erofs).
-
-## exobox-rt (2026-11-18): the in-sandbox runtime (native/rt)
-no_std, no allocation. Its size is measured once it's linked into `exobox`.
-
-| Crate | For | Where | Cost noted |
-|---|---|---|---|
-| rustix 1 (`thread`) | raw Linux syscalls; `thread` for prctl(PR_SET_NO_NEW_PRIVS) before the filter's install (`filter.rs`; seccomp itself is one inline `syscall`, as rustix has no wrapper) | library | `thread` adds linux-raw-sys's prctl constants only |
-| libc 0.2 | fork and waitpid: the filter's real-kernel test | test | test-only (already in the workspace) |

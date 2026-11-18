@@ -13,6 +13,12 @@
 //!   (`filter`) allows from the gate.
 #![cfg_attr(not(test), no_std)]
 
+pub mod context;
 pub mod filter;
+pub mod futex;
+pub mod sched;
+pub mod sync;
 pub mod sysmap;
 pub mod xabi;
+#[cfg(test)]
+mod testutil;

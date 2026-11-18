@@ -8,8 +8,9 @@ license.workspace = true
 publish = false
 
 [dependencies]
-# thread: prctl(PR_SET_NO_NEW_PRIVS) before installing the filter
-rustix = { workspace = true, features = ["thread"] }
+# thread: prctl(PR_SET_NO_NEW_PRIVS) before installing the filter; mm: mprotect for the
+# coroutine stacks' guard pages (sched)
+rustix = { workspace = true, features = ["thread", "mm"] }
 
 [dev-dependencies]
 # fork and waitpid for the filter's real-kernel test; struct layouts and constants checked
