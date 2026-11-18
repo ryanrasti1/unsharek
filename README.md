@@ -117,7 +117,13 @@ that mounts `/dev/exobox/<name>` with `mount(2)` and execs the next one).
    a read-write block device served over a channel (a new kernel driver: Nix's `/nix/var` on
    ext4); FUSE in the store's kernel (a config fragment); the streaming image builder (item 7) to
    the API in capnix's `spikes/storefs/README.md`.
-9. Custom kernels, at build time: the kernel as its own Nix build (`lib.exoboxKernel { src, config }`:
+9. Network through a capability (capnix's "Two connections"): the runtime holds a second
+   connection (a host fd, not a guest fd) bootstrapped like the program's, and serves `AF_INET`
+   sockets from it: `connect` becomes a stream pumped to an LKL socketpair end in place of the
+   program's fd, names resolve through it. Behind a small provider trait in the runtime (connect,
+   resolve), so the core stays protocol-free; the connection carries no more authority than the
+   program's own, since the program can reach it.
+10. Custom kernels, at build time: the kernel as its own Nix build (`lib.exoboxKernel { src, config }`:
    a source and a config fragment over `lkl/defconfig`, for more drivers or filesystems; LKL has
    no loadable modules), and `lib.mkExobox { kernel }` for an exobox built with it. In development,
    `EXOBOX_LKL_SRC` and `EXOBOX_LKL_CONFIG` (a fragment) select them.
