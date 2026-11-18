@@ -63,7 +63,9 @@ IPv6, no filesystems but ramfs, proc, devpts and erofs, a 16 MB pool.
   lockdown and per fork; no kernel change.
 
 ## Building
-Built out of tree by `make` (incremental; the cold build is about a minute), from a checkout of
-the branch (flake input `linux`, overridable to a local worktree for kernel work). `liblkl.a`
-is linked into the `exobox` binary; only the kernel object is used, not `tools/lkl/lib`: exobox
-provides the host ops itself.
+Built out of tree by `make` (`lkl/Makefile`, into `target/lkl`; incremental, the cold build ~20 s
+on 24 cores), from a checkout of the branch: `EXOBOX_LKL_SRC` (default `/home/ryan/src/lkl-exobox`)
+during development, the flake input `linux` for the final `nix build` (to be enabled once the branch
+is pushed). `native/lkl-sys` runs the make from its build.rs and links the kernel object alone
+(`liblkl-kernel.a`, tools/lkl's `lib/lkl.o`), not `tools/lkl/lib`: exobox provides the host ops
+itself. The stock posix host (`liblkl-posix.a`) is linked only by lkl-sys's smoke test.

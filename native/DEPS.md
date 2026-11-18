@@ -41,3 +41,31 @@ of routes plus its names.
 Tools in the devshell (not linked): cargo-nextest (per-test processes and timeouts), erofs-utils
 (store images for programs outside the store; `fsck.erofs`/`dump.erofs` are the test oracle for
 native/erofs).
+
+## The kernel and lkl-sys (2026-11-18): LKL linked in (native/lkl-sys, lkl/)
+Measured on stock LKL (`d0f76a77e`, Linux 6.12) with `lkl/defconfig`, GCC 16.2, 24 cores.
+
+- **Kernel object** (`liblkl-kernel.a`, tools/lkl's `lib/lkl.o`): 3.48 MB text, 2.42 MB data,
+  0.26 MB bss: ~5.9 MB added to any binary that links it. The largest pieces of data:
+  `irq_desc`, 0.97 MB (NR_IRQS = 4096 descriptors of 248 bytes, static: the series' item 14 makes
+  it a knob), and printk's static ring (0.35 MB).
+  It needs nothing from libc: only `lkl_printf` and `lkl_bug`, which lkl-sys's shim.c defines
+  (vsnprintf into a stack buffer, handed to the binary's `exobox_lkl_print`/`exobox_lkl_panic`).
+  Built with `-Wa,-mrelax-relocations=no` (no relaxable GOT relocations: the tier A mis-relaxed GOT
+  push can't happen, and binaries need no `--no-relax`) and given back its `.note.GNU-stack`, so
+  no link flags are needed. A change to the kernel's flags rebuilds it all (~45 s under load).
+- **Cold kernel build**: ~20 s wall (3.5 min CPU), by make or through cargo (build.rs passes cargo's
+  jobserver). **No-op make**: ~3.5 s (kbuild walking its tree); build.rs only runs it when lkl/,
+  wrapper.h or the kernel's source changed, so a warm `./test` doesn't pay it (a no-op
+  `cargo build` stays ~0.1 s, the source tree's mtimes scanned by cargo).
+- `./test -E 'package(lkl-sys)'` warm: ~0.7 s (the boot to halt takes ~35 ms; objdump of the test
+  binary ~0.5 s; readelf of lkl.o's relocations, the shim's test: fractions of that).
+
+| Crate | For | Where | Cost noted |
+|---|---|---|---|
+| cc 1 | compiles shim.c (`lkl_printf`, `lkl_bug`) | lkl-sys's build.rs | ~1 KB of code; already in the tree (fixtures) |
+| bindgen 0.73 (runtime only: no logging, no prettyplease) | Rust declarations from lkl.h: the host-operations table, the entry points, `__lkl__NR_*` | lkl-sys's build.rs | none at run time. Build: ~4.5 s of its dependency chain (syn, clang-sys, regex, nom, cexpr) on a cold build, in parallel with the rest; ~0.3 s to generate the bindings each time build.rs runs. Needs libclang at build time (devshell: `rustPlatform.bindgenHook`) |
+
+Tools in the devshell (not linked): libclang via `rustPlatform.bindgenHook` (sets `LIBCLANG_PATH` and
+`BINDGEN_EXTRA_CLANG_ARGS`; changing flake.nix refreshes devshell.sh's cached environment by
+itself); objdump (binutils, already in the stdenv) for the `addr32 call` check.
