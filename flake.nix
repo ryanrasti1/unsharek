@@ -48,6 +48,8 @@
         EXOBOX_TEST_BASH = "${pkgs.bash}/bin/bash";
         EXOBOX_TEST_COREUTILS = "${pkgs.coreutils}";
         EXOBOX_TEST_PYTHON = "${pkgs.python3}/bin/python3";
+        # a C++ program for the pipeline case (suite: pipeline_cpp)
+        EXOBOX_TEST_PATCHELF = "${pkgs.patchelf}/bin/patchelf";
         # ./test --perf (native/exobox/tests/perf.rs): parallel work and a C build
         EXOBOX_TEST_XZ = "${pkgs.xz}/bin/xz";
         EXOBOX_TEST_MAKE = "${pkgs.gnumake}/bin/make";

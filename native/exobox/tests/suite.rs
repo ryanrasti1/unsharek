@@ -231,6 +231,19 @@ fn cases() -> Vec<Case> {
         fixture("signals", FORK),
         fixture("forkthreads", FORK),
         fixture("fork_rng", FORK),
+        fixture("settid", FORK),
+        // The pipeline that found settid's bug: a C++ program on a pipeline's left side, in a
+        // bash exec'd in the guest (it failed ~5 runs in 6 in capnix tier A).
+        case(
+            "pipeline_cpp",
+            Prog::External("EXOBOX_TEST_BASH"),
+            FORK,
+            Expect { stdout: vec!["PIPELINE_OK"], ..status(Status::Code(0)) },
+        )
+        .args(vec![
+            Arg::Lit("-c"),
+            Arg::Lit("for i in 1 2 3 4 5; do v=$($EXOBOX_TEST_PATCHELF --version | $EXOBOX_TEST_COREUTILS/bin/cat) || exit 1; [ -n \"$v\" ] || exit 1; $EXOBOX_TEST_COREUTILS/bin/true | $EXOBOX_TEST_PATCHELF --version >/dev/null || exit 1; done; echo PIPELINE_OK"),
+        ]),
         fixture("forkbomb", FORK).flags(&["--max-procs=16"]).env(&[("EXOBOX_TEST_MAX_PROCS", "16")]).native(None),
         Case {
             timeout: Duration::from_secs(15),
