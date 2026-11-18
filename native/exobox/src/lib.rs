@@ -427,6 +427,8 @@ pub struct Sandbox {
     mode: Mode,
     deny: Deny,
     rules: Vec<Rule>,
+    /// Host fds given to the guest ([`Sandbox::pass_fd`]): (host, guest).
+    fds: Vec<(i32, i32)>,
 }
 
 impl Sandbox {
@@ -435,7 +437,7 @@ impl Sandbox {
         if mode != Mode::Coroutine {
             return Err(Error::NotImplemented("threaded and fork mode"));
         }
-        Ok(Sandbox { guest: Guest::boot(config)?, mode, deny: Deny::Kill, rules: vec![] })
+        Ok(Sandbox { guest: Guest::boot(config)?, mode, deny: Deny::Kill, rules: vec![], fds: vec![] })
     }
 
     /// What a refused host syscall gets (default: kill).
@@ -447,6 +449,23 @@ impl Sandbox {
     /// Allow one more host syscall on top of the mode's list.
     pub fn allow(&mut self, rule: Rule) -> &mut Self {
         self.rules.push(rule);
+        self
+    }
+
+    /// Give the guest host fd `fd` as its fd `guest` (e.g. a channel to the orchestrator at 1000):
+    /// a guest file whose reads and writes the runtime does on `fd` (as fds 0-2 are), installed
+    /// before the setup closure runs; the filter is widened to `read` and `write` on exactly that
+    /// host fd. A guest read waits for the host fd without holding the guest's CPU. `fd` stays
+    /// open for the sandbox's life. Readiness for the guest's `poll`/`epoll` on it isn't there yet
+    /// (the kernel's host-fd files have no poll; README plan item 9's readiness work): use blocking
+    /// reads.
+    pub fn pass_fd(&mut self, fd: OwnedFd, guest: i32) -> &mut Self {
+        use std::os::fd::IntoRawFd;
+        let host = fd.into_raw_fd();
+        for sysno in [Sysno::read, Sysno::write] {
+            self.rules.push(Rule { sysno, args: vec![ArgRange { index: 0, lo: host as u64, hi: host as u64 }] });
+        }
+        self.fds.push((host, guest));
         self
     }
 
@@ -491,7 +510,11 @@ impl Sandbox {
             source: std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()),
         })?;
         let prog: &'static filter::Program = prog;
+        let fds = self.fds.clone();
         self.guest.run(argv, env, move || {
+            for (host, guest) in fds {
+                setup::host_fd(host, guest).map_err(Error::io("passing a host fd"))?;
+            }
             setup().map_err(Into::into)?;
             // The mode's list allows no host memory calls: setup code that still makes one gets
             // ENOMEM (mmap) or nothing done, not the filter's verdict.

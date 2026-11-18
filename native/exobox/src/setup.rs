@@ -4,6 +4,7 @@
 
 use std::ffi::CStr;
 use std::io;
+use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 
 use exobox_rt::guest;
@@ -95,6 +96,20 @@ fn open(path: &CStr, flags: usize) -> io::Result<usize> {
 
 fn close(fd: usize) {
     let _ = sys(l::__lkl__NR_close, [fd, 0, 0, 0, 0, 0]);
+}
+
+/// Host fd `host` as guest fd `guest`: a guest file whose reads and writes the runtime does on
+/// the host's fd (`host_fd`, the kernel series' item 11), as fds 0-2 are. For a setup closure;
+/// under a [`Sandbox`](crate::Sandbox), [`Sandbox::pass_fd`](crate::Sandbox::pass_fd) does this and
+/// widens the filter to the host fd, which a closure calling this alone doesn't.
+pub fn host_fd(host: RawFd, guest: RawFd) -> io::Result<()> {
+    let fd = sys(l::__lkl__NR_host_fd, [host as usize, libc::O_RDWR as usize, 0, 0, 0, 0])?;
+    if fd != guest as usize {
+        let r = sys(l::__lkl__NR_dup3, [fd, guest as usize, 0, 0, 0, 0]);
+        close(fd);
+        r?;
+    }
+    Ok(())
 }
 
 /// The guest's basics, as init's: `/proc`, `/dev` (null, zero, full, random, urandom, tty, devpts,

@@ -8,6 +8,7 @@
 //!   routing one (deny=errno: EPERM, the program survives to say so).
 
 use std::ffi::OsString;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -40,6 +41,11 @@ fn child(layer: &str, name: &str) -> ! {
         _ => {
             let mut sb = exobox::Sandbox::boot(exobox::Mode::Coroutine, exobox::GuestConfig::default()).unwrap();
             sb.deny(exobox::Deny::Errno);
+            if layer == "passfd" {
+                // The parent's socketpair end, inherited at fd 3 (`run_passfd`), as guest fd 1000.
+                // SAFETY: fd 3 is this process's, from the parent, and nothing else owns it.
+                sb.pass_fd(unsafe { std::os::fd::OwnedFd::from_raw_fd(3) }, 1000);
+            }
             let mounts: Vec<_> = store.mounts.iter().map(|m| (sb.map_image(&m.image).unwrap(), m.guest.clone())).collect();
             sb.run(&argv, &env, move || exobox::setup::mount_closure(&mounts)).unwrap_err()
         }
@@ -59,6 +65,33 @@ fn run(layer: &str, name: &str) -> Result<(i32, String, String), Failed> {
     Ok((status.code().unwrap_or(-1), out, err))
 }
 
+/// The `passfd` layer: a socketpair, one end the child's fd 3; "ping" sent before it starts, the
+/// answer read after it ends.
+fn run_passfd() -> Result<(i32, String, String, String), Failed> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::os::unix::process::CommandExt;
+    let (mut ours, theirs) = UnixStream::pair()?;
+    ours.write_all(b"ping")?;
+    let theirs_fd = theirs.as_raw_fd();
+    let mut cmd = Command::new(std::env::current_exe()?);
+    cmd.env(CHILD, "passfd:fd_echo")
+        .env("EXOBOX_GUEST_TEST_CACHE", PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("image-cache"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: dup2 between fork and exec, async-signal-safe.
+    unsafe {
+        cmd.pre_exec(move || if libc::dup2(theirs_fd, 3) < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) });
+    }
+    let (status, _, out, err) = common::spawn_bounded(cmd, None, Duration::from_secs(10))?;
+    drop(theirs);
+    ours.set_nonblocking(true)?;
+    let mut answer = vec![0; 64];
+    let n = ours.read(&mut answer).unwrap_or(0);
+    Ok((status.code().unwrap_or(-1), out, err, String::from_utf8_lossy(&answer[..n]).into_owned()))
+}
+
 fn main() {
     if let Ok(what) = std::env::var(CHILD) {
         let (layer, name) = what.split_once(':').unwrap();
@@ -66,6 +99,13 @@ fn main() {
     }
     let args = Arguments::from_args();
     let trials = vec![
+        Trial::test("sandbox_pass_fd", || {
+            let (code, out, err, answer) = run_passfd()?;
+            if code != 0 || !out.contains("FD_ECHO_OK") || answer != "got:ping" {
+                return Err(format!("exit {code}, answer {answer:?}\n{out}\n{err}").into());
+            }
+            Ok(())
+        }),
         Trial::test("guest_runs_hello", || {
             let (code, out, err) = run("guest", "hello")?;
             if code != 0 || !out.contains("HELLO_OK") {
