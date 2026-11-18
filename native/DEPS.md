@@ -109,3 +109,16 @@ binary's size is unchanged until it does.
 | Crate | For | Where | Cost noted |
 |---|---|---|---|
 | exobox-erofs | building a store path's image on a cache miss | library | object's ELF reader, ~3 KB |
+
+## exobox-rt's loader (2026-11-18): exec inside the sandbox (native/rt/src/exec.rs)
+Nothing new in Cargo.lock: object was already in the tree (exobox-erofs). The rt crate's normal
+tree gains object and memchr; object is built without std or alloc features (`read_core`, `elf`),
+reading the headers in place from the loader's fixed buffers. Not linked into a binary yet; the
+release rlib's non-generic exec code is ~3.2 KB (`nm --size-sort`: build_stack 1.9 KB), and the
+generic part (header parsing, mapping) is instantiated where the runtime calls it. The loader's
+working storage (`exec::Scratch`, ~19 KiB) is the caller's.
+
+| Crate | For | Where | Cost noted |
+|---|---|---|---|
+| object 0.40 (no default features; read_core, elf) | the ELF file and program headers: the header's checks (magic, class, version, byte order) and the field accessors | library | a few KB; pulls memchr (no std); `extern crate alloc` in object, but nothing on the loader's path allocates |
+| exobox-fixtures (path) | the programs the loader tests load and run (static_start, static_start_nopie, hello, hello_nopie) | rt tests | test-only; the fixtures' build (~1 s cold, cached) |

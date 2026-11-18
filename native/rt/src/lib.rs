@@ -17,6 +17,7 @@
 
 pub mod arena;
 pub mod context;
+pub mod exec;
 pub mod filter;
 pub mod futex;
 pub mod host;
