@@ -1,0 +1,24 @@
+[package]
+name = "exobox-erofs"
+version = "0.0.0"
+description = "Builds erofs store images whose ELF files can be mapped in place by a loader"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "exobox_erofs"
+
+[[bin]]
+name = "exobox-erofs"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+# Only the ELF reader: program headers, read through a cache rather than the whole file.
+object = { version = "0.40", default-features = false, features = ["read_core", "elf", "std"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
