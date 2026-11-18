@@ -117,14 +117,16 @@ that mounts `/dev/exobox/<name>` with `mount(2)` and execs the next one).
    a read-write block device served over a channel (a new kernel driver: Nix's `/nix/var` on
    ext4); FUSE in the store's kernel (a config fragment); the streaming image builder (item 7) to
    the API in capnix's `spikes/storefs/README.md`.
-9. Pluggable networking: the guest's `connect`, `listen`/`accept` and name lookups (`AF_INET`,
-   `AF_INET6`) go to Rust closures registered with the sandbox (`Net::new().on_connect(..)
-   .on_listen(..).on_resolve(..)`), each run on its own coroutine after lockdown with a small context
-   (blocking-style reads, writes and waits on host fds the sandbox holds, the guest's socket ends,
-   allocation from the runtime's own memory). exobox makes a socketpair end the program's fd, so
-   poll, epoll, nonblocking sockets and fork work unchanged; it knows no protocol. capnix plugs in
-   its Cap'n Web connection this way. Since the program shares the address space, a callback's
-   connection must carry no more authority than the program's own.
+9. Pluggable networking: the guest's `connect`, `listen`/`accept` and name lookups go to a provider
+   the sandbox is given (`sb.net(impl Net)`: `async fn connect(addr, guest: SocketEnd)`,
+   `resolve(name)`, `listen(addr, incoming)`, with the guest pid; errors map to errno). It runs on a
+   small async executor in the runtime, over its coroutines (`spawn`, `readable(fd)`/`writable(fd)`
+   on held host fds and guest socket ends, `sleep_until`, real wakers), so one long-lived task can
+   own a multiplexed connection: a no_std, alloc-using async protocol core runs on it unchanged.
+   exobox makes a socketpair end the program's fd, so poll, epoll, nonblocking sockets and fork work
+   unchanged; it knows no protocol. capnix plugs in its Cap'n Web session this way. Needs `ppoll`
+   on a few host fds at once (the filter allows one today). Since the program shares the address
+   space, the provider's connection must carry no more authority than the program's own.
 10. Custom kernels, at build time: the kernel as its own Nix build (`lib.exoboxKernel { src, config }`:
    a source and a config fragment over `lkl/defconfig`, for more drivers or filesystems; LKL has
    no loadable modules), and `lib.mkExobox { kernel }` for an exobox built with it. In development,
