@@ -16,3 +16,5 @@ rustix = { workspace = true, features = ["thread", "mm"] }
 # fork and waitpid for the filter's real-kernel test; struct layouts and constants checked
 # against glibc's x86-64 ABI (sysmap, xabi)
 libc = { workspace = true }
+# property tests of the arena against a page model
+proptest = { workspace = true }

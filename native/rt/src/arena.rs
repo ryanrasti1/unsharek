@@ -1,0 +1,999 @@
+//! The arena: the program's memory after lockdown.
+//!
+//! Before lockdown the runtime reserves one large `MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE`
+//! mapping (read/write; read/write/exec when the profile allows code to be made). After lockdown
+//! the host allows no `mmap`, `mprotect`, `munmap` or `brk`, so the program's memory calls are
+//! trapped and served here, inside `[base, base + len)`. This module never maps host memory; it
+//! hands out addresses inside the reservation, copies file contents in, and gives pages back
+//! through the caller ([`Backing`]).
+//!
+//! # State
+//! One sorted table of extents covers the whole arena: each extent is free or mapped, and says
+//! whether its pages are *clean* (known to be zero) or *dirty* (may hold data). The table is
+//! caller-provided storage ([`Extent`] slice; [`CAPACITY`] entries in the runtime) because the
+//! crate allocates nothing. Adjacent extents that agree are merged, so its length is about the
+//! number of distinct mappings, as a VMA list's is.
+//!
+//! An operation that has to split extents checks first that the table has room for them, and
+//! fails with `ENOMEM` *before changing anything* if it hasn't: memory, files and the table are
+//! left as they were. That is Linux's own answer when a process exceeds `vm.max_map_count`
+//! (65530 by default, which is why [`CAPACITY`] is 64Ki). Operations that only remove or merge
+//! extents (unmapping a whole mapping) never need room, so a full table can always be drained.
+//!
+//! # Clean and dirty: why never-written pages are tracked
+//! Free pages that were never handed out, and pages given back to the host, are zero. Reusing
+//! them costs nothing. An anonymous mapping that was never writable (`PROT_NONE` or `PROT_READ`)
+//! also still holds those zeros. glibc reserves 128 MiB `PROT_NONE` per malloc arena and trims it
+//! with `munmap`; capnix cleared freed pages in place without knowing which had been written and
+//! touched ~66 MB per sandbox doing it. Here a range stays clean until it is mapped or made
+//! writable, and clean ranges are neither released nor zeroed. The cost: there is no host
+//! `mprotect`, so a program that writes to a `PROT_NONE` page (it would have crashed natively)
+//! succeeds, and its own later mapping of that page may not read zero.
+//!
+//! # Giving pages back: two modes
+//! - [`Mode::Release`] (coroutine and fork modes): freed dirty pages go back to the host at once
+//!   through [`Backing::release`] (`madvise(MADV_DONTNEED)`), in calls of at most [`MADV_CHUNK`]
+//!   bytes inside the arena: the filter allows only that. Free memory is then always clean.
+//! - [`Mode::HighWater`] (threaded mode): the filter allows no `madvise` at all (concurrent
+//!   `madvise` and page faults is the Dirty-COW race class), so nothing is released and memory stays
+//!   at its peak. Freed dirty pages stay dirty and are cleared in place when they are handed out
+//!   again, only the pages that actually hold a nonzero byte: reading a page the program never
+//!   touched maps the host's shared zero page (free), writing it would make it the sandbox's.
+//!
+//! # What is not Linux
+//! - **No protections after lockdown.** `mprotect` records the protection (for `/proc/self/maps`
+//!   and for clean tracking) and has no host effect. Guard pages a program places after lockdown
+//!   (glibc's thread-stack guards) are not enforced.
+//! - **W^X.** On an arena that isn't executable, `PROT_EXEC` is refused: `mmap` returns `EPERM`
+//!   and `mprotect` `EACCES`, as capnix did. Those are Linux's own answers for a mapping that may
+//!   not be executable (`noexec` mounts, SELinux `execmem`), so programs treat them as a policy
+//!   refusal, not a bug.
+//! - **`brk` never grows.** It returns the current break whatever is asked, which glibc reads as
+//!   failure and falls back to `mmap` for its main heap (capnix did the same).
+//! - **File mappings are copies** made at `mmap` through [`Backing::read`]. A `MAP_SHARED`
+//!   mapping that is writable at `mmap` is written back through [`Backing::write`] at `msync`,
+//!   `munmap` (and anything that replaces it) and [`Arena::writeback_all`] (exit): the rule
+//!   linux-workers' `NOMMU_LINUX_MAPPINGS` and capnix used. The whole range is written back, not
+//!   only changed bytes. One process's sqlite `-shm` works this way; two processes sharing a file
+//!   mapping don't see each other's writes until write-back.
+//! - Not supported: `MAP_SHARED | MAP_ANONYMOUS` is private (a forked child doesn't share it);
+//!   making a read-only `MAP_SHARED` file mapping writable with `mprotect` doesn't write it back;
+//!   `mremap` growing a file mapping fills the new tail with zeros; `MREMAP_DONTUNMAP`, `mremap`
+//!   with `old_len == 0`, `MADV_REMOVE` and `MADV_WIPEONFORK` return `EINVAL`, which callers
+//!   already handle (OpenSSL falls back to checking its pid when `WIPEONFORK` fails).
+//!
+//! # Errors
+//! Every call returns `Result<usize, Errno>`: the value on success (an address, or 0), and on
+//! failure rustix's [`Errno`], whose `raw_os_error()` is the **positive** Linux errno value. The
+//! raw syscall return value (`-errno` on failure) is [`ret`]. Addresses or ranges outside the
+//! arena are errors here (`ENOMEM`, `EINVAL` for `munmap`); what to do with the program's
+//! memory from before lockdown is the dispatcher's decision, made before it calls in.
+//!
+//! # Concurrency
+//! Methods take `&mut self`: the caller serialises them (one lock around the arena). The program's
+//! own threads may touch arena memory meanwhile, as they could natively.
+
+use core::cmp::{max, min};
+use core::ptr;
+
+pub use rustix::io::Errno;
+
+/// Every arena call's result: the value, or the Linux errno (positive, see the module docs).
+pub type Result<T> = core::result::Result<T, Errno>;
+
+/// The page size (x86-64, aarch64 with 4 KiB pages).
+pub const PAGE: usize = 4096;
+/// The most bytes one [`Backing::release`] call covers: the filter's bound on `madvise`'s length.
+pub const MADV_CHUNK: usize = 1 << 20;
+/// The runtime's table size: Linux's default `vm.max_map_count` (65530), rounded up. An entry is
+/// [`core::mem::size_of::<Extent>()`] bytes (40 on 64-bit), 2.5 MiB in all, in the runtime's bss.
+pub const CAPACITY: usize = 1 << 16;
+/// Requests of at least this size are placed at this alignment, as Linux does for anonymous
+/// mappings since 6.7, so the host can back them with transparent huge pages.
+const HUGE: usize = 2 << 20;
+
+// The syscalls' flag values (the generic ones, which x86-64 and aarch64 use).
+pub const PROT_NONE: u32 = 0;
+pub const PROT_READ: u32 = 1;
+pub const PROT_WRITE: u32 = 2;
+pub const PROT_EXEC: u32 = 4;
+pub const PROT_GROWSDOWN: u32 = 0x0100_0000;
+pub const PROT_GROWSUP: u32 = 0x0200_0000;
+pub const MAP_SHARED: u32 = 0x01;
+pub const MAP_PRIVATE: u32 = 0x02;
+pub const MAP_SHARED_VALIDATE: u32 = 0x03;
+pub const MAP_TYPE: u32 = 0x0f;
+pub const MAP_FIXED: u32 = 0x10;
+pub const MAP_ANONYMOUS: u32 = 0x20;
+pub const MAP_NORESERVE: u32 = 0x4000;
+pub const MAP_FIXED_NOREPLACE: u32 = 0x10_0000;
+pub const MREMAP_MAYMOVE: u32 = 1;
+pub const MREMAP_FIXED: u32 = 2;
+pub const MREMAP_DONTUNMAP: u32 = 4;
+pub const MS_ASYNC: u32 = 1;
+pub const MS_INVALIDATE: u32 = 2;
+pub const MS_SYNC: u32 = 4;
+pub const MADV_NORMAL: u32 = 0;
+pub const MADV_RANDOM: u32 = 1;
+pub const MADV_SEQUENTIAL: u32 = 2;
+pub const MADV_WILLNEED: u32 = 3;
+pub const MADV_DONTNEED: u32 = 4;
+pub const MADV_FREE: u32 = 8;
+pub const MADV_REMOVE: u32 = 9;
+pub const MADV_DONTFORK: u32 = 10;
+pub const MADV_DOFORK: u32 = 11;
+pub const MADV_MERGEABLE: u32 = 12;
+pub const MADV_UNMERGEABLE: u32 = 13;
+pub const MADV_HUGEPAGE: u32 = 14;
+pub const MADV_NOHUGEPAGE: u32 = 15;
+pub const MADV_DONTDUMP: u32 = 16;
+pub const MADV_DODUMP: u32 = 17;
+pub const MADV_WIPEONFORK: u32 = 18;
+pub const MADV_KEEPONFORK: u32 = 19;
+pub const MADV_COLD: u32 = 20;
+pub const MADV_PAGEOUT: u32 = 21;
+pub const MADV_POPULATE_READ: u32 = 22;
+pub const MADV_POPULATE_WRITE: u32 = 23;
+pub const MADV_DONTNEED_LOCKED: u32 = 24;
+pub const MADV_COLLAPSE: u32 = 25;
+
+/// The raw syscall return value of an arena call: the value, or `-errno`.
+pub fn ret(r: Result<usize>) -> isize {
+    match r {
+        Ok(v) => v as isize,
+        Err(e) => -(e.raw_os_error() as isize),
+    }
+}
+
+/// How freed pages are given back (see the module docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Through [`Backing::release`], at once, in chunks of at most [`MADV_CHUNK`].
+    Release,
+    /// Never: pages are reused, and cleared in place first if they were written.
+    HighWater,
+}
+
+/// What the arena needs from its caller: file contents, and the host's `madvise`. Addresses
+/// passed are inside the arena; implementations read and write that memory directly (it is the
+/// program's, e.g. through LKL's `pread64`/`pwrite64`).
+pub trait Backing {
+    /// Read up to `len` bytes of `file` at `offset` into `[addr, addr + len)`; `Ok(0)` at the end
+    /// of the file (the rest of the mapping stays zero, as Linux zero-fills past EOF).
+    fn read(&mut self, file: u64, offset: u64, addr: usize, len: usize) -> Result<usize>;
+    /// Write up to `len` bytes from `[addr, addr + len)` to `file` at `offset`.
+    fn write(&mut self, file: u64, offset: u64, addr: usize, len: usize) -> Result<usize>;
+    /// A writable `MAP_SHARED` mapping outlives its fd: return a new handle to the same open file
+    /// (a `dup`) that the arena keeps until [`Backing::close`]. It must differ from every handle
+    /// the arena holds. Fail with `EACCES` if the file isn't open for writing, as Linux's mmap does.
+    fn retain(&mut self, file: u64) -> Result<u64>;
+    /// No mapping refers to a handle from [`Backing::retain`] any more.
+    fn close(&mut self, file: u64);
+    /// Give `[addr, addr + len)` back to the host (`madvise(MADV_DONTNEED)`): afterwards it reads
+    /// zero. `len <= MADV_CHUNK`; [`Mode::Release`] only. On error the arena clears the range in
+    /// place instead.
+    fn release(&mut self, addr: usize, len: usize) -> Result<()>;
+}
+
+/// A file to map: the handle the dispatcher resolved the program's fd to, and the offset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileMap {
+    pub file: u64,
+    pub offset: u64,
+}
+
+/// Counters for `/proc/meminfo` and `sysinfo` (MemTotal `size`, MemFree `size - mapped`) and for
+/// tests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// The arena's size in bytes.
+    pub size: usize,
+    /// Bytes mapped now.
+    pub mapped: usize,
+    /// The highest arena offset ever mapped: in [`Mode::HighWater`], about what the sandbox may
+    /// hold.
+    pub high_water: usize,
+    /// Bytes given back through [`Backing::release`], in all.
+    pub released: u64,
+    /// Bytes cleared in place (only pages that held a nonzero byte), in all.
+    pub zeroed: u64,
+    /// Table entries in use.
+    pub extents: usize,
+}
+
+/// A mapping, as `/proc/self/maps` would list it (adjacent extents are not merged).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mapping {
+    pub start: usize,
+    pub end: usize,
+    pub prot: u32,
+    /// The file a writable shared mapping is written back to, at the offset of `start`.
+    pub shared: Option<FileMap>,
+}
+
+/// A writable shared file mapping: written back to `file` at `offset` (that of the extent's start).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Shared {
+    file: u64,
+    offset: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// Not mapped. `dirty`: may hold data (only in high-water mode; release mode frees clean).
+    Free { dirty: bool },
+    /// Mapped with `prot`. `dirty`: may hold data (it is or was writable since it was zero, or
+    /// holds a file's bytes). `anon`: zeros, not a file's bytes (what `MADV_DONTNEED` restores).
+    Mapped { prot: u8, dirty: bool, anon: bool, shared: Option<Shared> },
+}
+
+const FREE_CLEAN: Kind = Kind::Free { dirty: false };
+
+impl Kind {
+    /// This kind as seen `delta` bytes further on: a shared mapping's file offset moves with it.
+    fn shifted(self, delta: usize) -> Kind {
+        match self {
+            Kind::Mapped { prot, dirty, anon, shared: Some(s) } => Kind::Mapped {
+                prot,
+                dirty,
+                anon,
+                shared: Some(Shared { file: s.file, offset: s.offset.wrapping_add(delta as u64) }),
+            },
+            k => k,
+        }
+    }
+    fn is_free(self) -> bool {
+        matches!(self, Kind::Free { .. })
+    }
+    fn is_mapped(self) -> bool {
+        !self.is_free()
+    }
+    fn is_dirty(self) -> bool {
+        match self {
+            Kind::Free { dirty } | Kind::Mapped { dirty, .. } => dirty,
+        }
+    }
+}
+
+/// One entry of the arena's table (storage the caller provides: `[Extent::EMPTY; CAPACITY]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Extent {
+    start: usize,
+    kind: Kind,
+}
+
+impl Extent {
+    pub const EMPTY: Extent = Extent { start: 0, kind: FREE_CLEAN };
+}
+
+/// The memory manager over one reservation. See the module docs.
+pub struct Arena<'t> {
+    base: usize,
+    end: usize,
+    exec: bool,
+    mode: Mode,
+    /// Sorted by start, covering `[base, end)`: entry i ends where i + 1 starts (the last at
+    /// `end`). `table[..n]` is in use.
+    table: &'t mut [Extent],
+    n: usize,
+    brk: usize,
+    high: usize,
+    released: u64,
+    zeroed: u64,
+}
+
+fn page_up(len: usize) -> Option<usize> {
+    len.checked_add(PAGE - 1).map(|l| l & !(PAGE - 1))
+}
+
+impl<'t> Arena<'t> {
+    /// An arena over `[base, base + len)`, all free, with `table` as its extent storage (its
+    /// length is the capacity). `exec`: the reservation is executable, so `PROT_EXEC` is allowed.
+    ///
+    /// # Safety
+    /// `[base, base + len)` is a private anonymous read/write mapping, all zero, that nothing else
+    /// hands out and that stays mapped while the arena lives. The arena reads, writes, zeroes and
+    /// copies it, and passes its addresses to `backing`.
+    pub unsafe fn new(base: usize, len: usize, exec: bool, mode: Mode, table: &'t mut [Extent]) -> Result<Self> {
+        if !base.is_multiple_of(PAGE) || len == 0 || !len.is_multiple_of(PAGE) || base.checked_add(len).is_none() || table.is_empty() {
+            return Err(Errno::INVAL);
+        }
+        table[0] = Extent { start: base, kind: FREE_CLEAN };
+        Ok(Arena { base, end: base + len, exec, mode, table, n: 1, brk: 0, high: base, released: 0, zeroed: 0 })
+    }
+
+    /// `[addr, addr + len)` lies inside the arena.
+    pub fn contains(&self, addr: usize, len: usize) -> bool {
+        self.range(addr, len).is_some()
+    }
+
+    /// The program's break, which `brk` returns (the loader sets it to the end of its data).
+    pub fn set_brk(&mut self, brk: usize) {
+        self.brk = brk;
+    }
+
+    /// `brk(2)`: never grows, whatever is asked; the current break tells glibc it failed, and
+    /// glibc's malloc falls back to `mmap`.
+    pub fn brk(&self, _addr: usize) -> usize {
+        self.brk
+    }
+
+    pub fn stats(&self) -> Stats {
+        let mapped = (0..self.n).filter(|&i| self.table[i].kind.is_mapped()).map(|i| self.ext_end(i) - self.table[i].start).sum();
+        Stats {
+            size: self.end - self.base,
+            mapped,
+            high_water: self.high - self.base,
+            released: self.released,
+            zeroed: self.zeroed,
+            extents: self.n,
+        }
+    }
+
+    /// The mapped extents, in address order.
+    pub fn mappings(&self) -> impl Iterator<Item = Mapping> + '_ {
+        (0..self.n).filter_map(move |i| match self.table[i].kind {
+            Kind::Mapped { prot, shared, .. } => Some(Mapping {
+                start: self.table[i].start,
+                end: self.ext_end(i),
+                prot: prot as u32,
+                shared: shared.map(|s| FileMap { file: s.file, offset: s.offset }),
+            }),
+            Kind::Free { .. } => None,
+        })
+    }
+
+    /// `mmap(2)`. `file` is the mapped file when `flags` lacks `MAP_ANONYMOUS` (else ignored).
+    /// Without `MAP_FIXED`, a free hint is used as is, else the lowest free range that fits.
+    pub fn mmap<B: Backing>(&mut self, b: &mut B, addr: usize, len: usize, prot: u32, flags: u32, file: Option<FileMap>) -> Result<usize> {
+        if len == 0 || prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
+            return Err(Errno::INVAL);
+        }
+        let len = page_up(len).ok_or(Errno::NOMEM)?;
+        let shared = match flags & MAP_TYPE {
+            MAP_SHARED | MAP_SHARED_VALIDATE => true,
+            MAP_PRIVATE => false,
+            _ => return Err(Errno::INVAL),
+        };
+        if prot & PROT_EXEC != 0 && !self.exec {
+            return Err(Errno::PERM);
+        }
+        let file = if flags & MAP_ANONYMOUS != 0 { None } else { Some(file.ok_or(Errno::BADF)?) };
+        if let Some(f) = file {
+            if !f.offset.is_multiple_of(PAGE as u64) {
+                return Err(Errno::INVAL);
+            }
+            f.offset.checked_add(len as u64).ok_or(Errno::OVERFLOW)?;
+        }
+        let lo = if flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0 {
+            if !addr.is_multiple_of(PAGE) {
+                return Err(Errno::INVAL);
+            }
+            let hi = self.range(addr, len).ok_or(Errno::NOMEM)?;
+            // NOREPLACE wins when both are set, as in Linux's do_mmap.
+            if flags & MAP_FIXED_NOREPLACE != 0 && !self.all(addr, hi, Kind::is_free) {
+                return Err(Errno::EXIST);
+            }
+            addr
+        } else {
+            self.place(addr, len)?
+        };
+        let hi = lo + len;
+
+        let retained = match file {
+            Some(f) if shared && prot & PROT_WRITE != 0 => Some(b.retain(f.file)?),
+            _ => None,
+        };
+        let offset = file.map_or(0, |f| f.offset);
+        let new = move |s: usize, _: Kind| Kind::Mapped {
+            prot: prot as u8,
+            dirty: file.is_some() || prot & PROT_WRITE != 0,
+            anon: file.is_none(),
+            shared: retained.map(|h| Shared { file: h, offset: offset + (s - lo) as u64 }),
+        };
+        // If the file can't be read, the range ends up unmapped: room for either outcome.
+        let hw = self.mode == Mode::HighWater;
+        let failed = move |_: usize, _: Kind| Kind::Free { dirty: hw };
+        let need = max(self.splits(lo, hi, &new), if file.is_some() { self.splits(lo, hi, &failed) } else { 0 });
+        if let Err(e) = self.room(need) {
+            if let Some(h) = retained {
+                b.close(h);
+            }
+            return Err(e);
+        }
+
+        self.vacate(b, lo, hi, true, false);
+        if let Some(f) = file
+            && let Err(e) = Self::fill(b, f, lo, len)
+        {
+            if let Some(h) = retained {
+                b.close(h);
+            }
+            if !hw {
+                self.release(b, lo, hi);
+            }
+            self.apply(lo, hi, &failed);
+            return Err(e);
+        }
+        self.apply(lo, hi, &new);
+        self.high = max(self.high, hi);
+        Ok(lo)
+    }
+
+    /// `munmap(2)`. Writable shared file mappings in the range are written back first.
+    pub fn munmap<B: Backing>(&mut self, b: &mut B, addr: usize, len: usize) -> Result<usize> {
+        if !addr.is_multiple_of(PAGE) || len == 0 {
+            return Err(Errno::INVAL);
+        }
+        let len = page_up(len).ok_or(Errno::INVAL)?;
+        let hi = self.range(addr, len).ok_or(Errno::INVAL)?;
+        let freed = self.freed();
+        self.room(self.splits(addr, hi, &freed))?;
+        self.vacate(b, addr, hi, false, false);
+        self.apply(addr, hi, &freed);
+        Ok(0)
+    }
+
+    /// `mremap(2)`: shrink in place; grow in place when the pages after are free; else move
+    /// (`MREMAP_MAYMOVE`), to `new_addr` with `MREMAP_FIXED`. A grown tail is zero, with the
+    /// protection of the mapping's last page.
+    pub fn mremap<B: Backing>(&mut self, b: &mut B, old: usize, old_len: usize, new_len: usize, flags: u32, new_addr: usize) -> Result<usize> {
+        if !old.is_multiple_of(PAGE)
+            || flags & !(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP) != 0
+            || (flags & MREMAP_FIXED != 0 && flags & MREMAP_MAYMOVE == 0)
+            || flags & MREMAP_DONTUNMAP != 0
+            || old_len == 0
+            || new_len == 0
+        {
+            return Err(Errno::INVAL);
+        }
+        let olen = page_up(old_len).ok_or(Errno::INVAL)?;
+        let nlen = page_up(new_len).ok_or(Errno::NOMEM)?;
+        let ohi = self.range(old, olen).ok_or(Errno::FAULT)?;
+        if !self.all(old, ohi, Kind::is_mapped) {
+            return Err(Errno::FAULT);
+        }
+        // A move rewrites one table entry per extent moved, each possibly splitting twice, plus
+        // the tail, the shrink and the source: room for all of it before anything changes.
+        let move_need = 2 * self.count(old, ohi) + 6;
+
+        if flags & MREMAP_FIXED != 0 {
+            if !new_addr.is_multiple_of(PAGE) {
+                return Err(Errno::INVAL);
+            }
+            let nhi = self.range(new_addr, nlen).ok_or(Errno::NOMEM)?;
+            if new_addr < ohi && old < nhi {
+                return Err(Errno::INVAL);
+            }
+            self.room(move_need)?;
+            let keep = min(olen, nlen);
+            if keep < olen {
+                self.munmap(b, old + keep, olen - keep)?;
+            }
+            self.move_to(b, old, keep, new_addr, nlen);
+            return Ok(new_addr);
+        }
+        if nlen <= olen {
+            if nlen < olen {
+                self.munmap(b, old + nlen, olen - nlen)?;
+            }
+            return Ok(old);
+        }
+        if let Some(nhi) = self.range(old, nlen)
+            && self.all(ohi, nhi, Kind::is_free)
+        {
+            let tail = self.tail_kind(ohi - PAGE);
+            let f = move |_: usize, _: Kind| tail;
+            self.room(self.splits(ohi, nhi, &f))?;
+            self.vacate(b, ohi, nhi, true, false);
+            self.apply(ohi, nhi, &f);
+            self.high = max(self.high, nhi);
+            return Ok(old);
+        }
+        if flags & MREMAP_MAYMOVE == 0 {
+            return Err(Errno::NOMEM);
+        }
+        let dst = self.fit(nlen).ok_or(Errno::NOMEM)?;
+        self.room(move_need)?;
+        self.move_to(b, old, olen, dst, nlen);
+        Ok(dst)
+    }
+
+    /// `mprotect(2)`: recorded, with no host effect (see the module docs). The whole range must be
+    /// mapped (`ENOMEM`, as Linux), and nothing changes if it isn't.
+    pub fn mprotect(&mut self, addr: usize, len: usize, prot: u32) -> Result<usize> {
+        if !addr.is_multiple_of(PAGE) || prot & !(PROT_READ | PROT_WRITE | PROT_EXEC | PROT_GROWSDOWN | PROT_GROWSUP) != 0 {
+            return Err(Errno::INVAL);
+        }
+        let prot = prot & (PROT_READ | PROT_WRITE | PROT_EXEC);
+        if prot & PROT_EXEC != 0 && !self.exec {
+            return Err(Errno::ACCESS);
+        }
+        if len == 0 {
+            return Ok(0);
+        }
+        let len = page_up(len).ok_or(Errno::NOMEM)?;
+        let hi = self.range(addr, len).ok_or(Errno::NOMEM)?;
+        if !self.all(addr, hi, Kind::is_mapped) {
+            return Err(Errno::NOMEM);
+        }
+        let f = move |_: usize, k: Kind| match k {
+            // Writable: the program may write it from now on, so it is no longer known zero.
+            Kind::Mapped { dirty, anon, shared, .. } => {
+                Kind::Mapped { prot: prot as u8, dirty: dirty || prot & PROT_WRITE != 0, anon, shared }
+            }
+            k => k,
+        };
+        self.room(self.splits(addr, hi, &f))?;
+        self.apply(addr, hi, &f);
+        Ok(0)
+    }
+
+    /// `madvise(2)`. `MADV_DONTNEED` makes anonymous pages read zero (released, or cleared in
+    /// place in high-water mode); file pages keep their bytes, the closest we can come to
+    /// Linux re-reading the file. `MADV_FREE` releases in release mode and does nothing in
+    /// high-water mode (keeping the old bytes is one of its allowed outcomes). Advice that only
+    /// tunes performance is accepted and ignored.
+    pub fn madvise<B: Backing>(&mut self, b: &mut B, addr: usize, len: usize, advice: u32) -> Result<usize> {
+        if !addr.is_multiple_of(PAGE) {
+            return Err(Errno::INVAL);
+        }
+        let zero = match advice {
+            MADV_DONTNEED | MADV_DONTNEED_LOCKED => true,
+            MADV_FREE => self.mode == Mode::Release,
+            MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_DONTFORK | MADV_DOFORK
+            | MADV_MERGEABLE | MADV_UNMERGEABLE | MADV_HUGEPAGE | MADV_NOHUGEPAGE | MADV_DONTDUMP
+            | MADV_DODUMP | MADV_KEEPONFORK | MADV_COLD | MADV_PAGEOUT | MADV_POPULATE_READ
+            | MADV_POPULATE_WRITE | MADV_COLLAPSE => false,
+            // WIPEONFORK can't be honoured (a forked child would keep the bytes): refusing it is
+            // safe, since a caller must handle kernels without it. REMOVE frees shared memory.
+            _ => return Err(Errno::INVAL),
+        };
+        if len == 0 {
+            return Ok(0);
+        }
+        let len = page_up(len).ok_or(Errno::NOMEM)?;
+        let hi = self.range(addr, len).ok_or(Errno::NOMEM)?;
+        if zero {
+            let mut at = addr;
+            while at < hi {
+                let (e, k) = self.piece(at, hi);
+                if let Kind::Mapped { dirty: true, anon: true, .. } = k {
+                    self.clear(b, at, e);
+                }
+                at = e;
+            }
+            // Pages now zero that can't be written are clean again. Only a refinement, skipped
+            // if the table has no room for it.
+            let f = |_: usize, k: Kind| match k {
+                Kind::Mapped { prot, dirty: true, anon: true, shared } if prot as u32 & PROT_WRITE == 0 => {
+                    Kind::Mapped { prot, dirty: false, anon: true, shared }
+                }
+                k => k,
+            };
+            if self.room(self.splits(addr, hi, &f)).is_ok() {
+                self.apply(addr, hi, &f);
+            }
+        }
+        // Linux applies the advice to what is mapped and then reports the hole.
+        if !self.all(addr, hi, Kind::is_mapped) {
+            return Err(Errno::NOMEM);
+        }
+        Ok(0)
+    }
+
+    /// `mincore(2)`: every mapped arena page is resident (the host may not have it, but the program
+    /// can't tell). `vec` is the program's buffer, already checked by the caller; `EFAULT` if it
+    /// is shorter than the range's pages.
+    pub fn mincore(&self, addr: usize, len: usize, vec: &mut [u8]) -> Result<usize> {
+        if !addr.is_multiple_of(PAGE) {
+            return Err(Errno::INVAL);
+        }
+        let len = page_up(len).ok_or(Errno::NOMEM)?;
+        let hi = self.range(addr, len).ok_or(Errno::NOMEM)?;
+        if !self.all(addr, hi, Kind::is_mapped) {
+            return Err(Errno::NOMEM);
+        }
+        vec.get_mut(..len / PAGE).ok_or(Errno::FAULT)?.fill(1);
+        Ok(0)
+    }
+
+    /// `msync(2)`: write back the writable shared file mappings in the range (synchronously,
+    /// whatever the flags). The first write error is returned; `ENOMEM` if part of the range
+    /// isn't mapped.
+    pub fn msync<B: Backing>(&mut self, b: &mut B, addr: usize, len: usize, flags: u32) -> Result<usize> {
+        if !addr.is_multiple_of(PAGE)
+            || flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
+            || (flags & MS_ASYNC != 0 && flags & MS_SYNC != 0)
+        {
+            return Err(Errno::INVAL);
+        }
+        let len = page_up(len).ok_or(Errno::NOMEM)?;
+        let hi = self.range(addr, len).ok_or(Errno::NOMEM)?;
+        let mut r = Ok(0);
+        let mut at = addr;
+        while at < hi {
+            let (e, k) = self.piece(at, hi);
+            match k {
+                Kind::Mapped { shared: Some(s), .. } => {
+                    if let Err(err) = Self::write_back(b, s, at, e) {
+                        r = r.and(Err(err));
+                    }
+                }
+                Kind::Free { .. } => r = r.and(Err(Errno::NOMEM)),
+                _ => {}
+            }
+            at = e;
+        }
+        r
+    }
+
+    /// Write back every writable shared file mapping (at exit). Continues past errors and returns
+    /// the first.
+    pub fn writeback_all<B: Backing>(&mut self, b: &mut B) -> Result<usize> {
+        let mut r = Ok(0);
+        for i in 0..self.n {
+            if let Kind::Mapped { shared: Some(s), .. } = self.table[i].kind
+                && let Err(e) = Self::write_back(b, s, self.table[i].start, self.ext_end(i))
+            {
+                r = r.and(Err(e));
+            }
+        }
+        r
+    }
+
+    // ----- The table -----
+
+    /// The end of `[addr, addr + len)` if it lies inside the arena.
+    fn range(&self, addr: usize, len: usize) -> Option<usize> {
+        let hi = addr.checked_add(len)?;
+        (addr >= self.base && hi <= self.end).then_some(hi)
+    }
+
+    fn ext_end(&self, i: usize) -> usize {
+        if i + 1 < self.n { self.table[i + 1].start } else { self.end }
+    }
+
+    /// The extent holding `addr` (inside the arena).
+    fn find(&self, addr: usize) -> usize {
+        self.table[..self.n].partition_point(|e| e.start <= addr) - 1
+    }
+
+    /// The extent piece starting at `at`: where it ends (at most `hi`) and its kind there.
+    fn piece(&self, at: usize, hi: usize) -> (usize, Kind) {
+        let i = self.find(at);
+        (min(self.ext_end(i), hi), self.table[i].kind.shifted(at - self.table[i].start))
+    }
+
+    fn all(&self, lo: usize, hi: usize, pred: fn(Kind) -> bool) -> bool {
+        let mut at = lo;
+        while at < hi {
+            let (e, k) = self.piece(at, hi);
+            if !pred(k) {
+                return false;
+            }
+            at = e;
+        }
+        true
+    }
+
+    /// How many extents overlap `[lo, hi)`.
+    fn count(&self, lo: usize, hi: usize) -> usize {
+        if lo >= hi { 0 } else { self.find(hi - 1) - self.find(lo) + 1 }
+    }
+
+    fn room(&self, need: usize) -> Result<()> {
+        if self.n + need <= self.table.len() { Ok(()) } else { Err(Errno::NOMEM) }
+    }
+
+    /// The new entries [`Arena::apply`] of `f` over `[lo, hi)` needs: one per range boundary that
+    /// falls inside an extent whose kind `f` changes. (Merges afterwards only free entries.)
+    fn splits(&self, lo: usize, hi: usize, f: &impl Fn(usize, Kind) -> Kind) -> usize {
+        let changes_at = |at: usize| {
+            let i = self.find(at);
+            let s = self.table[i].start;
+            if s == at {
+                return false;
+            }
+            let ps = max(s, lo);
+            let k = self.table[i].kind.shifted(ps - s);
+            f(ps, k) != k
+        };
+        changes_at(lo) as usize + (hi < self.end && changes_at(hi)) as usize
+    }
+
+    /// Split the extent holding `at` there, if `f` changes the part of it inside `[lo, ..)`.
+    fn split_at(&mut self, at: usize, lo: usize, f: &impl Fn(usize, Kind) -> Kind) {
+        let i = self.find(at);
+        let Extent { start: s, kind } = self.table[i];
+        if s == at {
+            return;
+        }
+        let ps = max(s, lo);
+        let k = kind.shifted(ps - s);
+        if f(ps, k) == k {
+            return;
+        }
+        self.table.copy_within(i + 1..self.n, i + 2);
+        self.table[i + 1] = Extent { start: at, kind: kind.shifted(at - s) };
+        self.n += 1;
+    }
+
+    /// Map every extent of `[lo, hi)` through `f(piece start, kind)`, splitting at the ends and
+    /// merging neighbours that end up alike. The caller has checked [`Arena::room`] for
+    /// [`Arena::splits`].
+    fn apply(&mut self, lo: usize, hi: usize, f: &impl Fn(usize, Kind) -> Kind) {
+        debug_assert!(self.n + self.splits(lo, hi, f) <= self.table.len());
+        self.split_at(lo, lo, f);
+        if hi < self.end {
+            self.split_at(hi, lo, f);
+        }
+        let (i, j) = (self.find(lo), self.find(hi - 1));
+        for k in i..=j {
+            let (s, e) = (self.table[k].start, self.ext_end(k));
+            // An extent left whole across lo or hi is one f doesn't change.
+            if s >= lo && e <= hi {
+                self.table[k].kind = f(s, self.table[k].kind);
+            }
+        }
+        self.coalesce(i.saturating_sub(1), min(j + 1, self.n - 1));
+    }
+
+    /// Merge alike neighbours among entries `a..=b`.
+    fn coalesce(&mut self, a: usize, b: usize) {
+        let mut w = a;
+        for r in a + 1..=b {
+            let (prev, cur) = (self.table[w], self.table[r]);
+            if prev.kind.shifted(cur.start - prev.start) != cur.kind {
+                w += 1;
+                self.table[w] = cur;
+            }
+        }
+        if w < b {
+            self.table.copy_within(b + 1..self.n, w + 1);
+            self.n -= b - w;
+        }
+    }
+
+    // ----- Placement -----
+
+    /// Where a new mapping of `len` goes: the hint if it is free, else the first fit.
+    fn place(&self, hint: usize, len: usize) -> Result<usize> {
+        if hint != 0
+            && hint.is_multiple_of(PAGE)
+            && let Some(hi) = self.range(hint, len)
+            && self.all(hint, hi, Kind::is_free)
+        {
+            return Ok(hint);
+        }
+        self.fit(len).ok_or(Errno::NOMEM)
+    }
+
+    /// The lowest free range of `len`, 2 MiB-aligned when `len` is that big and such a range exists.
+    fn fit(&self, len: usize) -> Option<usize> {
+        if len >= HUGE
+            && let Some(a) = self.first_fit(len, HUGE)
+        {
+            return Some(a);
+        }
+        self.first_fit(len, PAGE)
+    }
+
+    fn first_fit(&self, len: usize, align: usize) -> Option<usize> {
+        let mut i = 0;
+        while i < self.n {
+            if self.table[i].kind.is_mapped() {
+                i += 1;
+                continue;
+            }
+            // A free run can be several extents (clean and dirty ones).
+            let mut j = i;
+            while j + 1 < self.n && self.table[j + 1].kind.is_free() {
+                j += 1;
+            }
+            let a = self.table[i].start.checked_add(align - 1)? & !(align - 1);
+            if a.checked_add(len).is_some_and(|e| e <= self.ext_end(j)) {
+                return Some(a);
+            }
+            i = j + 1;
+        }
+        None
+    }
+
+    // ----- Memory -----
+
+    /// What `munmap` turns a mapping into: free, still dirty in high-water mode if it was (release
+    /// mode has given dirty pages back by then).
+    fn freed(&self) -> impl Fn(usize, Kind) -> Kind + use<> {
+        let hw = self.mode == Mode::HighWater;
+        move |_, k| match k {
+            Kind::Mapped { dirty, .. } => Kind::Free { dirty: hw && dirty },
+            k => k,
+        }
+    }
+
+    /// A grown tail's kind: zeros, with the protection of the mapping's page at `last`.
+    fn tail_kind(&self, last: usize) -> Kind {
+        match self.piece(last, last + PAGE).1 {
+            Kind::Mapped { prot, .. } => Kind::Mapped { prot, dirty: prot as u32 & PROT_WRITE != 0, anon: true, shared: None },
+            k => k,
+        }
+    }
+
+    /// The side effects of removing whatever is in `[lo, hi)` (the table is the caller's to
+    /// update): write back and let go of shared files (unless `moving`: they go with the
+    /// mapping), give dirty pages back, and with `reuse`, leave every page zero.
+    fn vacate<B: Backing>(&mut self, b: &mut B, lo: usize, hi: usize, reuse: bool, moving: bool) {
+        let mut at = lo;
+        while at < hi {
+            let (e, k) = self.piece(at, hi);
+            if !moving && let Kind::Mapped { shared: Some(s), .. } = k {
+                // munmap reports no write-back errors (Linux's page cache would still hold them).
+                let _ = Self::write_back(b, s, at, e);
+                if !self.seen(s.file, lo, at) && !self.referenced_outside(s.file, lo, hi) {
+                    b.close(s.file);
+                }
+            }
+            if k.is_dirty() && (reuse || self.mode == Mode::Release) {
+                self.clear(b, at, e);
+            }
+            at = e;
+        }
+    }
+
+    /// Make `[lo, hi)` read zero: given back in release mode, cleared in place in high-water mode.
+    fn clear<B: Backing>(&mut self, b: &mut B, lo: usize, hi: usize) {
+        match self.mode {
+            Mode::Release => self.release(b, lo, hi),
+            // SAFETY: inside the arena (Arena::new's contract).
+            Mode::HighWater => self.zeroed += unsafe { zero_nonzero(lo, hi - lo) } as u64,
+        }
+    }
+
+    fn release<B: Backing>(&mut self, b: &mut B, lo: usize, hi: usize) {
+        let mut a = lo;
+        while a < hi {
+            let n = min(hi - a, MADV_CHUNK);
+            match b.release(a, n) {
+                Ok(()) => self.released += n as u64,
+                // SAFETY: inside the arena (Arena::new's contract).
+                Err(_) => self.zeroed += unsafe { zero_nonzero(a, n) } as u64,
+            }
+            a += n;
+        }
+    }
+
+    /// A shared file handle appears in `[lo, at)`.
+    fn seen(&self, file: u64, lo: usize, at: usize) -> bool {
+        let mut p = lo;
+        while p < at {
+            let (e, k) = self.piece(p, at);
+            if matches!(k, Kind::Mapped { shared: Some(s), .. } if s.file == file) {
+                return true;
+            }
+            p = e;
+        }
+        false
+    }
+
+    /// Some mapping outside `[lo, hi)` is written back to `file`.
+    fn referenced_outside(&self, file: u64, lo: usize, hi: usize) -> bool {
+        (0..self.n).any(|i| {
+            matches!(self.table[i].kind, Kind::Mapped { shared: Some(s), .. } if s.file == file)
+                && (self.table[i].start < lo || self.ext_end(i) > hi)
+        })
+    }
+
+    fn write_back<B: Backing>(b: &mut B, s: Shared, lo: usize, hi: usize) -> Result<()> {
+        let mut done = 0;
+        while done < hi - lo {
+            match b.write(s.file, s.offset + done as u64, lo + done, hi - lo - done)? {
+                0 => return Err(Errno::IO),
+                n => done += n,
+            }
+        }
+        Ok(())
+    }
+
+    fn fill<B: Backing>(b: &mut B, f: FileMap, lo: usize, len: usize) -> Result<()> {
+        let mut done = 0;
+        while done < len {
+            match b.read(f.file, f.offset + done as u64, lo + done, len - done)? {
+                0 => break,
+                n => done += min(n, len - done),
+            }
+        }
+        Ok(())
+    }
+
+    /// Move the `olen` bytes at `src` to `dst` as a mapping of `nlen` (room checked by the caller):
+    /// content, protections and shared files go with it; the source is freed.
+    fn move_to<B: Backing>(&mut self, b: &mut B, src: usize, olen: usize, dst: usize, nlen: usize) {
+        let (shi, dhi) = (src + olen, dst + nlen);
+        let tail = self.tail_kind(shi - PAGE);
+        self.vacate(b, dst, dhi, true, false);
+        let mut at = src;
+        while at < shi {
+            let (e, k) = self.piece(at, shi);
+            let d = dst + (at - src);
+            if k.is_dirty() {
+                // SAFETY: both inside the arena and disjoint (dst was free or vacated, src mapped).
+                unsafe { copy_nonzero(d, at, e - at) };
+            }
+            self.apply(d, d + (e - at), &move |s: usize, _: Kind| k.shifted(s - d));
+            at = e;
+        }
+        if nlen > olen {
+            self.apply(dst + olen, dhi, &move |_: usize, _: Kind| tail);
+        }
+        self.vacate(b, src, shi, false, true);
+        let freed = self.freed();
+        self.apply(src, shi, &freed);
+        self.high = max(self.high, dhi);
+    }
+
+    #[cfg(test)]
+    fn check(&self) {
+        assert!(self.n >= 1 && self.n <= self.table.len());
+        assert_eq!(self.table[0].start, self.base);
+        for i in 0..self.n {
+            let (s, e) = (self.table[i].start, self.ext_end(i));
+            assert!(s < e && e <= self.end, "extent {i} [{s:#x}, {e:#x})");
+            assert_eq!(s % PAGE, 0);
+            if self.mode == Mode::Release {
+                assert_ne!(self.table[i].kind, Kind::Free { dirty: true }, "release mode frees clean");
+            }
+            if i > 0 {
+                let p = self.table[i - 1];
+                assert_ne!(p.kind.shifted(s - p.start), self.table[i].kind, "extents {} and {i} unmerged", i - 1);
+            }
+        }
+    }
+}
+
+/// Clear every page of `[addr, addr + len)` that holds a nonzero byte; the bytes written. Pages
+/// that already read zero are left alone: a page the program never touched maps the host's zero
+/// page when read, and would become the sandbox's memory if written.
+///
+/// # Safety
+/// The range is mapped read/write, page-aligned.
+unsafe fn zero_nonzero(addr: usize, len: usize) -> usize {
+    let mut written = 0;
+    for p in (addr..addr + len).step_by(PAGE) {
+        // SAFETY: the caller's.
+        if unsafe { !page_is_zero(p) } {
+            unsafe { ptr::write_bytes(p as *mut u8, 0, PAGE) };
+            written += PAGE;
+        }
+    }
+    written
+}
+
+/// Copy `[src, src + len)` to `dst`, which is zero, skipping source pages that are zero (they
+/// stay untouched at the destination too).
+///
+/// # Safety
+/// Both ranges mapped read/write, page-aligned, disjoint.
+unsafe fn copy_nonzero(dst: usize, src: usize, len: usize) {
+    for off in (0..len).step_by(PAGE) {
+        // SAFETY: the caller's.
+        if unsafe { !page_is_zero(src + off) } {
+            unsafe { ptr::copy_nonoverlapping((src + off) as *const u8, (dst + off) as *mut u8, PAGE) };
+        }
+    }
+}
+
+/// # Safety
+/// `p` is a readable page.
+unsafe fn page_is_zero(p: usize) -> bool {
+    // Compared with a page of zeros: slice equality of bytes is one memcmp, fast in any build
+    // (a loop over words is ~30x slower unoptimised, which the tests are).
+    static ZERO: [u8; PAGE] = [0; PAGE];
+    // SAFETY: the caller's. (The program's threads may write it meanwhile; then it was racing
+    // its own munmap or madvise, natively too.)
+    let bytes = unsafe { core::slice::from_raw_parts(p as *const u8, PAGE) };
+    bytes == ZERO
+}
+
+#[cfg(test)]
+mod tests;

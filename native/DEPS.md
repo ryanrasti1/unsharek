@@ -69,3 +69,14 @@ Measured on stock LKL (`d0f76a77e`, Linux 6.12) with `lkl/defconfig`, GCC 16.2, 
 Tools in the devshell (not linked): libclang via `rustPlatform.bindgenHook` (sets `LIBCLANG_PATH` and
 `BINDGEN_EXTRA_CLANG_ARGS`; changing flake.nix refreshes devshell.sh's cached environment by
 itself); objdump (binutils, already in the stdenv) for the `addr32 call` check.
+
+## exobox-rt arena tests (2026-11-18): property tests of the arena (native/rt/src/arena)
+Test-only: nothing reaches the runtime or the binary. The rt crate's test build goes from rustix
+alone to 17 crates; cold `cargo build -p exobox-rt --tests` 4.4 s, of which proptest and its
+dependencies are ~3.5 s (zerocopy 1.9 s via rand_chacha's ppv-lite86, proptest 1.5 s,
+regex-syntax 1.1 s, in parallel). Warm, nothing.
+
+| Crate | For | Where | Cost noted |
+|---|---|---|---|
+| proptest 1 (default-features off, std) | random sequences of mmap/munmap/mremap/mprotect against a model, shrunk to a minimal failing sequence | rt tests | test-only; without `fork`/`timeout` (no rusty-fork, tempfile, wait-timeout); `failure_persistence` off, so no files written |
+| libc 0.2 | a real `MAP_NORESERVE` reservation, `madvise` as the release hook, `mincore` to see what the host holds | rt tests | test-only (already the suite's) |

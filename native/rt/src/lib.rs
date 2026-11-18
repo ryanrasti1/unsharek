@@ -13,6 +13,7 @@
 //!   (`filter`) allows from the gate.
 #![cfg_attr(not(test), no_std)]
 
+pub mod arena;
 pub mod context;
 pub mod filter;
 pub mod futex;
