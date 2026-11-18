@@ -29,6 +29,10 @@ enum Command {
         /// (read-only). Repeatable.
         #[arg(long = "allow-path", value_name = "PATH")]
         allow_paths: Vec<PathBuf>,
+        /// Map an erofs image as /dev/exobox/NAME, and mount it at MOUNTPOINT if given.
+        /// Repeatable.
+        #[arg(long = "image", value_name = "NAME=PATH[:MOUNTPOINT]")]
+        images: Vec<exobox::ImageArg>,
         /// Fork mode: the most processes alive at once.
         #[arg(long)]
         max_procs: Option<u32>,
@@ -52,7 +56,7 @@ enum Deny {
 }
 
 fn main() -> ExitCode {
-    let Command::Run { mode, deny, rules, allow_paths, max_procs, argv } = Cli::parse().command;
+    let Command::Run { mode, deny, rules, allow_paths, images, max_procs, argv } = Cli::parse().command;
     let config = exobox::Config {
         mode: match mode {
             Mode::Coroutine => exobox::Mode::Coroutine,
@@ -65,8 +69,18 @@ fn main() -> ExitCode {
         },
         rules,
         allow_paths,
+        images,
         max_procs,
         argv,
+        // As env(1): the program gets this process's environment.
+        env: std::env::vars_os()
+            .map(|(k, v)| {
+                let mut kv = k;
+                kv.push("=");
+                kv.push(v);
+                kv
+            })
+            .collect(),
         image_cache: None,
     };
     let Err(e) = exobox::run(config);

@@ -14,6 +14,12 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 exobox-erofs = { path = "../erofs" }
+# The in-sandbox runtime (the dispatcher, the scheduler, the filter) and the kernel's numbers
+exobox-rt = { path = "../rt" }
+lkl-sys = { path = "../lkl-sys" }
+# Host setup before the routing filter: reserving memory, mapping images, the auxiliary vector,
+# host entropy; and the guest's constants
+libc.workspace = true
 syscalls.workspace = true
 thiserror.workspace = true
 
@@ -21,11 +27,15 @@ thiserror.workspace = true
 exobox-fixtures = { path = "../fixtures" }
 libtest-mimic.workspace = true
 tempfile.workspace = true
-libc.workspace = true
 
 # The regression suite: one table of cases, each run natively and in every mode it names.
 [[test]]
 name = "suite"
+harness = false
+
+# The library's layers (Guest alone, Sandbox), each in a child process of its own.
+[[test]]
+name = "guest"
 harness = false
 
 # The performance budgets (./test --perf).

@@ -32,14 +32,15 @@ int main(void)
 
 	/* 1. Every number with zero arguments. Skipped: rt_sigreturn (allowed: through the gate it
 	 * would unwind a frame that isn't there), exit_group (allowed: would end the test), ppoll
-	 * (allowed: a NULL timeout blocks), fork mode's read (stdin), exit where threads are host threads
+	 * (allowed: a NULL timeout blocks), read (stdin, fd 0, is the host's in every mode: filter::HOST),
+	 * exit where threads are host threads
 	 * (exit(0) is allowed: it would end this thread), and the unassigned 335-423 gap
 	 * (this host kernel raises SIGILL for those, even natively). An allowed number that takes an
 	 * fd or address still refuses here, since fd 0 and address 0 are outside every rule. */
 	int refused = 0, leaked = 0;
 	for (long nr = 0; nr < 470; nr++) {
 		if (nr == SYS_rt_sigreturn || nr == SYS_exit_group || nr == SYS_ppoll ||
-		    (fork_mode && nr == SYS_read) || (threads && nr == SYS_exit) || (nr > 334 && nr < 424))
+		    nr == SYS_read || (threads && nr == SYS_exit) || (nr > 334 && nr < 424))
 			continue;
 		long r = gate(nr, 0, 0, 0, 0, 0, 0);
 		if (nr == allowed) {
@@ -106,8 +107,11 @@ int main(void)
 	}
 
 	/* 5. Memory outside the arena; fds nobody was given. */
-	expect("madvise(stack page, DONTNEED) via gate",
-	       gate(SYS_madvise, (long)&buf & ~4095L, 4096, MADV_DONTNEED, 0, 0, 0), 0);
+	/* Not the stack: the program's stack is in the arena, where madvise is allowed (coroutine
+	 * mode), and zeroing it would crash this test rather than probe the filter. The host's vDSO
+	 * is outside the arena in every mode. */
+	expect("madvise(vDSO page, DONTNEED) via gate",
+	       gate(SYS_madvise, (long)getauxval(AT_SYSINFO_EHDR) & ~4095L, 4096, MADV_DONTNEED, 0, 0, 0), 0);
 	expect("write(1, \"\") via gate", gate(SYS_write, 1, (long)"", 0, 0, 0, 0), 1);
 	expect("read(1) via gate", gate(SYS_read, 1, (long)buf, 1, 0, 0, 0), 0);
 	expect("write(5) via gate", gate(SYS_write, 5, (long)"x", 1, 0, 0, 0), 0);

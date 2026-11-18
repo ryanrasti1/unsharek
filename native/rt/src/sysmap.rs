@@ -403,6 +403,13 @@ table! {
     148 sched_rr_get_interval Lkl(127);
     160 setrlimit Lkl(164);
     162 sync Lkl(81);
+    // The mount family is the guest kernel's: it isn't the sandbox's boundary (the host filter
+    // is), and the setup closure run before exec (`exobox::Guest::run`) and in-guest inits
+    // (capnix's) mount with plain syscalls.
+    155 pivot_root Lkl(41);
+    161 chroot Lkl(51);
+    165 mount Lkl(40);
+    166 umount2 Lkl(39);
     186 gettid Lkl(178);
     187 readahead Lkl(213);
     188 setxattr Lkl(5);
@@ -552,13 +559,9 @@ table! {
     // EPERM here as "not allowed", which is what it is. -------------------------------------
     103 syslog Er(Perm);
     153 vhangup Er(Perm);
-    155 pivot_root Er(Perm);
     159 adjtimex Er(Perm);
-    161 chroot Er(Perm);
     163 acct Er(Perm);
     164 settimeofday Er(Perm);
-    165 mount Er(Perm);
-    166 umount2 Er(Perm);
     167 swapon Er(Perm);
     168 swapoff Er(Perm);
     // (Not in the audit, which skips it; the same reason as the rest. capnix gave ENOSYS.)

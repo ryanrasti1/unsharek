@@ -273,7 +273,7 @@ fn cases() -> Vec<Case> {
 /// EPERM, and no crash or hang).
 fn sysaudit_check(out: &str) -> Result<(), String> {
     const EPERM: &[&str] = &[
-        "chroot", "mount", "umount2", "pivot_root", "swapon", "swapoff", "sethostname", "setdomainname", "acct",
+        "swapon", "swapoff", "sethostname", "setdomainname", "acct",
         "settimeofday", "adjtimex", "clock_settime", "clock_adjtime", "syslog", "vhangup", "quotactl",
         "quotactl_fd", "kexec_load", "kexec_file_load", "init_module", "finit_module", "delete_module", "iopl",
         "ioperm", "unshare", "setns",
