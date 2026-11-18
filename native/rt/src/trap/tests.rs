@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::context::{self, Context};
-use crate::filter::{self, Deny, Mode, Params, Program};
+use crate::filter::{self, Deny, Mode, Params, Policy, Program};
 use core::arch::asm;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64};
 use std::time::{Duration, Instant};
@@ -158,7 +158,7 @@ static RUNTIME: AtomicUsize = AtomicUsize::new(0);
 /// Install the handler on this (child) thread and lock down: `mode`'s filter with deny=errno.
 fn lockdown(dispatch: Dispatch, target: Target, mode: Mode, arena: &[(u64, u64)], tokens: (u32, u32)) {
     let mut prog = Box::new(Program::new());
-    let params = Params { mode, deny: Deny::Errno, gate_ip: gate_ip(), arena, token_fds: tokens, extra: &[] };
+    let params = Params { policy: Policy::Mode(mode), deny: Deny::Errno, gate_ip: gate_ip(), arena, token_fds: tokens, extra: &[] };
     filter::compile(&params, &mut prog).unwrap();
     RUNTIME.store(context::read_fs(), Ordering::Relaxed);
     // SAFETY: the child's own alternate stack; the dispatchers keep to the contract.

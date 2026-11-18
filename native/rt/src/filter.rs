@@ -14,7 +14,17 @@
 //! 2. `rt_sigreturn`: allow from anywhere (the SIGSYS handler returns through it).
 //! 3. not from the gate: `SECCOMP_RET_TRAP` (the program's syscall, served in-process).
 //! 4. from the gate: the first rule whose number matches and whose conditions all hold allows;
-//!    nothing matching is `deny`.
+//!    nothing matching is `deny`. Or, for [`Policy::RouteOnly`], allow everything.
+//!
+//! **Two filters, stacked.** The sandbox's routing and its security are separate layers, each a
+//! filter of this shape: first the routing-only one ([`Policy::RouteOnly`]: steps 1-3, then allow
+//! all from the gate), installed when the guest starts running (`exobox::Guest::run`), then,
+//! before the program's exec, the mode's ([`Policy::Mode`]), stacked on it. The kernel runs every
+//! installed filter and takes the highest-precedence action (KILL > TRAP > ERRNO > ALLOW): a
+//! non-gate call is TRAP in both, a gate call ALLOW in the first and the mode list's verdict in the
+//! second. That is why the mode filter keeps its own instruction-pointer check (step 3) instead of
+//! judging every call by its list: a KILL or ERRNO for a non-gate call would outrank the routing
+//! filter's TRAP, and the program's own syscalls would be refused instead of served.
 //!
 //! Compilation is a pure function into caller-provided fixed storage ([`Program`]); installing is
 //! separate ([`install`]) so the program can be built and checked without touching the process.
@@ -43,8 +53,9 @@ pub const NR_CLONE: u32 = 56;
 pub const NR_EXIT: u32 = 60;
 pub const NR_EXIT_GROUP: u32 = 231;
 pub const NR_PPOLL: u32 = 271;
-/// `seccomp(2)` itself, for [`install`].
+/// `seccomp(2)` itself and `prctl(2)`, for [`install`].
 const NR_SECCOMP: usize = 317;
+const NR_PRCTL: usize = 157;
 
 /// The one flag set a host thread is made with (include/uapi/linux/sched.h): `CLONE_VM |
 /// CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM | CLONE_CHILD_CLEARTID`.
@@ -102,6 +113,16 @@ pub enum Mode {
     Fork,
 }
 
+/// What the filter decides for a call from the gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Policy {
+    /// Routing only: everything from the gate is allowed (the first of the stacked filters; see the
+    /// module comment). `deny`, the arena, the token fds and the extra rules are unused.
+    RouteOnly,
+    /// The mode's list, then the extra rules, then `deny`.
+    Mode(Mode),
+}
+
 /// What a refused syscall from the gate gets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Deny {
@@ -142,7 +163,7 @@ pub const MAX_CONDS: usize = 6;
 /// Everything the filter depends on. Plain data: the caller fills it in at lockdown.
 #[derive(Clone, Copy, Debug)]
 pub struct Params<'a> {
-    pub mode: Mode,
+    pub policy: Policy,
     pub deny: Deny,
     /// The address just past the gate's `syscall` instruction (what the kernel reports):
     /// `trap::gate_ip()`.
@@ -449,11 +470,12 @@ pub fn compile(params: &Params, out: &mut Program) -> Result<(), Error> {
     e.ld(OFF_IP + 4)?;
     e.push(JEQ_K, 1, 0, (ip >> 32) as u32)?;
     e.ret(SECCOMP_RET_TRAP)?;
-    // 4. The gate: the mode's list, then the user's rules, then deny.
-    let bit = match params.mode {
-        Mode::Coroutine => COROUTINE,
-        Mode::Threaded => THREADED,
-        Mode::Fork => FORK,
+    // 4. The gate: the mode's list, then the user's rules, then deny; or all of it.
+    let bit = match params.policy {
+        Policy::RouteOnly => return e.ret(SECCOMP_RET_ALLOW),
+        Policy::Mode(Mode::Coroutine) => COROUTINE,
+        Policy::Mode(Mode::Threaded) => THREADED,
+        Policy::Mode(Mode::Fork) => FORK,
     };
     for entry in HOST.iter().filter(|en| en.modes & bit != 0) {
         e.entry(entry, params)?;
@@ -476,28 +498,21 @@ struct SockFprog {
 /// `SECCOMP_FILTER_FLAG_*`, e.g. TSYNC for every thread). After this, every syscall the thread
 /// makes goes through the filter: the caller must already have its SIGSYS handler in place, and
 /// make host syscalls only through the gate.
+///
+/// Both calls are made through the gate (`trap::gate`), so this works with a filter already in
+/// place: the mode's filter is installed on top of the routing one, which traps every call not
+/// from the gate (rustix's `prctl` would be served by the guest instead). The routing filter
+/// allows `seccomp` from the gate; the mode's lists don't, so nothing can be stacked after it.
 pub fn install(prog: &Program, flags: u32) -> Result<(), rustix::io::Errno> {
+    let check = |r: isize| if r < 0 { Err(rustix::io::Errno::from_raw_os_error(-r as i32)) } else { Ok(()) };
     // Unprivileged seccomp requires no_new_privs (and it's right regardless: no setuid gains).
-    rustix::thread::set_no_new_privs(true)?;
+    // prctl(PR_SET_NO_NEW_PRIVS = 38, 1).
+    // SAFETY: sets a flag of the process.
+    check(unsafe { crate::trap::gate(NR_PRCTL, 38, 1, 0, 0, 0, 0) })?;
     let fprog = SockFprog { len: prog.len as u16, filter: prog.insns.as_ptr() };
-    // rustix has no seccomp wrapper, so the one call is made directly.
     // SECCOMP_SET_MODE_FILTER = 1 (include/uapi/linux/seccomp.h).
-    let ret: isize;
-    // SAFETY: seccomp reads `fprog` and the instructions it points to, both live for the call;
-    // the syscall clobbers only rax (the result), rcx and r11.
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") NR_SECCOMP as isize => ret,
-            in("rdi") 1usize,
-            in("rsi") flags as usize,
-            in("rdx") &fprog as *const SockFprog,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    if ret < 0 { Err(rustix::io::Errno::from_raw_os_error(-ret as i32)) } else { Ok(()) }
+    // SAFETY: seccomp reads `fprog` and the instructions it points to, both live for the call.
+    check(unsafe { crate::trap::gate(NR_SECCOMP, 1, flags as usize, &fprog as *const SockFprog as usize, 0, 0, 0) })
 }
 
 #[cfg(test)]

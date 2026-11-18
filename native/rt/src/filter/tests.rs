@@ -60,7 +60,7 @@ fn run(prog: &[SockFilter], d: &Data) -> u32 {
 
 fn build(mode: Mode, deny: Deny, extra: &[Rule]) -> Program {
     let mut p = Program::new();
-    let params = Params { mode, deny, gate_ip: GATE, arena: &ARENA, token_fds: TOKENS, extra };
+    let params = Params { policy: Policy::Mode(mode), deny, gate_ip: GATE, arena: &ARENA, token_fds: TOKENS, extra };
     compile(&params, &mut p).unwrap();
     p
 }
@@ -119,6 +119,34 @@ fn not_from_the_gate_traps() {
             }
         }
     }
+}
+
+/// The routing-only filter: arch and x32 killed, rt_sigreturn allowed, everything else not from
+/// the gate trapped and everything from it allowed, whatever the other parameters say.
+#[test]
+fn route_only() {
+    let mut prog = Program::new();
+    let extra = [Rule { nr: 39, conds: &[] }];
+    let params = Params {
+        policy: Policy::RouteOnly,
+        deny: Deny::Kill,
+        gate_ip: GATE,
+        arena: &ARENA,
+        token_fds: TOKENS,
+        extra: &extra,
+    };
+    compile(&params, &mut prog).unwrap();
+    for nr in 0..=500 {
+        for args in [[0; 6], [u64::MAX; 6], [1, 2, 3, 4, 5, 6]] {
+            assert_eq!(check(&prog, gate(nr, args)), ALLOW, "nr {nr} from the gate");
+            let d = Data { nr, arch: AUDIT_ARCH_X86_64, ip: GATE + 2, args };
+            let want = if nr == NR_RT_SIGRETURN { ALLOW } else { SECCOMP_RET_TRAP };
+            assert_eq!(check(&prog, d), want, "nr {nr} elsewhere");
+        }
+    }
+    let other = Data { arch: 0x4000_0003, ..gate(1, [0; 6]) };
+    assert_eq!(check(&prog, other), SECCOMP_RET_KILL_PROCESS);
+    assert_eq!(check(&prog, gate(X32_SYSCALL_BIT | 1, [0; 6])), SECCOMP_RET_KILL_PROCESS);
 }
 
 #[test]
@@ -203,7 +231,7 @@ fn madvise() {
     // No arena: no madvise at all.
     let mut p = Program::new();
     let params = Params {
-        mode: Mode::Coroutine,
+        policy: Policy::Mode(Mode::Coroutine),
         deny: Deny::Errno,
         gate_ip: GATE,
         arena: &[],
@@ -403,7 +431,7 @@ fn errors() {
     let mut p = Program::new();
     let with = |extra: &[Rule], token_fds, arena: &[(u64, u64)], p: &mut Program| {
         let params = Params {
-            mode: Mode::Threaded,
+            policy: Policy::Mode(Mode::Threaded),
             deny: Deny::Kill,
             gate_ip: GATE,
             arena,
@@ -480,7 +508,7 @@ fn installs_in_the_kernel() {
     for mode in MODES {
         let mut prog = Program::new();
         let params = Params {
-            mode,
+            policy: Policy::Mode(mode),
             deny: Deny::Errno,
             gate_ip,
             arena: &ARENA,
@@ -523,4 +551,42 @@ fn installs_in_the_kernel() {
         assert!(libc::WIFEXITED(status), "{mode:?}: child status {status:#x}");
         assert_eq!(libc::WEXITSTATUS(status), 0, "{mode:?}");
     }
+}
+
+/// The two filters stacked, as the sandbox installs them (the module comment): with the routing one
+/// alone a gate call outside every mode list (getppid) is allowed; once the coroutine mode's filter
+/// is stacked on it, the same call is refused (deny = errno) while the mode's own calls still pass.
+/// Through `trap::gate`, which `install` itself uses, so the second install passes the first filter.
+#[test]
+fn stacked_filters_in_the_kernel() {
+    let gate_ip = crate::trap::gate_ip();
+    let params = |policy| Params { policy, deny: Deny::Errno, gate_ip, arena: &ARENA, token_fds: TOKENS, extra: &[] };
+    let (mut route, mut mode) = (Program::new(), Program::new());
+    compile(&params(Policy::RouteOnly), &mut route).unwrap();
+    compile(&params(Policy::Mode(Mode::Coroutine)), &mut mode).unwrap();
+    let g = |nr: u32, a0: usize| unsafe { crate::trap::gate(nr as usize, a0, b"".as_ptr() as usize, 0, 0, 0, 0) };
+    // SAFETY: the child only calls install and the gate, then exits through the gate.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0);
+    if pid == 0 {
+        let status = if install(&route, 0).is_err() {
+            10
+        } else if g(110, 0) <= 0 {
+            11 // getppid allowed: the parent's pid
+        } else if install(&mode, 0).is_err() {
+            12
+        } else if g(110, 0) != -1 {
+            13 // now EPERM
+        } else if g(NR_WRITE, 1) != 0 {
+            14
+        } else {
+            0
+        };
+        g(NR_EXIT_GROUP, status);
+        unreachable!();
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+    assert!(libc::WIFEXITED(status), "child status {status:#x}");
+    assert_eq!(libc::WEXITSTATUS(status), 0);
 }
