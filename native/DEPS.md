@@ -80,3 +80,22 @@ regex-syntax 1.1 s, in parallel). Warm, nothing.
 |---|---|---|---|
 | proptest 1 (default-features off, std) | random sequences of mmap/munmap/mremap/mprotect against a model, shrunk to a minimal failing sequence | rt tests | test-only; without `fork`/`timeout` (no rusty-fork, tempfile, wait-timeout); `failure_persistence` off, so no files written |
 | libc 0.2 | a real `MAP_NORESERVE` reservation, `madvise` as the release hook, `mincore` to see what the host holds | rt tests | test-only (already the suite's) |
+
+## exobox-rt's host operations (2026-11-18): LKL on the coroutine scheduler (native/rt/src/host.rs)
+exobox-rt now depends on lkl-sys (the kernel's bindings and object) and two more rustix features.
+Nothing new from crates.io. What it costs:
+
+- **Build**: building exobox-rt now builds the kernel (lkl-sys's build.rs: ~20 s cold, nothing warm)
+  and needs libclang for the bindings, as lkl-sys already did. Kept rather than a separate crate:
+  the host ops need the scheduler's internals (`TlsKey`'s index) and the bindings' types, and one
+  edge rt → lkl-sys is the simplest graph.
+- **Binary**: the kernel object (~5.9 MB, see above) is linked only where `lkl_init` is referenced;
+  the host ops themselves are a few KB of code plus static pools (tens of KB: 1024 semaphores, 8
+  mutexes, 4 timers) and the 0.3 KB table.
+- `./test -E 'package(exobox-rt)'`: the boot test (`tests/lkl_boot.rs`) adds ~0.1 s (a forked child
+  that boots, sleeps 50 ms, halts).
+
+| Crate | For | Where | Cost noted |
+|---|---|---|---|
+| lkl-sys (path) | `lkl_host_operations` and its types, filled in by `host`; the kernel for the boot test | library | the kernel build at build time; ~5.9 MB in a binary that boots it |
+| rustix 1, + `time`, `event` | `clock_gettime` (vDSO) for the scheduler's clocks; `ppoll` with no fds as the idle wait | library | a few hundred bytes of code |

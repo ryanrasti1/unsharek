@@ -9,8 +9,11 @@ publish = false
 
 [dependencies]
 # thread: prctl(PR_SET_NO_NEW_PRIVS) before installing the filter; mm: mprotect for the
-# coroutine stacks' guard pages (sched)
-rustix = { workspace = true, features = ["thread", "mm"] }
+# coroutine stacks' guard pages (sched); time: the clocks (vDSO), event: ppoll as the idle wait
+# (host)
+rustix = { workspace = true, features = ["thread", "mm", "time", "event"] }
+# The kernel and its host-operations table, which `host` fills in
+lkl-sys = { path = "../lkl-sys" }
 
 [dev-dependencies]
 # fork and waitpid for the filter's real-kernel test; struct layouts and constants checked

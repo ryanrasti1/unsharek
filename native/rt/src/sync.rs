@@ -111,7 +111,7 @@ impl Mutex {
 /// at the coroutine's exit for a nonzero value (POSIX's rules: the value is cleared first, and
 /// destructors that set values again get up to 4 rounds).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TlsKey(usize);
+pub struct TlsKey(pub(crate) usize);
 
 impl TlsKey {
     /// `None` when all `sched::TLS_KEYS` keys are taken.

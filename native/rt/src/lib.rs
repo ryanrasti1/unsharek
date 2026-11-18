@@ -17,6 +17,7 @@ pub mod arena;
 pub mod context;
 pub mod filter;
 pub mod futex;
+pub mod host;
 pub mod sched;
 pub mod sync;
 pub mod sysmap;
