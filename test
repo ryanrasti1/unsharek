@@ -12,8 +12,11 @@ root="$(cd "$(dirname "$0")" && pwd)"
 source "$root/devshell.sh"
 cd "$root"
 profile=default
+build=()
 if [[ "${1:-}" == --perf ]]; then
+  # The budgets are release numbers (capnix tier A measured release builds), so measure release.
   profile=perf
+  build=(--release)
   shift
 fi
-exec cargo nextest run --workspace --no-tests=warn --profile "$profile" "$@"
+exec cargo nextest run --workspace --no-tests=warn --profile "$profile" "${build[@]}" "$@"
