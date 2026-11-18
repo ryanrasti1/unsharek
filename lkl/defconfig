@@ -2,11 +2,13 @@
 # olddefconfig). Started from capnix tier A's tiera_defconfig: the smallest kernel the programs
 # need. tools/lkl appends its host's kernel.config (64BIT and the like) to it.
 #
-# Not settable here on stock LKL: HZ is a fixed `int` in arch/lkl/Kconfig (100) and NR_IRQS is
-# hard-coded in arch/lkl/include/asm/irq.h (64 * 64 = 4096, every irq_desc allocated at boot:
-# 2.4 MB of slab). The series (lkl/README.md, item 14) makes both Kconfig options; once it is in,
-# CONFIG_HZ_1000 (boot waits in jiffies: 9-20 ms instead of 45-75 ms at HZ 100) and a small
-# CONFIG_LKL_NR_IRQS go here.
+# The arch's knobs (the series' item 14): a 1000 Hz tick (boot waits for kernel threads in
+# jiffies: 9-20 ms instead of 45-75 ms at 100; NO_HZ_IDLE keeps an idle kernel tickless either
+# way), 128 IRQs (each irq_desc is allocated at boot: 4096 cost ~1 MB), no tracing (~1 MiB of slab,
+# ~0.5 MiB of text).
+CONFIG_HZ=1000
+CONFIG_LKL_NR_IRQS=128
+# CONFIG_LKL_TRACING is not set
 # CONFIG_LOCALVERSION_AUTO is not set
 CONFIG_NO_HZ_IDLE=y
 CONFIG_HIGH_RES_TIMERS=y
