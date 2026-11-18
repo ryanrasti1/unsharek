@@ -305,10 +305,11 @@ pub static HOST_OPS: HostOps = HostOps(UnsafeCell::new(lkl_host_operations {
     shmem_init: None,
     shmem_mmap: None,
     pci_ops: ptr::null_mut(),
-    // The kernel series' item 6 (a task's exit) and 11 (host fds as guest files): the sandbox's
-    // dispatcher provides them; without task_exit, a task's end ends its host thread.
+    // The kernel series' item 6 (a task's exit): the sandbox's dispatcher provides it
+    // (`exobox_rt::guest`), as what a task's end means is the sandbox's; without it, a task's
+    // end ends its coroutine (thread_exit).
     task_exit: None,
-    hostfd_rw: None,
+    hostfd_rw: Some(hostfd_rw),
 }));
 
 // ---- print and panic ----
@@ -606,6 +607,59 @@ unsafe extern "C" fn memmove(d: *mut c_void, s: *const c_void, n: c_ulong) -> *m
     d
 }
 
+// ---- host fds as guest files (the kernel series' item 11) ----
+
+/// The one host fd a coroutine waits on, polled by the idle wait (the filter allows `ppoll` on one
+/// fd): (fd, events, the waiter).
+static FD_WAIT: FdWait = FdWait(Cell::new(None));
+struct FdWait(Cell<Option<(i32, i16, Tid)>>);
+// SAFETY: as the pools'.
+unsafe impl Sync for FdWait {}
+
+const POLLIN: i16 = 1;
+const POLLOUT: i16 = 4;
+/// How long a waiting coroutine sleeps between polls when the idle wait isn't watching its fd (it
+/// watches one; or the program keeps the CPU busy, and idle never runs).
+const FD_REPOLL_NS: u64 = 5_000_000;
+
+/// `hostfd_rw`: a read or write on the host's fd for a guest file made by `host_fd`, called with
+/// the CPU free and the task asleep. The host thread is every coroutine's, so it must not block in
+/// the host: poll the fd (through the gate), and until it is ready block the coroutine, the idle
+/// wait watching the fd; then the one read or write, which won't block. Through the gate, so the
+/// filter decides: reads of 0 and writes of 1 and 2 (the program's stdio) and nothing else.
+unsafe extern "C" fn hostfd_rw(fd: c_int, buf: *mut c_void, len: c_ulong, write: c_int) -> core::ffi::c_long {
+    let events = if write != 0 { POLLOUT } else { POLLIN };
+    let zero = crate::xabi::Timespec { tv_sec: 0, tv_nsec: 0 };
+    loop {
+        let mut p = crate::trap::PollFd { fd, events, revents: 0 };
+        match crate::trap::ppoll(Some(&mut p), Some(&zero)) {
+            Ok(n) if n > 0 => break,
+            Ok(_) => {}
+            Err(e) => return -(e.raw_os_error() as core::ffi::c_long),
+        }
+        let s = sched();
+        let deadline = s.now().saturating_add(FD_REPOLL_NS);
+        if FD_WAIT.0.get().is_none() {
+            FD_WAIT.0.set(Some((fd, events, s.current())));
+            s.block(Some(deadline));
+            FD_WAIT.0.set(None);
+        } else {
+            s.sleep_until(deadline);
+        }
+    }
+    let r = if write != 0 {
+        // SAFETY: the kernel's buffer of len bytes.
+        crate::trap::write(fd as u32, unsafe { core::slice::from_raw_parts(buf as *const u8, len as usize) })
+    } else {
+        // SAFETY: as above, writable.
+        crate::trap::read(fd as u32, unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len as usize) })
+    };
+    match r {
+        Ok(n) => n as core::ffi::c_long,
+        Err(e) => -(e.raw_os_error() as core::ffi::c_long),
+    }
+}
+
 // ---- the production Host: clocks and the idle wait ----
 
 /// The scheduler's [`Host`] in the sandbox: the host's clocks (rustix's vDSO calls: no syscall,
@@ -649,8 +703,21 @@ impl Host for SysHost {
         };
         let ts = timeout.map(|t| crate::xabi::Timespec { tv_sec: t.tv_sec, tv_nsec: t.tv_nsec });
         // Through the gate (the filter's one wait; rustix's poll would trap once the routing
-        // filter is in). EINTR (a signal) is a wake-up like any other.
-        let _ = crate::trap::ppoll(None, ts.as_ref());
+        // filter is in), watching the host fd a coroutine waits for, if any. EINTR (a signal) is
+        // a wake-up like any other.
+        match FD_WAIT.0.get() {
+            Some((fd, events, tid)) => {
+                let mut p = crate::trap::PollFd { fd, events, revents: 0 };
+                if let Ok(n) = crate::trap::ppoll(Some(&mut p), ts.as_ref())
+                    && n > 0
+                {
+                    sched().wake(tid);
+                }
+            }
+            None => {
+                let _ = crate::trap::ppoll(None, ts.as_ref());
+            }
+        }
     }
 }
 
