@@ -15,7 +15,6 @@
 
 pub mod setup;
 pub mod store;
-mod unpack;
 
 use std::convert::Infallible;
 use std::ffi::{CString, OsString};
@@ -153,7 +152,9 @@ pub struct GuestConfig {
 
 impl Default for GuestConfig {
     fn default() -> Self {
-        GuestConfig { memory: 4 << 30, kernel_memory: 32 << 20 }
+        // The kernel's memory holds its slab, the page cache of what the program reads from its
+        // images (evictable), and its ramfs files (/tmp).
+        GuestConfig { memory: 4 << 30, kernel_memory: 64 << 20 }
     }
 }
 
@@ -179,10 +180,7 @@ impl Image {
         self.name
     }
 
-    /// The guest's block device for it.
-    ///
-    /// STOPGAP(kernel item 12, memblk): the kernel has no block device over host memory yet, so
-    /// the device doesn't exist and [`setup::mount_erofs`] copies the image's files instead.
+    /// The guest's block device for it (a memblk disk, the kernel series' item 12).
     pub fn device(&self) -> PathBuf {
         Path::new("/dev/exobox").join(self.name)
     }
@@ -274,7 +272,9 @@ impl Guest {
         let stacks_len = COROUTINES * COROUTINE_STACK;
         let stacks = reserve(0, stacks_len, rw)?;
         let loglevel = std::env::var("EXOBOX_KERNEL_LOGLEVEL").unwrap_or_else(|_| "1".into());
-        let cmdline = CString::new(format!("mem={mem_mb}M loglevel={loglevel}")).unwrap();
+        // program_mem: what sysinfo and /proc/meminfo report (the kernel series' item 13): the
+        // program's memory is the arena, not the kernel's pool (V8 sizes its heap from it).
+        let cmdline = CString::new(format!("mem={mem_mb}M program_mem={memory} loglevel={loglevel}")).unwrap();
         // SAFETY: fresh reservations, the guest's from now on; this thread runs it.
         unsafe {
             guest::boot(guest::Boot {
@@ -303,12 +303,16 @@ impl Guest {
     }
 
     /// Map an erofs image read-only (a host `mmap`, before lockdown): the guest's read-only block
-    /// device `/dev/exobox/<name>`, the name being the file's, up to its first `.` (for an fd,
-    /// `image<N>`). Host code.
+    /// device `/dev/exobox/<name>` (a memblk disk over the mapping), the name being the file's
+    /// without `.erofs` (for an fd, `image<N>`). Host code.
     pub fn map_image<'a>(&mut self, source: impl Into<ImageSource<'a>>) -> Result<Image, Error> {
+        self.map_image_named(source.into(), None)
+    }
+
+    fn map_image_named(&mut self, source: ImageSource, name: Option<&str>) -> Result<Image, Error> {
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (file, name): (File, String) = match source.into() {
+        let (file, name_default): (File, String) = match source {
             ImageSource::Path(p) => {
                 let f = File::open(p).map_err(Error::io(p.display().to_string()))?;
                 let base = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -317,10 +321,16 @@ impl Guest {
             }
             ImageSource::Fd(fd) => (File::from(fd), format!("image{n}")),
         };
+        let name = name.map_or(name_default, str::to_owned);
+        if name.is_empty() || name.contains('/') || name.starts_with('.') {
+            return Err(Error::ImageArg(name));
+        }
         let len = file.metadata().map_err(Error::io(name.clone()))?.len() as usize;
-        let data: &'static [u8] = if len == 0 {
-            &[]
-        } else {
+        // memblk serves whole 512-byte sectors; an erofs image is whole 4 KiB blocks.
+        if len == 0 || !len.is_multiple_of(512) {
+            return Err(Error::io(name)(std::io::Error::new(std::io::ErrorKind::InvalidData, "not an image of whole blocks")));
+        }
+        let data: &'static [u8] = {
             // SAFETY: a read-only private mapping of the whole file, never unmapped.
             let p = unsafe {
                 libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, file.as_raw_fd(), 0)
@@ -331,8 +341,9 @@ impl Guest {
             // SAFETY: mapped above for the process's life.
             unsafe { std::slice::from_raw_parts(p as *const u8, len) }
         };
-        // STOPGAP(kernel item 12): no memblk device is made; mount_erofs unpacks `data`.
-        Ok(Image { name: Box::leak(name.into_boxed_str()), data })
+        let image = Image { name: Box::leak(name.into_boxed_str()), data };
+        setup::block_device(&image).map_err(Error::io(format!("the guest's {}", image.device().display())))?;
+        Ok(image)
     }
 
     /// Install the routing filter, run `before_exec` as the guest's init (every syscall it makes
@@ -507,9 +518,7 @@ pub fn store(config: &Config) -> Result<store::Store, Error> {
 /// starts; the process ends with the program's status.
 pub fn run(config: Config) -> Result<Infallible, Error> {
     let store = store(&config)?;
-    let mut guest = GuestConfig::default();
-    // STOPGAP(kernel item 12): the files the program opens are copied into the kernel's memory.
-    guest.kernel_memory += 224 << 20;
+    let guest = GuestConfig::default();
     let mut sb = Sandbox::boot(config.mode, guest)?;
     sb.deny(config.deny);
     for r in &config.rules {
@@ -520,8 +529,7 @@ pub fn run(config: Config) -> Result<Infallible, Error> {
         mounts.push((sb.map_image(&m.image)?, m.guest.clone()));
     }
     for i in &config.images {
-        let img = sb.map_image(&i.path)?;
-        let img = Image { name: Box::leak(i.name.clone().into_boxed_str()), ..img };
+        let img = sb.guest.map_image_named(ImageSource::Path(&i.path), Some(&i.name))?;
         if let Some(at) = &i.mount {
             mounts.push((img, at.clone()));
         }

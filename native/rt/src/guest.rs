@@ -22,19 +22,13 @@
 //! its errno. Pointers the emulations dereference are checked against the arena first (EFAULT);
 //! those passed to LKL are LKL's to read (it has no MMU: a bad one is a fault in the sandbox).
 //!
-//! **Stopgaps** for kernel items not landed yet, each marked `STOPGAP(item N)`:
-//! - item 11 (host stdio as guest files): the guest's fds 0-2 are placeholders (`/dev/null`,
-//!   opened by setup), and reads and writes on the fds that are, or were dup'ed from, them go to
-//!   the host's 0/1/2 here ([`Stdio`]). Redirections the program makes itself (`dup2` of another
-//!   file onto 1) work; a pipe can't carry them to another process, and a read of stdin holds the
-//!   one host thread until it returns.
-//! - item 13 (the memory size): `sysinfo` reports the arena's size and free space.
-//! - item 8 (signals): a signal the program sends its own process whose action is the default
-//!   and fatal ends the sandbox with 128 + the signal, as capnix did; handlers are recorded by
-//!   LKL but never run.
-//! - item 6 (exit reporting): init's exit status is what `lkl_syscall` returns for its
-//!   `exit_group` (item 4); a thread's exit is its coroutine's end (LKL's TLS destructor ends
-//!   its task).
+//! **Ends.** A task's end comes back from the kernel as the `task_exit` host op (item 6), on the
+//! task's own coroutine: init's (pid 1, after its exit ran in the guest) ends the sandbox with
+//! its status; another thread's ends its coroutine.
+//!
+//! **Stopgap** for a kernel item not landed yet, marked `STOPGAP(item 8)`: signals. A signal the
+//! program sends its own process whose action is the default and fatal ends the sandbox with
+//! 128 + the signal, as capnix did; handlers are recorded by LKL but never run.
 
 use core::cell::{Cell, UnsafeCell};
 use core::ffi::{CStr, c_long};
@@ -104,8 +98,6 @@ pub enum Phase {
 const THREADS: usize = 512;
 /// The program's main stack, mapped in the arena at exec (Linux's default `RLIMIT_STACK`).
 const STACK: usize = 8 << 20;
-/// Guest fds whose host-stdio placeholder status is tracked (STOPGAP(item 11)).
-const STDIO_FDS: usize = 64;
 
 /// A program thread's runtime state; slot 0 is the root's.
 struct Thread {
@@ -133,7 +125,12 @@ struct State {
     threads: [Thread; THREADS],
     /// Each signal's restorer (`rt_sigaction`'s `sa_restorer`, which LKL has no field for).
     restorers: [Cell<usize>; 65],
-    stdio: Stdio,
+    /// Calls served, for the dispatcher's turn-taking.
+    served: Cell<u32>,
+    /// The host's auxiliary vector values, for every exec.
+    aux: Cell<Aux>,
+    /// The running program's absolute path (STOPGAP(item 10): `/proc/self/exe`).
+    exe_len: Cell<usize>,
 }
 
 static S: State = State {
@@ -147,7 +144,9 @@ static S: State = State {
     threads: [const { Thread { used: Cell::new(false), co: Cell::new(0), attach: Cell::new(0), clear_tid: Cell::new(0) } };
         THREADS],
     restorers: [const { Cell::new(0) }; 65],
-    stdio: Stdio::new(),
+    served: Cell::new(0),
+    aux: Cell::new(Aux { hwcap: 0, hwcap2: 0, sysinfo_ehdr: 0, minsigstksz: 0 }),
+    exe_len: Cell::new(0),
 };
 
 // SAFETY: one host thread (see `Local`).
@@ -214,8 +213,12 @@ pub unsafe fn boot(b: Boot) -> Result<(), Error> {
         trap::set_altstack(ALTSTACK.get().as_mut_ptr(), trap::ALTSTACK_SIZE).map_err(err("sigaltstack"))?;
         trap::install(dispatch, target).map_err(err("the SIGSYS handler"))?;
     }
-    // SAFETY: the table and its scheduler are installed; one kernel per process.
-    let r = unsafe { l::lkl_init(host::ops()) };
+    // SAFETY: the table and its scheduler are installed; one kernel per process. The table is
+    // written only here, before the kernel reads it.
+    let r = unsafe {
+        (*host::ops()).task_exit = Some(task_exit);
+        l::lkl_init(host::ops())
+    };
     if r < 0 {
         return Err(Error { what: "lkl_init", errno: Errno::from_raw_os_error(-r) });
     }
@@ -278,7 +281,8 @@ pub struct Aux {
 /// (the root) coroutine, as init. Returns only if the program can't be loaded, with the errno an
 /// `execve` would give. From the setup phase (after [`route`]), on the root.
 pub fn exec(path: &[u8], argv: &[&[u8]], envp: &[&[u8]], aux: Aux) -> Errno {
-    match load(path, argv, envp, aux) {
+    S.aux.set(aux);
+    match load(path, argv, envp, false) {
         Ok(regs) => {
             // Everything this function's callers have on the root's stack is dead from here: the
             // root's trap frames go below this point (`target`).
@@ -298,7 +302,10 @@ pub fn exec(path: &[u8], argv: &[&[u8]], envp: &[&[u8]], aux: Aux) -> Errno {
     }
 }
 
-fn load(path: &[u8], argv: &[&[u8]], envp: &[&[u8]], aux: Aux) -> Result<Registers, Errno> {
+/// Open, check and map a program, and build its stack. With `replace`, the old image (the whole
+/// arena) is dropped first, once nothing can fail any more short of memory: the guest's execve.
+fn load(path: &[u8], argv: &[&[u8]], envp: &[&[u8]], replace: bool) -> Result<Registers, Errno> {
+    let aux = S.aux.get();
     let mut g = Guest;
     // SAFETY: the loader's scratch is used only here, once.
     let scratch = unsafe { SCRATCH.get() };
@@ -328,12 +335,25 @@ fn load(path: &[u8], argv: &[&[u8]], envp: &[&[u8]], aux: Aux) -> Result<Registe
         prog.close(&mut g);
         return Err(e);
     }
+    set_exe(path);
     with_arena(|a, b| {
-        let img = prog.map(a, b)?;
-        let lo = a.mmap(b, 0, STACK, arena::PROT_READ | arena::PROT_WRITE, arena::MAP_PRIVATE | arena::MAP_ANONYMOUS, None)?;
-        // SAFETY: just mapped, read/write, the program's from now on.
-        let start = unsafe { img.build_stack(lo, lo + STACK, &p) }?;
-        Ok(start.registers())
+        if replace {
+            // The point of no return. Shared file mappings are written back as they go.
+            let (lo, hi) = (S.arena_lo.get(), S.arena_hi.get());
+            let _ = a.munmap(b, lo, hi - lo);
+        }
+        let r = (|| {
+            let img = prog.map(a, b)?;
+            let lo = a.mmap(b, 0, STACK, arena::PROT_READ | arena::PROT_WRITE, arena::MAP_PRIVATE | arena::MAP_ANONYMOUS, None)?;
+            // SAFETY: just mapped, read/write, the program's from now on.
+            let start = unsafe { img.build_stack(lo, lo + STACK, &p) }?;
+            Ok(start.registers())
+        })();
+        if replace && r.is_err() {
+            // The old image is gone: Linux kills a process that fails here (SIGSEGV).
+            finish(128 + 11);
+        }
+        r
     })
 }
 
@@ -364,7 +384,6 @@ impl Files for Guest {
         const X_OK: usize = 1;
         res(lkl_call(lkl::FACCESSAT as c_long, [k::AT_FDCWD as isize as usize, p, X_OK, 0, 0, 0]))?;
         let fd = res(lkl_call(lkl::OPENAT as c_long, [k::AT_FDCWD as isize as usize, p, O_CLOEXEC, 0, 0, 0]))?;
-        fill(fd);
         let mut st = LklStat::default();
         let r = res(lkl_call(lkl::FSTAT as c_long, [fd, &mut st as *mut _ as usize, 0, 0, 0, 0]));
         if r.is_err() || st.st_mode & 0o170000 != 0o100000 {
@@ -574,334 +593,73 @@ fn clone(uc: &Ucontext, a: [usize; 6]) -> Result<usize, Errno> {
     Ok(tid)
 }
 
-/// The sandbox ends with `code`: shared file mappings written back, then the host's exit.
+/// The sandbox ends with `code`: the host's exit.
 fn finish(code: i32) -> ! {
-    if S.phase.get() == Phase::Program {
-        let _ = with_arena(|a, b| a.writeback_all(b));
-    }
     trap::exit_group(code)
 }
 
-/// init's end: `lkl_syscall` returns its wait status (item 4).
-fn exit_group(code: usize) -> ! {
-    let st = lkl_call(l::__lkl__NR_exit_group, [code, 0, 0, 0, 0, 0]);
-    finish(if st >= 0 { ((st >> 8) & 0xff) as i32 } else { code as i32 & 0xff })
+/// The process is about to end: its writable shared file mappings written back while the files
+/// the arena holds for them are still open (init's exit closes them).
+fn writeback() {
+    if S.phase.get() == Phase::Program {
+        let _ = with_arena(|a, b| a.writeback_all(b));
+    }
 }
 
-/// A thread's `exit`: its tid word cleared and woken, then its coroutine ends (and LKL's TLS
-/// destructor ends its task). The main thread's exit while others run: not yet.
+/// `exit_group`: the guest ends the process's threads; the calling one's end comes back as
+/// `task_exit`, init's last (pid 1) with the status.
+fn exit_group(code: usize) -> ! {
+    writeback();
+    lkl_call(l::__lkl__NR_exit_group, [code, 0, 0, 0, 0, 0]);
+    // Only if the kernel refused (it doesn't): end anyway.
+    finish(code as i32 & 0xff)
+}
+
+/// A thread's `exit`: its tid word cleared and woken, then the guest's exit, which comes back as
+/// `task_exit`.
 fn exit_thread(code: usize) -> ! {
     let t = me();
     let ct = t.clear_tid.replace(0);
     if ct != 0 && write_user(ct, 0u32).is_ok() {
         futexes().wake(&SCHED, ct, 1, futex::FUTEX_BITSET_MATCH_ANY);
     }
+    if S.threads.iter().filter(|t| t.used.get()).count() == 1 {
+        // The process's last thread: its exit is the process's.
+        writeback();
+    }
+    lkl_call(l::__lkl__NR_exit, [code, 0, 0, 0, 0, 0]);
+    finish(code as i32 & 0xff)
+}
+
+/// The `task_exit` host op (item 6): the calling coroutine's task ended in its syscall, the CPU
+/// released and LKL's TLS for it cleared. pid 1: init's end, the sandbox's, with its wait status
+/// (a fatal signal as 128 + it, as a shell reports it). Otherwise a thread: its coroutine ends.
+unsafe extern "C" fn task_exit(pid: core::ffi::c_int, status: core::ffi::c_int) {
+    if pid == 1 {
+        let code = if status & 0x7f == 0 { (status >> 8) & 0xff } else { 128 + (status & 0x7f) };
+        finish(code);
+    }
+    let t = me();
     if core::ptr::eq(t, &S.threads[0]) {
-        // init's last thread: its exit is init's (lkl_syscall returns the status).
-        let st = lkl_call(l::__lkl__NR_exit, [code, 0, 0, 0, 0, 0]);
-        if st >= 0 {
-            finish(((st >> 8) & 0xff) as i32);
-        }
-        // TODO(item 6): the main thread ends before its other threads; it waits forever here.
+        // The root is the host thread and can't end: init's main thread ended before its other
+        // threads (pthread_exit from main). It has nothing left to run.
         loop {
             SCHED.block(None);
         }
     }
-    // Its first LKL call (a thread that made none still has a guest task waiting to be taken).
-    lkl_call(l::__lkl__NR_gettid, [0; 6]);
     t.co.set(0);
     t.used.set(false);
     SCHED.exit(0)
 }
 
 // ------------------------------------------------------------------------------------------------
-// STOPGAP(item 12): image files filled on first open.
+// Numbers the dispatcher looks at before routing.
 
-/// A regular file of an image unpacked into the guest's ramfs (`exobox::setup::mount_erofs`)
-/// empty: its contents are written in from the host mapping the first time any open of it
-/// succeeds, so a closure of hundreds of MB costs only what the program opens; until then stat
-/// calls report its real size. Until memblk mounts images in place.
-#[derive(Debug)]
-pub struct LazyFile {
-    /// Its inode number on the guest's root filesystem.
-    pub ino: u64,
-    /// Its contents, in the image's host mapping.
-    pub data: &'static [u8],
-    /// 0: empty, 1: being filled, 2: filled.
-    state: Cell<u8>,
-}
-
-impl LazyFile {
-    pub fn new(ino: u64, data: &'static [u8]) -> Self {
-        LazyFile { ino, data, state: Cell::new(0) }
-    }
-}
-
-const LAZY_TABLES: usize = 256;
-
-struct Lazy {
-    /// The root filesystem's `st_dev`, which the inode numbers are of, and as statx gives it.
-    dev: Cell<u64>,
-    statx_dev: Cell<(u32, u32)>,
-    tables: [Cell<&'static [LazyFile]>; LAZY_TABLES],
-}
-
-// SAFETY: one host thread (see `Local`).
-unsafe impl Sync for Lazy {}
-
-static LAZY: Lazy = Lazy { dev: Cell::new(u64::MAX), statx_dev: Cell::new((0, 0)), tables: [const { Cell::new(&[]) }; LAZY_TABLES] };
-
-/// Register an image's lazy files, sorted by `ino`, all on the filesystem of `/`.
-pub fn lazy_files(files: &'static [LazyFile]) -> Result<(), Error> {
-    debug_assert!(files.is_sorted_by_key(|f| f.ino));
-    if LAZY.dev.get() == u64::MAX {
-        let mut st = LklStat::default();
-        let r = lkl_call(lkl::NEWFSTATAT as c_long, [k::AT_FDCWD as isize as usize, c"/".as_ptr() as usize, &mut st as *mut _ as usize, 0, 0, 0]);
-        res(r).map_err(err("stat /"))?;
-        let mut stx = [0u8; 256];
-        const STATX_BASIC_STATS: usize = 0x7ff;
-        let r = lkl_call(l::__lkl__NR_statx, [k::AT_FDCWD as isize as usize, c"/".as_ptr() as usize, 0, STATX_BASIC_STATS, stx.as_mut_ptr() as usize, 0]);
-        res(r).map_err(err("statx /"))?;
-        let u32_at = |o: usize| u32::from_ne_bytes(stx[o..o + 4].try_into().unwrap());
-        LAZY.statx_dev.set((u32_at(STX_DEV_MAJOR), u32_at(STX_DEV_MINOR)));
-        LAZY.dev.set(st.st_dev);
-    }
-    let slot = LAZY.tables.iter().find(|t| t.get().is_empty()).ok_or(Error { what: "lazy image tables", errno: Errno::NOSPC })?;
-    slot.set(files);
-    Ok(())
-}
-
-// struct statx's fields the size fix reads and writes.
-const STX_INO: usize = 32;
-const STX_SIZE: usize = 40;
-const STX_DEV_MAJOR: usize = 136;
-const STX_DEV_MINOR: usize = 140;
-
-fn lazy_file(ino: u64) -> Option<&'static LazyFile> {
-    LAZY.tables.iter().find_map(|t| {
-        let t = t.get();
-        t.binary_search_by_key(&ino, |f| f.ino).ok().map(|i| &t[i])
-    })
-}
-
-/// A stat result for an image file not filled yet: its real size, not the placeholder's 0.
-fn lazy_stat(st: &mut LklStat) {
-    if st.st_dev == LAZY.dev.get() && st.st_size == 0 && st.st_mode & 0o170000 == 0o100000
-        && let Some(f) = lazy_file(st.st_ino).filter(|f| f.state.get() != 2)
-    {
-        st.st_size = f.data.len() as i64;
-        st.st_blocks = f.data.len().div_ceil(512) as i64;
-    }
-}
-
-/// The same for a statx result the program asked for, in its buffer.
-fn lazy_statx(buf: usize) {
-    if LAZY.dev.get() == u64::MAX || !user(buf, 256) {
-        return;
-    }
-    // SAFETY: checked to be program memory, struct statx's 256 bytes.
-    let b = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, 256) };
-    let u32_at = |b: &[u8], o: usize| u32::from_ne_bytes(b[o..o + 4].try_into().unwrap());
-    let u64_at = |b: &[u8], o: usize| u64::from_ne_bytes(b[o..o + 8].try_into().unwrap());
-    if (u32_at(b, STX_DEV_MAJOR), u32_at(b, STX_DEV_MINOR)) != LAZY.statx_dev.get() || u64_at(b, STX_SIZE) != 0 {
-        return;
-    }
-    if let Some(f) = lazy_file(u64_at(b, STX_INO)).filter(|f| f.state.get() != 2) {
-        b[STX_SIZE..STX_SIZE + 8].copy_from_slice(&(f.data.len() as u64).to_ne_bytes());
-    }
-}
-
-/// After a successful open of `fd`: if it is an image file not filled yet, fill it.
-fn fill(fd: usize) {
-    if LAZY.dev.get() == u64::MAX {
-        return;
-    }
-    let mut st = LklStat::default();
-    if lkl_call(lkl::FSTAT as c_long, [fd, &mut st as *mut _ as usize, 0, 0, 0, 0]) != 0
-        || st.st_dev != LAZY.dev.get()
-        || st.st_mode & 0o170000 != 0o100000
-    {
-        return;
-    }
-    let Some(f) = lazy_file(st.st_ino) else {
-        return;
-    };
-    while f.state.get() == 1 {
-        SCHED.yield_now();
-    }
-    if f.state.get() == 2 {
-        return;
-    }
-    f.state.set(1);
-    // A write handle on the same file (the program's fd may be read-only): /proc/self/fd/<fd>.
-    let mut path = *b"/proc/self/fd/\0\0\0\0\0\0\0\0\0\0\0";
-    let mut n = 14;
-    let mut digits = [0u8; 10];
-    let (mut v, mut d) = (fd, 0);
-    loop {
-        digits[d] = b'0' + (v % 10) as u8;
-        d += 1;
-        v /= 10;
-        if v == 0 {
-            break;
-        }
-    }
-    while d > 0 {
-        d -= 1;
-        path[n] = digits[d];
-        n += 1;
-    }
-    const O_WRONLY: usize = 1;
-    const O_CLOEXEC: usize = 0o2000000;
-    let w = lkl_call(lkl::OPENAT as c_long, [k::AT_FDCWD as isize as usize, path.as_ptr() as usize, O_WRONLY | O_CLOEXEC, 0, 0, 0]);
-    if w >= 0 {
-        let mut off = 0;
-        while off < f.data.len() {
-            let chunk = (f.data.len() - off).min(1 << 20);
-            let r = lkl_call(l::__lkl__NR_pwrite64, [w as usize, f.data[off..].as_ptr() as usize, chunk, off, 0, 0]);
-            if r <= 0 {
-                break;
-            }
-            off += r as usize;
-        }
-        lkl_call(l::__lkl__NR_close, [w as usize, 0, 0, 0, 0, 0]);
-    }
-    f.state.set(2);
-}
-
-// ------------------------------------------------------------------------------------------------
-// STOPGAP(item 11): host stdio behind the guest's placeholder fds.
-
-struct Stdio {
-    /// For each guest fd below STDIO_FDS: the host fd it stands for, or -1.
-    host: [Cell<i8>; STDIO_FDS],
-}
-
-impl Stdio {
-    const fn new() -> Self {
-        let mut host = [const { Cell::new(-1) }; STDIO_FDS];
-        host[0] = Cell::new(0);
-        host[1] = Cell::new(1);
-        host[2] = Cell::new(2);
-        Stdio { host }
-    }
-    fn of(&self, fd: usize) -> Option<u32> {
-        let h = self.host.get(fd)?.get();
-        (h >= 0).then_some(h as u32)
-    }
-    fn set(&self, fd: usize, h: Option<u32>) {
-        if let Some(c) = self.host.get(fd) {
-            c.set(h.map_or(-1, |h| h as i8));
-        }
-    }
-}
-
-const NR_READ: usize = 0;
-const NR_WRITE: usize = 1;
-const NR_CLOSE: usize = 3;
-const NR_READV: usize = 19;
-const NR_WRITEV: usize = 20;
-const NR_DUP: usize = 32;
 const NR_KILL: usize = 62;
-const NR_FCNTL: usize = 72;
-const NR_SYSINFO: usize = 99;
+const NR_READLINK: usize = 89;
+const NR_READLINKAT: usize = 267;
 const NR_TKILL: usize = 200;
 const NR_TGKILL: usize = 234;
-const NR_DUP3: usize = 292;
-const NR_CLOSE_RANGE: usize = 436;
-
-/// One read or write on host stdio `h`: the filter allows reads of 0 and writes of 1 and 2.
-fn stdio_io(write: bool, h: u32, p: usize, n: usize) -> isize {
-    if !user(p, n) {
-        return -(Errno::FAULT.raw_os_error() as isize);
-    }
-    // SAFETY: checked to be program memory.
-    let r = unsafe {
-        if write {
-            if h == 0 {
-                return -(Errno::BADF.raw_os_error() as isize);
-            }
-            trap::write(h, core::slice::from_raw_parts(p as *const u8, n))
-        } else {
-            if h != 0 {
-                return -(Errno::BADF.raw_os_error() as isize);
-            }
-            trap::read(0, core::slice::from_raw_parts_mut(p as *mut u8, n))
-        }
-    };
-    ret(r)
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Iovec {
-    base: usize,
-    len: usize,
-}
-
-/// The calls on fds that may be host stdio, before routing (None: not stdio, route as usual).
-fn stdio_call(nr: usize, a: [usize; 6]) -> Option<isize> {
-    let st = &S.stdio;
-    match nr {
-        NR_READ | NR_WRITE => {
-            let h = st.of(a[0])?;
-            Some(stdio_io(nr == NR_WRITE, h, a[1], a[2]))
-        }
-        NR_READV | NR_WRITEV => {
-            let h = st.of(a[0])?;
-            let mut total = 0isize;
-            for i in 0..a[2].min(1024) {
-                let v: Iovec = match read_user(a[1] + i * size_of::<Iovec>()) {
-                    Ok(v) => v,
-                    Err(e) => return Some(-(e.raw_os_error() as isize)),
-                };
-                if v.len == 0 {
-                    continue;
-                }
-                let r = stdio_io(nr == NR_WRITEV, h, v.base, v.len);
-                if r < 0 {
-                    return Some(if total > 0 { total } else { r });
-                }
-                total += r;
-                if (r as usize) < v.len {
-                    break;
-                }
-            }
-            Some(total)
-        }
-        NR_CLOSE => {
-            st.set(a[0], None);
-            None
-        }
-        NR_DUP | NR_DUP3 | NR_FCNTL => {
-            const F_DUPFD: usize = 0;
-            const F_DUPFD_CLOEXEC: usize = 1030;
-            let h = st.of(a[0]);
-            if nr == NR_FCNTL && a[1] != F_DUPFD && a[1] != F_DUPFD_CLOEXEC {
-                return None;
-            }
-            let r = match nr {
-                NR_DUP => lkl_call(23, a),
-                NR_DUP3 => lkl_call(lkl::DUP3 as c_long, a),
-                _ => lkl_call(lkl::FCNTL as c_long, a),
-            };
-            if r >= 0 {
-                st.set(r as usize, h);
-            }
-            Some(r)
-        }
-        NR_CLOSE_RANGE => {
-            const CLOSE_RANGE_CLOEXEC: usize = 4;
-            if a[2] & CLOSE_RANGE_CLOEXEC == 0 {
-                for fd in a[0]..=a[1].min(STDIO_FDS - 1) {
-                    st.set(fd, None);
-                }
-            }
-            None
-        }
-        _ => None,
-    }
-}
 
 // ------------------------------------------------------------------------------------------------
 // STOPGAP(item 8): signals the program sends its own process.
@@ -934,10 +692,126 @@ fn self_signal(nr: usize, a: [usize; 6]) -> Option<isize> {
     const SIG_DFL: usize = 0;
     let ignored_by_default = matches!(sig, SIGCHLD | SIGCONT | SIGURG | SIGWINCH | SIGSTOP..=SIGTTOU);
     if old.handler == SIG_DFL && !ignored_by_default {
+        writeback();
         finish(128 + sig as i32);
     }
     // TODO(item 8): a handler is recorded but not run; SIG_IGN and ignored defaults do nothing.
     Some(0)
+}
+
+// ------------------------------------------------------------------------------------------------
+// The guest's own execve.
+
+/// The program's path and arguments, copied out of the old image before it goes.
+static EXEC_STRINGS: Local<[u8; 1 << 20]> = Local::new([0; 1 << 20]);
+static EXEC_ARGS: Local<[&'static [u8]; 8192]> = Local::new([&[]; 8192]);
+/// The path `/proc/self/exe` names (STOPGAP(item 10)).
+static EXE: Local<[u8; exec::PATH_MAX]> = Local::new([0; exec::PATH_MAX]);
+
+/// A NUL-terminated string of the program's, without its NUL (EFAULT outside its memory,
+/// ENAMETOOLONG past `max`).
+fn user_cstr(p: usize, max: usize) -> Result<&'static [u8], Errno> {
+    for n in 0..max {
+        if !user(p + n, 1) {
+            return Err(Errno::FAULT);
+        }
+        // SAFETY: checked to be program memory.
+        if unsafe { *((p + n) as *const u8) } == 0 {
+            // SAFETY: the n bytes just read.
+            return Ok(unsafe { core::slice::from_raw_parts(p as *const u8, n) });
+        }
+    }
+    Err(Errno::NAMETOOLONG)
+}
+
+/// STOPGAP(item 10, exec's kernel half): `/proc/self/exe` is init's `/init` in the guest, so ld.so
+/// can't find `$ORIGIN` (RUNPATHs like the fixtures'); the dispatcher answers `readlink` of it
+/// with the path exec loaded, made absolute.
+fn set_exe(path: &[u8]) {
+    // SAFETY: only exec and readlink use it, never at once.
+    let exe = unsafe { EXE.get() };
+    let mut n = 0;
+    if path.first() != Some(&b'/') {
+        let r = lkl_call(l::__lkl__NR_getcwd, [exe.as_mut_ptr() as usize, exe.len(), 0, 0, 0, 0]);
+        if r > 0 {
+            n = r as usize - 1; // without its NUL
+            if n > 1 && n < exe.len() {
+                exe[n] = b'/';
+                n += 1;
+            }
+        }
+    }
+    let m = path.len().min(exe.len() - n);
+    exe[n..n + m].copy_from_slice(&path[..m]);
+    S.exe_len.set(n + m);
+}
+
+/// `readlink`/`readlinkat` of `/proc/self/exe` (or `/proc/1/exe`): the program's path.
+fn readlink_exe(path: usize, buf: usize, size: usize) -> Option<isize> {
+    let p = user_cstr(path, 32).ok()?;
+    if (p != b"/proc/self/exe" && p != b"/proc/1/exe") || S.exe_len.get() == 0 {
+        return None;
+    }
+    // SAFETY: as set_exe.
+    let exe = &unsafe { EXE.get() }[..S.exe_len.get()];
+    let n = exe.len().min(size);
+    if !user(buf, n) {
+        return Some(-(Errno::FAULT.raw_os_error() as isize));
+    }
+    // SAFETY: checked to be program memory.
+    unsafe { core::ptr::copy_nonoverlapping(exe.as_ptr(), buf as *mut u8, n) };
+    Some(n as isize)
+}
+
+/// `execve(path, argv, envp)` inside the guest: the new image replaces the old one in the arena
+/// and the calling thread resumes at its start. Errors before the point of no return leave the old
+/// image as it was. Not yet: the kernel's half (close-on-exec fds, handlers reset: item 10) and
+/// ending the process's other threads.
+fn execve(uc: &mut Ucontext, path: usize, argv: usize, envp: usize) -> Result<usize, Errno> {
+    // SAFETY: the guest's execve runs one at a time (nothing in it suspends while these are
+    // being filled: user memory is read directly).
+    let (strings, args) = unsafe { (EXEC_STRINGS.get(), EXEC_ARGS.get()) };
+    let mut used = 0;
+    let mut copy = |s: &[u8]| -> Result<&'static [u8], Errno> {
+        let at = used;
+        used += s.len();
+        if used > strings.len() {
+            return Err(Errno::TOOBIG);
+        }
+        strings[at..used].copy_from_slice(s);
+        // SAFETY: the static buffer; this region isn't written again during this exec.
+        Ok(unsafe { core::slice::from_raw_parts(strings.as_ptr().add(at), s.len()) })
+    };
+    let path = copy(user_cstr(path, exec::PATH_MAX)?)?;
+    let mut n = 0;
+    let mut vector = |v: usize| -> Result<usize, Errno> {
+        let start = n;
+        if v == 0 {
+            return Ok(0);
+        }
+        loop {
+            let p: usize = read_user(v + (n - start) * 8)?;
+            if p == 0 {
+                return Ok(n - start);
+            }
+            if n == args.len() {
+                return Err(Errno::TOOBIG);
+            }
+            args[n] = copy(user_cstr(p, exec::MAX_ARG_STRLEN)?)?;
+            n += 1;
+        }
+    };
+    let nargv = vector(argv)?;
+    let nenvp = vector(envp)?;
+    let (argv, envp) = args[..nargv + nenvp].split_at(nargv);
+    let regs = load(path, argv, envp, true)?;
+    let m = &mut uc.mcontext;
+    (m.rax, m.rbx, m.rcx, m.rdx, m.rsi, m.rdi, m.rbp) = (0, 0, 0, 0, 0, 0, 0);
+    (m.r8, m.r9, m.r10, m.r11, m.r12, m.r13, m.r14, m.r15) = (0, 0, 0, 0, 0, 0, 0, 0);
+    m.rsp = regs.rsp;
+    m.rip = regs.rip;
+    m.fs_base = 0;
+    Ok(0)
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -971,54 +845,39 @@ fn dispatch(uc: &mut Ucontext) {
     let (nr, a) = uc.syscall();
     let r = serve(uc, nr, a);
     uc.set_return(r);
+    // No preemption here: a thread whose calls never block (a poll with timeout 0 in a loop)
+    // would keep every other coroutine from running, a new thread among them (it isn't the
+    // kernel's to schedule until its first call attaches it). So every so many calls, the others
+    // get a turn (threadpoll's last run hung without it).
+    let n = S.served.get().wrapping_add(1);
+    S.served.set(n);
+    if n.is_multiple_of(32) && S.phase.get() == Phase::Program {
+        SCHED.yield_now();
+    }
 }
 
+
 fn serve(uc: &mut Ucontext, nr: usize, a: [usize; 6]) -> isize {
-    if let Some(r) = stdio_call(nr, a) {
+    if matches!(nr, NR_KILL | NR_TKILL | NR_TGKILL)
+        && let Some(r) = self_signal(nr, a)
+    {
         return r;
     }
-    match nr {
-        NR_KILL | NR_TKILL | NR_TGKILL => {
-            if let Some(r) = self_signal(nr, a) {
-                return r;
-            }
-        }
-        NR_SYSINFO => return sysinfo(a[0]),
-        _ => {}
+    // STOPGAP(item 10): readlink, readlinkat(AT_FDCWD) of /proc/self/exe.
+    let exe = match nr {
+        NR_READLINK => readlink_exe(a[0], a[1], a[2]),
+        NR_READLINKAT if a[0] as i32 == k::AT_FDCWD => readlink_exe(a[1], a[2], a[3]),
+        _ => None,
+    };
+    if let Some(r) = exe {
+        return r;
     }
-    let r = match sysmap::route(nr) {
+    match sysmap::route(nr) {
         Route::Lkl(n) => lkl_call(n as c_long, a),
         Route::Rewrite(rw) => rewrite(rw, a),
         Route::Emulate(e) => emulate(uc, e, nr, a),
         Route::Errno(e) => e.ret(),
-    };
-    // STOPGAP(item 12): open, openat, openat2 of an image file not filled yet.
-    if matches!(nr, 2 | 257 | 437) && r >= 0 {
-        fill(r as usize);
     }
-    if nr == 332 && r == 0 {
-        lazy_statx(a[4]);
-    }
-    r
-}
-
-/// STOPGAP(item 13): `sysinfo` says the arena's size (the program's memory), not the kernel's pool.
-fn sysinfo(p: usize) -> isize {
-    if !user(p, 112) {
-        return -(Errno::FAULT.raw_os_error() as isize);
-    }
-    let r = lkl_call(l::__lkl__NR_sysinfo, [p, 0, 0, 0, 0, 0]);
-    if r == 0 && S.phase.get() == Phase::Program {
-        let st = with_arena(|a, _| a.stats());
-        // struct sysinfo: totalram at 32, freeram at 40, mem_unit at 104.
-        // SAFETY: checked above.
-        unsafe {
-            ((p + 32) as *mut u64).write_unaligned(st.size as u64);
-            ((p + 40) as *mut u64).write_unaligned((st.size - st.mapped) as u64);
-            ((p + 104) as *mut u32).write_unaligned(1);
-        }
-    }
-    r
 }
 
 fn rewrite(rw: Rewrite, a: [usize; 6]) -> isize {
@@ -1039,7 +898,6 @@ fn rewrite(rw: Rewrite, a: [usize; 6]) -> isize {
             if r < 0 {
                 return r;
             }
-            lazy_stat(&mut st);
             ret(write_user::<X86Stat>(buf, xabi::stat_to_x86(&st)).map(|_| 0))
         }
         Rewrite::Poll => {
@@ -1068,12 +926,7 @@ fn rewrite(rw: Rewrite, a: [usize; 6]) -> isize {
                 let r = lkl_call(lkl::FCNTL as c_long, [a[0], k::F_GETFD as usize, 0, 0, 0, 0]);
                 return if r < 0 { r } else { a[1] as isize };
             }
-            let h = S.stdio.of(a[0]);
-            let r = lkl_call(lkl::DUP3 as c_long, [a[0], a[1], 0, 0, 0, 0]);
-            if r >= 0 {
-                S.stdio.set(a[1], h);
-            }
-            r
+            lkl_call(lkl::DUP3 as c_long, [a[0], a[1], 0, 0, 0, 0])
         }
         Rewrite::EpollCreate => {
             if a[0] as i32 <= 0 {
@@ -1201,9 +1054,6 @@ fn emulate(uc: &mut Ucontext, e: Emulate, nr: usize, a: [usize; 6]) -> isize {
             let file = if flags & arena::MAP_ANONYMOUS != 0 {
                 None
             } else {
-                if a[4] as i32 >= 0 && S.stdio.of(a[4]).is_some() {
-                    return -(Errno::NODEV.raw_os_error() as isize);
-                }
                 Some(FileMap { file: a[4] as i32 as u64, offset: a[5] as u64 })
             };
             if file.is_some_and(|f| f.file > i32::MAX as u64) {
@@ -1275,7 +1125,11 @@ fn emulate(uc: &mut Ucontext, e: Emulate, nr: usize, a: [usize; 6]) -> isize {
             }
         }
         // TODO: the guest's own execve (argv and envp copied out before the old image goes).
-        E::Execve | E::Execveat => -(Errno::NOSYS.raw_os_error() as isize),
+        E::Execve if !program => -(Errno::NOSYS.raw_os_error() as isize),
+        E::Execve => ret(execve(uc, a[0], a[1], a[2])),
+        // execveat(dfd, path, argv, envp, flags): from the working directory only, so far.
+        E::Execveat if program && a[0] as i32 == k::AT_FDCWD && a[4] == 0 => ret(execve(uc, a[1], a[2], a[3])),
+        E::Execveat => -(Errno::NOSYS.raw_os_error() as isize),
         // TODO(item 8): no handler is run, so there is nothing to return from.
         E::SigReturn => -(Errno::NOSYS.raw_os_error() as isize),
         E::Prctl => {

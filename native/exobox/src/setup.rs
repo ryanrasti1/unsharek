@@ -11,22 +11,30 @@ use lkl_sys as l;
 
 use crate::{Error, Image};
 
-/// Mount `image` at `path` (made if missing), read-only.
-///
-/// STOPGAP(kernel item 12, memblk): the kernel can't mount the image's block device yet
-/// ([`Image::device`]), so its tree is made in the guest's ramfs under `path` (writable), each
-/// file's contents copied in from the host mapping when it is first opened (and then paid for in
-/// the kernel's memory). When memblk lands this becomes
-/// `mount(image.device(), path, "erofs", MS_RDONLY)`.
+/// Mount `image` (its block device, [`Image::device`]) at `path`, made if missing, read-only.
+/// From a setup closure: `mkdir` and `mount(2)` are the guest's there.
 pub fn mount_erofs(image: &Image, path: impl AsRef<Path>) -> Result<(), Error> {
     let path = path.as_ref();
-    let mut lazy = vec![];
-    crate::unpack::unpack(image.bytes(), path, true, &mut lazy)
-        .map_err(Error::io(format!("{} at {}", image.name(), path.display())))?;
-    lazy.sort_by_key(|l| l.0);
-    let files: Vec<guest::LazyFile> = lazy.into_iter().map(|(ino, data)| guest::LazyFile::new(ino, data)).collect();
-    guest::lazy_files(Vec::leak(files))?;
+    let what = || format!("mounting {} at {}", image.device().display(), path.display());
+    std::fs::create_dir_all(path).map_err(Error::io(what()))?;
+    let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+    let (dev, at) = (c(&image.device()), c(path));
+    // SAFETY: NUL-terminated strings, live for the call.
+    let r = unsafe { libc::mount(dev.as_ptr(), at.as_ptr(), c"erofs".as_ptr(), libc::MS_RDONLY, std::ptr::null()) };
+    if r != 0 {
+        return Err(Error::io(what())(io::Error::last_os_error()));
+    }
     Ok(())
+}
+
+/// `image`'s disk in the guest (memblk over its host mapping) and its node, `/dev/exobox/<name>`.
+/// Host code before `run` ([`crate::Guest::map_image`]).
+pub(crate) fn block_device(image: &Image) -> io::Result<()> {
+    let b = image.bytes();
+    let dev = sys(l::__lkl__NR_memblk_add, [b.as_ptr() as usize, b.len(), 0, 0, 0, 0])?;
+    mkdir(c"/dev/exobox", 0o755)?;
+    let node = std::ffi::CString::new(image.device().into_os_string().into_encoded_bytes()).unwrap();
+    sys(l::__lkl__NR_mknodat, [AT_FDCWD, p(&node), libc::S_IFBLK as usize | 0o400, dev, 0, 0]).map(|_| ())
 }
 
 /// A Nix closure: each image mounted at its store path (or allowed host directory), as
@@ -90,8 +98,9 @@ fn close(fd: usize) {
 /// guest's `getrandom` would wait for entropy a cooperative kernel can't gather), loopback up,
 /// and fds 0-2.
 ///
-/// STOPGAP(kernel item 11): fds 0-2 are `/dev/null` placeholders that the runtime serves from the
-/// host's stdio (`exobox_rt::guest`), so they have a file type but aren't the host's files.
+/// fds 0-2 are the host's (`host_fd`, the kernel series' item 11): guest files whose reads and
+/// writes the runtime does on the host's 0-2 (`exobox_rt::host`'s `hostfd_rw`), so `dup2`, pipes
+/// and inheritance treat them as any file.
 pub fn defaults(entropy: &[u8]) -> io::Result<()> {
     mkdir(c"/proc", 0o555)?;
     mount(c"proc", c"/proc", c"proc", 0, 0)?;
@@ -138,13 +147,11 @@ pub fn defaults(entropy: &[u8]) -> io::Result<()> {
     close(s);
     r?;
 
-    // fds 0-2: the lowest free fds, so opening until 2 is taken fills exactly the missing ones.
-    const F_GETFD: usize = 1;
-    while sys(l::__lkl__NR_fcntl, [2, F_GETFD, 0, 0, 0, 0]).is_err() {
-        let fd = open(c"/dev/null", libc::O_RDWR as usize)?;
-        if fd > 2 {
-            close(fd);
-            break;
+    // fds 0-2: host_fd takes the lowest free fd, and init has none yet (no console).
+    for k in 0..3 {
+        let fd = sys(l::__lkl__NR_host_fd, [k, libc::O_RDWR as usize, 0, 0, 0, 0])?;
+        if fd != k {
+            return Err(io::Error::other(format!("host_fd({k}) made fd {fd}")));
         }
     }
     Ok(())
