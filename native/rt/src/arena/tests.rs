@@ -131,9 +131,9 @@ fn table(cap: usize) -> Vec<Extent> {
     vec![Extent::EMPTY; cap]
 }
 
-fn arena<'t>(r: &Reservation, mode: Mode, exec: bool, t: &'t mut [Extent]) -> Arena<'t> {
+fn arena<'t>(r: &Reservation, mode: Mode, t: &'t mut [Extent]) -> Arena<'t> {
     // SAFETY: the reservation is read/write, zero, and the arena's alone.
-    unsafe { Arena::new(r.base, r.len, exec, mode, t) }.unwrap()
+    unsafe { Arena::new(r.base, r.len, mode, t) }.unwrap()
 }
 
 fn prot_at(a: &Arena, addr: usize) -> Option<u32> {
@@ -219,7 +219,7 @@ fn check_page(base: usize, p: usize, pg: Pg) -> std::result::Result<(), TestCase
 fn run(mode: Mode, ops: Vec<Op>) -> std::result::Result<(), TestCaseError> {
     let r = Reservation::new(PP * PAGE);
     let mut t = table(CAPACITY);
-    let mut a = arena(&r, mode, false, &mut t);
+    let mut a = arena(&r, mode, &mut t);
     let mut b = Fake::new(&r);
     let mut model: BTreeMap<usize, Pg> = BTreeMap::new();
     let mut touched = BTreeSet::new();
@@ -440,7 +440,7 @@ fn glibc_prot_none_heap_costs_nothing_untouched() {
     for mode in [Mode::Release, Mode::HighWater] {
         let r = Reservation::new(1 << 30);
         let mut t = table(CAPACITY);
-        let mut a = arena(&r, mode, false, &mut t);
+        let mut a = arena(&r, mode, &mut t);
         let mut b = Fake::new(&r);
         let heap_max = 64 * MB;
         let p = a.mmap(&mut b, 0, 2 * heap_max, PROT_NONE, ANON | MAP_NORESERVE, None).unwrap();
@@ -493,7 +493,7 @@ fn map_fixed_replaces_existing_mapping() {
     for mode in [Mode::Release, Mode::HighWater] {
         let r = Reservation::new(64 * MB);
         let mut t = table(CAPACITY);
-        let mut a = arena(&r, mode, false, &mut t);
+        let mut a = arena(&r, mode, &mut t);
         let mut b = Fake::new(&r);
         b.files.insert(7, vec![b'f'; 2 * PAGE]);
         let p = a.mmap(&mut b, 0, 16 * PAGE, RW, ANON, None).unwrap();
@@ -528,7 +528,7 @@ fn mremap_grow_and_move_preserve_content() {
     for mode in [Mode::Release, Mode::HighWater] {
         let r = Reservation::new(64 * MB);
         let mut t = table(CAPACITY);
-        let mut a = arena(&r, mode, false, &mut t);
+        let mut a = arena(&r, mode, &mut t);
         let mut b = Fake::new(&r);
         let pattern = |i: usize| (i % 251) as u8 + 1;
         let p = a.mmap(&mut b, 0, 4 * PAGE, RW, ANON, None).unwrap();
@@ -581,7 +581,7 @@ fn mremap_grow_and_move_preserve_content() {
 fn shared_mapping_written_back() {
     let r = Reservation::new(64 * MB);
     let mut t = table(CAPACITY);
-    let mut a = arena(&r, Mode::Release, false, &mut t);
+    let mut a = arena(&r, Mode::Release, &mut t);
     let mut b = Fake::new(&r);
     b.files.insert(7, vec![b'x'; 3 * PAGE]);
     let f = Some(FileMap { file: 7, offset: 0 });
@@ -641,7 +641,7 @@ fn shared_mapping_written_back() {
 fn high_water_reuses_thread_stacks_zeroed() {
     let r = Reservation::new(256 * MB);
     let mut t = table(CAPACITY);
-    let mut a = arena(&r, Mode::HighWater, false, &mut t);
+    let mut a = arena(&r, Mode::HighWater, &mut t);
     let mut b = Fake::new(&r);
     let stack = 8 * MB;
     let mut first = None;
@@ -679,7 +679,7 @@ fn high_water_reuses_thread_stacks_zeroed() {
 fn release_chunks_inside_arena() {
     let r = Reservation::new(64 * MB);
     let mut t = table(CAPACITY);
-    let mut a = arena(&r, Mode::Release, false, &mut t);
+    let mut a = arena(&r, Mode::Release, &mut t);
     let mut b = Fake::new(&r);
     let len = 5 * MB + MB / 2;
     let p = a.mmap(&mut b, 0, len, RW, ANON, None).unwrap();
@@ -704,29 +704,19 @@ fn release_chunks_inside_arena() {
     assert_eq!(b.released(), 3 * MB + len);
 }
 
-/// W^X: PROT_EXEC is refused on an arena that isn't executable (EPERM from mmap, EACCES from
-/// mprotect, as capnix and Linux's noexec answer), and allowed on one that is.
+/// PROT_EXEC is an ordinary protection: mapped and mprotect'd like any other.
 #[test]
-fn prot_exec_only_on_exec_arena() {
-    let rx = PROT_READ | PROT_EXEC;
-    for exec in [false, true] {
-        let r = Reservation::new(16 * MB);
-        let mut t = table(CAPACITY);
-        let mut a = arena(&r, Mode::Release, exec, &mut t);
-        let mut b = Fake::new(&r);
-        let p = a.mmap(&mut b, 0, PAGE, RW, ANON, None).unwrap();
-        if exec {
-            assert!(a.mmap(&mut b, 0, PAGE, rx, ANON, None).is_ok());
-            assert_eq!(a.mprotect(p, PAGE, rx), Ok(0));
-            assert_eq!(prot_at(&a, p), Some(rx));
-        } else {
-            assert_eq!(a.mmap(&mut b, 0, PAGE, rx, ANON, None), Err(Errno::PERM));
-            assert_eq!(a.mmap(&mut b, p, PAGE, rx, ANON | MAP_FIXED, None), Err(Errno::PERM));
-            assert_eq!(a.mprotect(p, PAGE, rx), Err(Errno::ACCESS));
-            assert_eq!(prot_at(&a, p), Some(RW));
-            assert_eq!(a.stats().mapped, PAGE);
-        }
-    }
+fn prot_exec_is_ordinary() {
+    let rwx = PROT_READ | PROT_WRITE | PROT_EXEC;
+    let r = Reservation::new(16 * MB);
+    let mut t = table(CAPACITY);
+    let mut a = arena(&r, Mode::Release, &mut t);
+    let mut b = Fake::new(&r);
+    let p = a.mmap(&mut b, 0, PAGE, rwx, ANON, None).unwrap();
+    assert_eq!(prot_at(&a, p), Some(rwx));
+    let q = a.mmap(&mut b, 0, PAGE, RW, ANON, None).unwrap();
+    assert_eq!(a.mprotect(q, PAGE, rwx), Ok(0));
+    assert_eq!(prot_at(&a, q), Some(rwx));
 }
 
 /// When the table is full, calls that need entries fail with ENOMEM and change nothing;
@@ -735,7 +725,7 @@ fn prot_exec_only_on_exec_arena() {
 fn full_table_is_enomem_not_corruption() {
     let r = Reservation::new(16 * MB);
     let mut t = table(8);
-    let mut a = arena(&r, Mode::Release, false, &mut t);
+    let mut a = arena(&r, Mode::Release, &mut t);
     let mut b = Fake::new(&r);
     let p = a.mmap(&mut b, 0, 64 * PAGE, RW, ANON, None).unwrap();
     mem(p, 64 * PAGE).fill(3);
@@ -775,7 +765,7 @@ fn full_table_is_enomem_not_corruption() {
 fn brk_mincore_madvise_and_errors() {
     let r = Reservation::new(16 * MB);
     let mut t = table(CAPACITY);
-    let mut a = arena(&r, Mode::Release, false, &mut t);
+    let mut a = arena(&r, Mode::Release, &mut t);
     let mut b = Fake::new(&r);
     b.files.insert(7, vec![b'f'; PAGE + 10]);
 

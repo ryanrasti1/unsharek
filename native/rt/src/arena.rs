@@ -1,7 +1,7 @@
 //! The arena: the program's memory after lockdown.
 //!
 //! Before lockdown the runtime reserves one large `MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE`
-//! mapping (read/write; read/write/exec when the profile allows code to be made). After lockdown
+//! mapping (read/write/execute: programs load their code into it, and JITs make theirs). After lockdown
 //! the host allows no `mmap`, `mprotect`, `munmap` or `brk`, so the program's memory calls are
 //! trapped and served here, inside `[base, base + len)`. This module never maps host memory; it
 //! hands out addresses inside the reservation, copies file contents in, and gives pages back
@@ -44,10 +44,8 @@
 //! - **No protections after lockdown.** `mprotect` records the protection (for `/proc/self/maps`
 //!   and for clean tracking) and has no host effect. Guard pages a program places after lockdown
 //!   (glibc's thread-stack guards) are not enforced.
-//! - **W^X.** On an arena that isn't executable, `PROT_EXEC` is refused: `mmap` returns `EPERM`
-//!   and `mprotect` `EACCES`, as capnix did. Those are Linux's own answers for a mapping that may
-//!   not be executable (`noexec` mounts, SELinux `execmem`), so programs treat them as a policy
-//!   refusal, not a bug.
+//! - **Executable memory is ordinary.** The reservation is read/write/execute, and `PROT_EXEC`
+//!   is recorded like any protection: the sandbox's boundary is the host filter, and JITs work.
 //! - **`brk` never grows.** It returns the current break whatever is asked, which glibc reads as
 //!   failure and falls back to `mmap` for its main heap (capnix did the same).
 //! - **File mappings are copies** made at `mmap` through [`Backing::read`]. A `MAP_SHARED`
@@ -270,7 +268,6 @@ impl Extent {
 pub struct Arena<'t> {
     base: usize,
     end: usize,
-    exec: bool,
     mode: Mode,
     /// Sorted by start, covering `[base, end)`: entry i ends where i + 1 starts (the last at
     /// `end`). `table[..n]` is in use.
@@ -288,18 +285,18 @@ fn page_up(len: usize) -> Option<usize> {
 
 impl<'t> Arena<'t> {
     /// An arena over `[base, base + len)`, all free, with `table` as its extent storage (its
-    /// length is the capacity). `exec`: the reservation is executable, so `PROT_EXEC` is allowed.
+    /// length is the capacity).
     ///
     /// # Safety
-    /// `[base, base + len)` is a private anonymous read/write mapping, all zero, that nothing else
+    /// `[base, base + len)` is a private anonymous read/write/execute mapping, all zero, that nothing else
     /// hands out and that stays mapped while the arena lives. The arena reads, writes, zeroes and
     /// copies it, and passes its addresses to `backing`.
-    pub unsafe fn new(base: usize, len: usize, exec: bool, mode: Mode, table: &'t mut [Extent]) -> Result<Self> {
+    pub unsafe fn new(base: usize, len: usize, mode: Mode, table: &'t mut [Extent]) -> Result<Self> {
         if !base.is_multiple_of(PAGE) || len == 0 || !len.is_multiple_of(PAGE) || base.checked_add(len).is_none() || table.is_empty() {
             return Err(Errno::INVAL);
         }
         table[0] = Extent { start: base, kind: FREE_CLEAN };
-        Ok(Arena { base, end: base + len, exec, mode, table, n: 1, brk: 0, high: base, released: 0, zeroed: 0 })
+        Ok(Arena { base, end: base + len, mode, table, n: 1, brk: 0, high: base, released: 0, zeroed: 0 })
     }
 
     /// `[addr, addr + len)` lies inside the arena.
@@ -355,9 +352,6 @@ impl<'t> Arena<'t> {
             MAP_PRIVATE => false,
             _ => return Err(Errno::INVAL),
         };
-        if prot & PROT_EXEC != 0 && !self.exec {
-            return Err(Errno::PERM);
-        }
         let file = if flags & MAP_ANONYMOUS != 0 { None } else { Some(file.ok_or(Errno::BADF)?) };
         if let Some(f) = file {
             if !f.offset.is_multiple_of(PAGE as u64) {
@@ -506,9 +500,6 @@ impl<'t> Arena<'t> {
             return Err(Errno::INVAL);
         }
         let prot = prot & (PROT_READ | PROT_WRITE | PROT_EXEC);
-        if prot & PROT_EXEC != 0 && !self.exec {
-            return Err(Errno::ACCESS);
-        }
         if len == 0 {
             return Ok(0);
         }
