@@ -94,6 +94,13 @@ impl Error {
     }
 }
 
+/// For setup closures: `std::fs` and friends' errors, with `?`.
+impl From<std::io::Error> for Error {
+    fn from(source: std::io::Error) -> Self {
+        Error::Io { what: "setup".into(), source }
+    }
+}
+
 impl From<guest::Error> for Error {
     fn from(e: guest::Error) -> Self {
         Error::Guest(e)
@@ -355,15 +362,16 @@ impl Guest {
     /// `argv` and `env` (each `NAME=value`). Never returns on success; on failure the routing
     /// filter is in, so the caller can only report the error and exit (both work: through the
     /// guest, to the host's stderr and exit).
-    pub fn run<F>(self, argv: &[OsString], env: &[OsString], before_exec: F) -> Result<Infallible, Error>
+    pub fn run<F, E>(self, argv: &[OsString], env: &[OsString], before_exec: F) -> Result<Infallible, Error>
     where
-        F: FnOnce() -> Result<(), Error>,
+        F: FnOnce() -> Result<(), E>,
+        E: Into<Error>,
     {
         let path = argv.first().ok_or(Error::NoProgram)?;
         let args: Vec<&[u8]> = argv.iter().map(|a| a.as_bytes()).collect();
         let envs: Vec<&[u8]> = env.iter().map(|a| a.as_bytes()).collect();
         guest::route()?;
-        before_exec()?;
+        before_exec().map_err(Into::into)?;
         let errno = guest::exec(path.as_bytes(), &args, &envs, self.aux);
         Err(Error::Exec { path: PathBuf::from(path), errno: std::io::Error::from_raw_os_error(errno.raw_os_error()) })
     }
@@ -409,9 +417,10 @@ impl Sandbox {
     }
 
     /// [`Guest::run`], its closure `setup` and then the mode's filter.
-    pub fn run<F>(self, argv: &[OsString], env: &[OsString], setup: F) -> Result<Infallible, Error>
+    pub fn run<F, E>(self, argv: &[OsString], env: &[OsString], setup: F) -> Result<Infallible, Error>
     where
-        F: FnOnce() -> Result<(), Error>,
+        F: FnOnce() -> Result<(), E>,
+        E: Into<Error>,
     {
         // Compiled now, on the host: the closure must not allocate after the filter goes in.
         let prog = Box::leak(Box::new(filter::Program::new()));
@@ -444,7 +453,7 @@ impl Sandbox {
         })?;
         let prog: &'static filter::Program = prog;
         self.guest.run(argv, env, move || {
-            setup()?;
+            setup().map_err(Into::into)?;
             // The mode's list allows no host memory calls: setup code that still makes one gets
             // ENOMEM (mmap) or nothing done, not the filter's verdict.
             guest::host_memory(false);
