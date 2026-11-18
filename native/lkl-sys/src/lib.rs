@@ -7,8 +7,16 @@
 //! - `lkl_host_operations`, the table of host operations the kernel calls (with `lkl_jmp_buf` and
 //!   `lkl_thread_t`, which it names)
 //!
-//! Only the kernel object is linked: the host operations, and `lkl_printf` and `lkl_bug` (which the
-//! kernel calls and stock LKL defines in tools/lkl/lib), are the host's to provide.
+//! Only the kernel object is linked, not tools/lkl/lib: the host operations are the binary's to
+//! provide, and so are the two functions shim.c's `lkl_printf` and `lkl_bug` (variadic, so in C)
+//! hand their formatted message to:
+//!
+//! ```ignore
+//! #[unsafe(no_mangle)]
+//! extern "C" fn exobox_lkl_print(s: *const c_char, len: c_ulong) { /* write it */ }
+//! #[unsafe(no_mangle)]
+//! extern "C" fn exobox_lkl_panic() -> ! { /* lkl_bug: the kernel can't go on */ }
+//! ```
 #![no_std]
 
 #[allow(

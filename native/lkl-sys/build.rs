@@ -36,25 +36,23 @@ fn main() {
     make(&lkl_dir, &src, &kout);
 
     println!("cargo:rustc-link-search=native={}", kout.display());
-    // lkl.o alone (lkl/Makefile): it needs nothing from libc, only lkl_printf and lkl_bug, which
-    // the host side defines (tools/lkl/lib/utils.c does, for the posix host).
+    // lkl.o alone (lkl/Makefile). It needs nothing from libc: only lkl_printf and lkl_bug, from
+    // shim.c below. Built so that no linker can mis-relax it and with its stack note (both in
+    // lkl/Makefile): a binary links it with no special flags.
     println!("cargo:rustc-link-lib=static=lkl-kernel");
-    // lkl.o has no .note.GNU-stack, which to ld means "needs an executable stack". rustc links with
-    // `-z noexecstack`, so a Rust binary's stack stays RW; a C program linking it must say so too.
+    // For tests/boot.rs's relocation check.
+    println!(
+        "cargo:rustc-env=LKL_KERNEL_OBJ={}",
+        kout.join("lkl.o").display()
+    );
 
-    // GCC 16 emits `push sym@GOTPCREL(%rip)` (a function pointer passed on the stack) with an
-    // R_X86_64_GOTPCRELX relocation, and ld 2.46 relaxes that `ff /6` as if it were an indirect
-    // call, into `addr32 call sym`: the kernel calls the function instead of passing it. Four
-    // sites in LKL (udp_setsockopt, which Go's resolver reaches; inet_ehashfn passed in the TCP
-    // lookups: inet_lhash2_lookup, __inet_lookup_listener, tcp_v4_rcv). Found in capnix tier A.
-    // `rustc-link-arg` only reaches this package's own links (the smoke test); a binary linking
-    // lkl-sys forwards DEP_LKL_LINK_ARGS from its build.rs, and runs the same check (tests/boot.rs).
-    // The cost, GOT loads instead of lea for global addresses, did not show in tier A's benchmark.
-    // On stock LKL (d0f76a77e) with the devshell's toolchain the four GOT pushes are in lkl.o but
-    // ld leaves them alone (`push GOT(%rip)` in a PIE, `push $imm` without), with or without
-    // --no-relax; kept until the tier A case is understood, the check costs half a second.
-    println!("cargo:rustc-link-arg=-Wl,--no-relax");
-    println!("cargo:link_args=-Wl,--no-relax");
+    println!("cargo:rerun-if-changed=shim.c");
+    cc::Build::new()
+        .file("shim.c")
+        // Always optimized: glibc's _FORTIFY_SOURCE (the devshell's hardening) wants -O.
+        .opt_level(2)
+        .warnings(true)
+        .compile("lkl-shim");
 
     bindings(&manifest, &src, &kout, &out_dir);
 }
@@ -93,7 +91,9 @@ fn bindings(manifest: &Path, src: &Path, kout: &Path, out_dir: &Path) {
         .use_core()
         .rust_edition(bindgen::RustEdition::Edition2024)
         // What lkl.o defines and the host-operations table, nothing of the uapi beyond them.
-        .allowlist_function("lkl_(init|start_kernel|cleanup|is_running|syscall|sys_halt)")
+        .allowlist_function(
+            "lkl_(init|start_kernel|cleanup|is_running|syscall|sys_halt|printf|bug)",
+        )
         .allowlist_type("lkl_host_operations|lkl_jmp_buf|lkl_thread_t")
         .allowlist_var("__lkl__NR_.*")
         .parse_callbacks(Box::new(SyscallNumbersAreLong))

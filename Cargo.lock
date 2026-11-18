@@ -299,6 +299,7 @@ name = "lkl-sys"
 version = "0.0.0"
 dependencies = [
  "bindgen",
+ "cc",
 ]
 
 [[package]]

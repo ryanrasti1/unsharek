@@ -13,3 +13,4 @@ links = "lkl"
 
 [build-dependencies]
 bindgen.workspace = true
+cc.workspace = true

@@ -7,11 +7,20 @@ use std::process::Command;
 
 use lkl_sys::*;
 
-// tools/lkl/lib (lkl/Makefile's liblkl-posix.a): the posix host's table, and lkl_printf and lkl_bug,
-// which the kernel object needs from its host.
+// tools/lkl/lib (lkl/Makefile's liblkl-posix.a): the posix host's table, and its lkl_printf and
+// lkl_bug, which win over shim.c's weak ones.
 #[link(name = "lkl-posix", kind = "static")]
 unsafe extern "C" {
     static mut lkl_host_ops: lkl_host_operations;
+}
+
+// shim.c's callbacks: the linker may still pull shim.c's object in (when it meets lkl-shim before
+// the posix host's definitions), and then they must exist. Unused here.
+#[unsafe(no_mangle)]
+extern "C" fn exobox_lkl_print(_: *const core::ffi::c_char, _: core::ffi::c_ulong) {}
+#[unsafe(no_mangle)]
+extern "C" fn exobox_lkl_panic() -> ! {
+    std::process::abort()
 }
 
 fn syscall(nr: c_long, args: &[c_long]) -> c_long {
@@ -47,9 +56,36 @@ fn boot_syscall_halt() {
     }
 }
 
-/// The link went as build.rs meant (`--no-relax`): no `addr32 call` anywhere in this binary, the
-/// sign of ld relaxing a GOT push into a call (build.rs). The binary holds the kernel, linked as
-/// any binary linking lkl-sys does.
+/// The kernel object can't be mis-relaxed (lkl/Makefile's -mrelax-relocations=no): it has no
+/// R_X86_64_GOTPCRELX or REX_GOTPCRELX relocation, the kinds ld may rewrite. ld 2.46 rewrote a
+/// GOTPCRELX `push` of a function pointer into `addr32 call` (capnix tier A).
+#[test]
+fn kernel_has_no_relaxable_got_relocations() {
+    let obj = env!("LKL_KERNEL_OBJ");
+    let out = Command::new("readelf")
+        .args(["-rW", obj])
+        .output()
+        .expect("readelf (binutils, in the devshell)");
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("R_X86_64_GOTPCREL "),
+        "{obj}: no GOT relocations at all?"
+    );
+    let relaxable: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("GOTPCRELX"))
+        .take(5)
+        .collect();
+    assert!(
+        relaxable.is_empty(),
+        "{obj}: relaxable GOT relocations:\n{}",
+        relaxable.join("\n")
+    );
+}
+
+/// The safety net: no `addr32 call` in this binary, which holds the kernel linked as any binary
+/// linking lkl-sys does. That instruction is what a mis-relaxed GOT push turns into.
 #[test]
 fn no_mis_relaxed_got_push() {
     let exe = std::env::current_exe().unwrap();
