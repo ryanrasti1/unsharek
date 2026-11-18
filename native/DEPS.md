@@ -80,3 +80,13 @@ regex-syntax 1.1 s, in parallel). Warm, nothing.
 |---|---|---|---|
 | proptest 1 (default-features off, std) | random sequences of mmap/munmap/mremap/mprotect against a model, shrunk to a minimal failing sequence | rt tests | test-only; without `fork`/`timeout` (no rusty-fork, tempfile, wait-timeout); `failure_persistence` off, so no files written |
 | libc 0.2 | a real `MAP_NORESERVE` reservation, `madvise` as the release hook, `mincore` to see what the host holds | rt tests | test-only (already the suite's) |
+
+## exobox's store (2026-11-18): closures and the image cache (native/exobox/src/store.rs)
+No new crates: exobox now depends on exobox-erofs (in the workspace; brings object and memchr,
+already measured above, ~3 KB in a binary). `nix-store` (Nix itself, on the host) is run once per
+start for the closure (~20 ms for bash's 7 paths). The CLI doesn't call the store yet, so the
+binary's size is unchanged until it does.
+
+| Crate | For | Where | Cost noted |
+|---|---|---|---|
+| exobox-erofs | building a store path's image on a cache miss | library | object's ELF reader, ~3 KB |

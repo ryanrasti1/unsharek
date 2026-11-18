@@ -42,6 +42,11 @@ use format::{BLOCK, INODE_SIZE, NID_UNIT};
 /// The image's block size, also the loader's page size: a block-aligned offset maps page-aligned.
 pub const BLOCK_SIZE: u64 = BLOCK;
 
+/// The version of what [`build`] writes (the image and [`Layout::to_text`]). Images are cached on
+/// disk keyed by their source (exobox's `store.rs`), so a change to either output must bump this,
+/// or a cache keeps serving images in the old layout.
+pub const FORMAT_VERSION: u32 = 1;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("{path}: {source}")]
