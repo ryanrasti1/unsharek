@@ -99,3 +99,13 @@ Nothing new from crates.io. What it costs:
 |---|---|---|---|
 | lkl-sys (path) | `lkl_host_operations` and its types, filled in by `host`; the kernel for the boot test | library | the kernel build at build time; ~5.9 MB in a binary that boots it |
 | rustix 1, + `time`, `event` | `clock_gettime` (vDSO) for the scheduler's clocks; `ppoll` with no fds as the idle wait | library | a few hundred bytes of code |
+
+## exobox's store (2026-11-18): closures and the image cache (native/exobox/src/store.rs)
+No new crates: exobox now depends on exobox-erofs (in the workspace; brings object and memchr,
+already measured above, ~3 KB in a binary). `nix-store` (Nix itself, on the host) is run once per
+start for the closure (~20 ms for bash's 7 paths). The CLI doesn't call the store yet, so the
+binary's size is unchanged until it does.
+
+| Crate | For | Where | Cost noted |
+|---|---|---|---|
+| exobox-erofs | building a store path's image on a cache miss | library | object's ELF reader, ~3 KB |

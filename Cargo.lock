@@ -219,6 +219,7 @@ name = "exobox"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "exobox-erofs",
  "exobox-fixtures",
  "libc",
  "libtest-mimic",

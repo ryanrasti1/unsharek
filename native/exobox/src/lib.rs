@@ -4,10 +4,12 @@
 //! [`Config`] says what to run and how; [`run`] turns the calling process into the sandbox. The
 //! `exobox` binary is a thin CLI over the two.
 
+pub mod store;
+
 use std::convert::Infallible;
 use std::ffi::OsString;
 use std::os::fd::OwnedFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 pub use syscalls::Sysno;
@@ -56,6 +58,10 @@ pub struct ArgRange {
 pub enum Error {
     #[error("invalid rule {rule:?}: {why}")]
     Rule { rule: String, why: String },
+    #[error("no program to run (argv is empty)")]
+    NoProgram,
+    #[error(transparent)]
+    Store(#[from] store::Error),
     #[error("not implemented yet: {0}")]
     NotImplemented(&'static str),
 }
@@ -111,6 +117,20 @@ pub struct Config {
     pub max_procs: Option<u32>,
     /// The program and its arguments; `argv[0]` is the program's path.
     pub argv: Vec<OsString>,
+    /// Where store images are cached; None: [`store::Cache::default_dir`].
+    pub image_cache: Option<PathBuf>,
+}
+
+/// The images the guest mounts for `config`'s program and allowed paths, built where the cache
+/// lacks them. Host-side, before lockdown; nothing is opened or mapped yet.
+pub fn store(config: &Config) -> Result<store::Store, Error> {
+    let program = config.argv.first().ok_or(Error::NoProgram)?;
+    let closure = store::closure(Path::new(program), &config.allow_paths)?;
+    let dir = match &config.image_cache {
+        Some(dir) => dir.clone(),
+        None => store::Cache::default_dir()?,
+    };
+    Ok(store::Cache::new(&dir).images(&closure)?)
 }
 
 /// Become the sandbox: boot the guest kernel in this process, load `config`'s program, lock down

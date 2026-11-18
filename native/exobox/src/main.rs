@@ -67,6 +67,7 @@ fn main() -> ExitCode {
         allow_paths,
         max_procs,
         argv,
+        image_cache: None,
     };
     let Err(e) = exobox::run(config);
     eprintln!("exobox: {e}");
