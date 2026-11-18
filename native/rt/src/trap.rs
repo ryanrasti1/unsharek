@@ -196,7 +196,12 @@ pub unsafe fn exit_thread() -> ! {
 ///
 /// The new thread has no alternate signal stack (the kernel clears it for a `CLONE_VM` child,
 /// `sas_ss_reset` in copy_process), and `sigaltstack` is not in the filter: a trap on it would be
-/// delivered on whatever stack it traps on. It must not trap until that is settled.
+/// delivered on whatever stack it traps on. It must not trap until that is settled. The way
+/// capnix settled it (tier A, `27955f1c`), with no filter entry: prepare the child's stack so
+/// that it `ret`s into `rt_sigreturn` on a frame copied from the trapped `clone`'s, whose
+/// `uc_stack` names the new thread's own alternate stack. `rt_sigreturn` (allowed from anywhere)
+/// installs it (`restore_altstack`), and the thread starts in the runtime with the program's
+/// signal mask.
 ///
 /// # Safety
 /// `stack_top` is the top of writable memory only this thread will use (it needs ~64 bytes plus
