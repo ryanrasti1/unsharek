@@ -117,12 +117,14 @@ that mounts `/dev/exobox/<name>` with `mount(2)` and execs the next one).
    a read-write block device served over a channel (a new kernel driver: Nix's `/nix/var` on
    ext4); FUSE in the store's kernel (a config fragment); the streaming image builder (item 7) to
    the API in capnix's `spikes/storefs/README.md`.
-9. Network through a capability (capnix's "Two connections"): the runtime holds a second
-   connection (a host fd, not a guest fd) bootstrapped like the program's, and serves `AF_INET`
-   sockets from it: `connect` becomes a stream pumped to an LKL socketpair end in place of the
-   program's fd, names resolve through it. Behind a small provider trait in the runtime (connect,
-   resolve), so the core stays protocol-free; the connection carries no more authority than the
-   program's own, since the program can reach it.
+9. Pluggable networking: the guest's `connect`, `listen`/`accept` and name lookups (`AF_INET`,
+   `AF_INET6`) go to Rust closures registered with the sandbox (`Net::new().on_connect(..)
+   .on_listen(..).on_resolve(..)`), each run on its own coroutine after lockdown with a small context
+   (blocking-style reads, writes and waits on host fds the sandbox holds, the guest's socket ends,
+   allocation from the runtime's own memory). exobox makes a socketpair end the program's fd, so
+   poll, epoll, nonblocking sockets and fork work unchanged; it knows no protocol. capnix plugs in
+   its Cap'n Web connection this way. Since the program shares the address space, a callback's
+   connection must carry no more authority than the program's own.
 10. Custom kernels, at build time: the kernel as its own Nix build (`lib.exoboxKernel { src, config }`:
    a source and a config fragment over `lkl/defconfig`, for more drivers or filesystems; LKL has
    no loadable modules), and `lib.mkExobox { kernel }` for an exobox built with it. In development,
