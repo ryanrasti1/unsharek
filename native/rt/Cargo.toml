@@ -8,4 +8,5 @@ license.workspace = true
 publish = false
 
 [dependencies]
-rustix = { workspace = true }
+# mm: mprotect for the stacks' guard pages (sched)
+rustix = { workspace = true, features = ["mm"] }

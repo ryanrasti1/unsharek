@@ -28,6 +28,14 @@ release build ~3.4 s. Nearly all of it is clap; object's code in the binary is ~
 | thiserror 2 | the library's error type | library | none at run time (a derive) |
 | tempfile 3 | scratch trees and images | test | test-only |
 
+## exobox-rt (2026-11-18): the in-sandbox runtime (native/rt)
+Not linked into a binary yet, so no size to measure. 3 crates in the normal dependency tree; cold
+release build ~2.9 s (nearly all rustix and linux-raw-sys).
+
+| Crate | For | Where | Cost noted |
+|---|---|---|---|
+| rustix 1 (no default features; mm) | raw Linux syscalls, no libc; `mm` for the coroutine stacks' guard pages (`mprotect`, sched.rs) | library | only the calls used are linked; pulls bitflags and linux-raw-sys (constants) |
+
 Tools in the devshell (not linked): cargo-nextest (per-test processes and timeouts), erofs-utils
 (store images for programs outside the store; `fsck.erofs`/`dump.erofs` are the test oracle for
 native/erofs).

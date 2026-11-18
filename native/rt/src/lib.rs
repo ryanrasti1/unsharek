@@ -12,3 +12,10 @@
 //! - **Host syscalls only through rustix's raw Linux backend**, and only those the filter
 //!   (`filter`) allows from the gate.
 #![cfg_attr(not(test), no_std)]
+
+pub mod context;
+pub mod futex;
+pub mod sched;
+pub mod sync;
+#[cfg(test)]
+mod testutil;
