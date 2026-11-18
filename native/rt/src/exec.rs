@@ -174,6 +174,8 @@ struct Elf {
     hi: u64,
     /// The base's alignment: the largest PT_LOAD `p_align`, at least a page.
     align: u64,
+    /// The page of the file the lowest PT_LOAD's page maps (where its span starts in the file).
+    off0: u64,
     entry: u64,
     /// Where the program headers are in memory (`PT_PHDR`, else the PT_LOAD that holds them), if
     /// anywhere.
@@ -316,7 +318,7 @@ fn parse<F: Files>(g: &mut F, file: u64, h: &mut Headers, want_interp: bool) -> 
         return Err(Errno::NOEXEC);
     }
 
-    let (mut lo, mut hi, mut align) = (u64::MAX, 0u64, PAGE as u64);
+    let (mut lo, mut hi, mut align, mut off0) = (u64::MAX, 0u64, PAGE as u64, 0u64);
     let (mut prev_end, mut loads) = (0u64, 0usize);
     let (mut phdr, mut pt_phdr, mut interp) = (None, None, None);
     for ph in phdrs(h, phnum) {
@@ -340,6 +342,9 @@ fn parse<F: Files>(g: &mut F, file: u64, h: &mut Headers, want_interp: bool) -> 
                 loads += 1;
                 prev_end = end;
                 if memsz > 0 {
+                    if page_down(va) < lo {
+                        off0 = page_down(off);
+                    }
                     lo = lo.min(page_down(va));
                     hi = hi.max(page_up(end).ok_or(Errno::NOEXEC)?);
                 }
@@ -363,7 +368,7 @@ fn parse<F: Files>(g: &mut F, file: u64, h: &mut Headers, want_interp: bool) -> 
     if loads == 0 || lo >= hi || !(lo..hi).contains(&entry) {
         return Err(Errno::NOEXEC);
     }
-    let elf = Elf { file, fixed, phnum, lo, hi, align, entry, phdr: pt_phdr.or(phdr) };
+    let elf = Elf { file, fixed, phnum, lo, hi, align, off0, entry, phdr: pt_phdr.or(phdr) };
     Ok((elf, interp))
 }
 
@@ -544,6 +549,14 @@ fn map_elf<G: Files + Backing>(arena: &mut Arena, g: &mut G, e: &Elf, h: &Header
             return Err(Errno::NOEXEC);
         }
         arena.mmap(g, lo, span, PROT_NONE, anon | MAP_FIXED_NOREPLACE, None)?
+    } else if let Some(at) = (e.align <= PAGE as u64)
+        .then(|| arena.mmap_in_place(g, span, PROT_NONE, FileMap { file: e.file, offset: e.off0 }))
+        .flatten()
+    {
+        // From the file, where its bytes already are in the image zone, as ld.so reserves a
+        // library: the segments whose offset and address agree (GNU ld's read-only ones) are
+        // then mapped in place, not copied.
+        at
     } else {
         // Over-reserve by the alignment, then give back the ends.
         let align = usize::try_from(e.align).map_err(|_| Errno::NOMEM)?;

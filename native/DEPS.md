@@ -162,3 +162,17 @@ kernel is its own derivation (lkl/Makefile from the flake's `linux` input; lkl-s
   exobox-erofs, 20 tests. Not the suite, the store test, erofs's image tests or exobox-rt's: they
   need the devshell's programs (`EXOBOX_TEST_*`, `fsck.erofs`), the host's `nix-store`, or a kernel
   tree.
+
+## Coroutine mode within its budgets (2026-11-18): memory per sandbox, startup
+No new crates; exobox gains a build script (`native/exobox/build.rs`: the binary linked non-PIE at
+0x500000000000, with the compiler's PIE start files) and so `cc` as a build-dependency (already in
+the tree). The release `exobox` binary: 9,616,256 / 8,400,120 bytes (unstripped / stripped), from
+9,799,104 / 8,596,664: its 17,861 relative relocations (`.rela.dyn`) are gone.
+
+An idle sandbox (`ready_idle`, release): PSS 11.3 MB alone (3.1 MB anonymous), 4.2 MB each with 8
+at once (from 19.3 MB and 9.9 MB anonymous; the debug build `./test --perf` measures: 11.5 MB to
+4.5 MB at 8). Start to READY ~5 ms (from ~30 ms), the closure's `nix-store` query now cached.
+
+| Crate | For | Where | Cost noted |
+|---|---|---|---|
+| cc 1 | the C compiler's `-print-file-name` for the PIE start files (`Scrt1.o`, `crtbeginS.o`, ...) | exobox's build.rs | build only; already in the tree |

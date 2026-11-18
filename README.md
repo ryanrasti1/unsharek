@@ -89,8 +89,11 @@ that mounts `/dev/exobox/<name>` with `mount(2)` and execs the next one).
   files into the arena, with its interpreter, and builds its stack. Nothing the program brings (its
   `PT_INTERP`, its libraries' constructors) runs before the filter is in place.
 - **The store.** A Nix program's closure is shown as erofs images, one per store path, built once
-  and cached. Their layout pads each ELF file to its memory image, so code can be mapped in place
-  and shared by every sandbox through the host's page cache.
+  and cached (the closure itself too: a store path's never changes). Their layout pads each ELF
+  file to its memory image, so code is mapped in place: each image is mapped twice before
+  lockdown, read-only for the guest's block device and privately into the arena's top, and the
+  program's mappings of its files are answered with where their bytes already are there, shared by
+  every sandbox through the host's page cache (what it writes is copy-on-write, its own).
 - **The kernel.** Stock LKL plus a short series (`lkl/README.md`): idle that waits instead of
   spinning, the program as PID 1, threads that join their process, a block device over host memory,
   and the rest of what a cooperative in-process host needs.
@@ -109,8 +112,8 @@ that mounts `/dev/exobox/<name>` with `mount(2)` and execs the next one).
 5. Templates: a booted kernel forked per sandbox (`Template::start`, `spawn`), the kernel's pages
    shared copy-on-write.
 6. Within the performance budgets (`./test --perf`): startup, memory per sandbox, parallel builds.
-7. Code mapped in place from the store images, and a streaming image builder for stores that
-   write images as paths arrive.
+7. Code mapped in place from the store images (done, in release-mode arenas: coroutine and fork),
+   and a streaming image builder for stores that write images as paths arrive.
 8. For capnix (`~/src/capnix-proper`, "What exobox needs to provide"): a host fd passed to the guest
    at a given fd (its Cap'n Web channel at 1000), with the filter widened to exactly that fd; the
    program run as a given uid (setup is the guest's init, as root, and can drop to it before exec);

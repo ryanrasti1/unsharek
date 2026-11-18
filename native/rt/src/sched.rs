@@ -242,6 +242,11 @@ pub struct Sched {
     run_head: Cell<u16>,
     run_tail: Cell<u16>,
     free_head: Cell<u16>,
+    /// Slots `fresh..fresh_end` were never used: not on the free list, their stacks not yet
+    /// recorded in them. `stacks`: the region's base, each stack's size, and whether it has guards.
+    fresh: Cell<u16>,
+    fresh_end: Cell<u16>,
+    stacks: Cell<(usize, usize, bool)>,
     heap: [Cell<u16>; CAPACITY],
     heap_len: Cell<usize>,
     seq: Cell<u64>,
@@ -306,6 +311,9 @@ impl Sched {
             run_head: Cell::new(NONE),
             run_tail: Cell::new(NONE),
             free_head: Cell::new(NONE),
+            fresh: Cell::new(1),
+            fresh_end: Cell::new(1),
+            stacks: Cell::new((0, 0, false)),
             heap: [const { Cell::new(NONE) }; CAPACITY],
             heap_len: Cell::new(0),
             seq: Cell::new(0),
@@ -343,21 +351,20 @@ impl Sched {
         self.current.set(ROOT);
         self.live.set(1);
         let n = (st.len / st.size).min(CAPACITY - 1);
-        // Free list in table order, so the first spawns take the lowest slots.
-        for i in (1..=n).rev() {
-            let lo = st.base as usize + (i - 1) * st.size;
-            if st.guard {
+        // The guards now (no host mprotect after lockdown); the slots when first spawned
+        // (`fresh`), in table order: the table is in .data, and writing every slot here made all
+        // of it private to each sandbox, though it runs a few dozen coroutines.
+        if st.guard {
+            for i in 0..n {
                 // SAFETY: the caller gave us the region.
                 unsafe {
-                    rustix::mm::mprotect(lo as *mut c_void, PAGE, rustix::mm::MprotectFlags::empty())?
+                    rustix::mm::mprotect((st.base as usize + i * st.size) as *mut c_void, PAGE, rustix::mm::MprotectFlags::empty())?
                 };
             }
-            let s = &self.slots[i];
-            s.stack_lo.set(if st.guard { lo + PAGE } else { lo });
-            s.stack_hi.set(lo + st.size);
-            s.run_next.set(self.free_head.get());
-            self.free_head.set(i as u16);
         }
+        self.stacks.set((st.base as usize, st.size, st.guard));
+        self.fresh.set(1);
+        self.fresh_end.set(n as u16 + 1);
         Ok(n)
     }
 
@@ -444,12 +451,23 @@ impl Sched {
     }
 
     fn spawn_start(&'static self, start: Start, regs: Option<&Registers>, fs: usize) -> Result<Tid, SpawnError> {
-        let i = self.free_head.get();
-        if i == NONE {
-            return Err(SpawnError::Full);
+        let mut i = self.free_head.get();
+        if i != NONE {
+            self.free_head.set(self.slots[i as usize].run_next.get());
+        } else {
+            // A slot never used yet: its stack is carved now.
+            i = self.fresh.get();
+            if i == self.fresh_end.get() {
+                return Err(SpawnError::Full);
+            }
+            self.fresh.set(i + 1);
+            let (base, size, guard) = self.stacks.get();
+            let lo = base + (i as usize - 1) * size;
+            let s = &self.slots[i as usize];
+            s.stack_lo.set(if guard { lo + PAGE } else { lo });
+            s.stack_hi.set(lo + size);
         }
         let s = &self.slots[i as usize];
-        self.free_head.set(s.run_next.get());
         // Generation 0 is never used, so a Tid is never 0.
         let g = s.generation.get().wrapping_add(1).max(1);
         s.generation.set(g);
@@ -838,8 +856,12 @@ impl Sched {
         self.tls_used.set(used | 1 << k);
         self.tls_dtors[k].set(dtor);
         // A key freed and allocated again starts empty everywhere, not with the old key's values.
+        // Only nonzero values are written: the table is in .data, and writing every slot's made
+        // all 260 KB of it private to each sandbox at boot, where reading leaves it shared.
         for s in &self.slots {
-            s.tls[k].set(0);
+            if s.tls[k].get() != 0 {
+                s.tls[k].set(0);
+            }
         }
         Some(k)
     }

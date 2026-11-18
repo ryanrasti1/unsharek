@@ -155,13 +155,19 @@ pub struct GuestConfig {
     pub memory: usize,
     /// The guest kernel's own memory (`mem=`), in bytes: its slab, page cache and ramfs.
     pub kernel_memory: usize,
+    /// Address space for the images ([`Guest::map_image`]), in bytes: each is mapped there too,
+    /// in the arena, so the program's code and data files are mapped in place from it (the
+    /// host's page cache, shared by every sandbox) instead of copied. Reserved, not committed;
+    /// images past it are copied from.
+    pub image_space: usize,
 }
 
 impl Default for GuestConfig {
     fn default() -> Self {
         // The kernel's memory holds its slab, the page cache of what the program reads from its
-        // images (evictable), and its ramfs files (/tmp).
-        GuestConfig { memory: 4 << 30, kernel_memory: 64 << 20 }
+        // images (evictable) and its ramfs files (/tmp). 32 MiB: each MiB costs 16 KiB of struct
+        // pages, all written at boot (64 MiB was 1 MiB of every sandbox).
+        GuestConfig { memory: 4 << 30, kernel_memory: 32 << 20, image_space: 64 << 30 }
     }
 }
 
@@ -170,6 +176,8 @@ impl Default for GuestConfig {
 #[derive(Debug)]
 pub struct Guest {
     aux: guest::Aux,
+    /// The image zone's unused part, `[next, end)`.
+    zone: (usize, usize),
 }
 
 /// A host image (erofs) mapped by [`Guest::map_image`], read-only. The guest sees it as the
@@ -177,7 +185,8 @@ pub struct Guest {
 #[derive(Clone, Copy, Debug)]
 pub struct Image {
     name: &'static str,
-    /// The host mapping, alive for the process's life (the guest maps code from it).
+    /// The host mapping (read-only, alive for the process's life): the disk's bytes, which the
+    /// runtime also copies files from.
     data: &'static [u8],
 }
 
@@ -276,7 +285,8 @@ impl Guest {
         let rwx = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
         let rw = libc::PROT_READ | libc::PROT_WRITE;
         // The filter's madvise bound: an arena address plus a chunk stays inside the reservation.
-        let arena = reserve(ARENA_AT, memory + filter::MADV_CHUNK as usize, rwx)?;
+        let zone = config.image_space.next_multiple_of(PAGE);
+        let arena = reserve(ARENA_AT, memory + zone + filter::MADV_CHUNK as usize, rwx)?;
         let mem_mb = config.kernel_memory.div_ceil(1 << 20).max(16);
         let heap_len = (mem_mb << 20) + PAGE;
         let heap = reserve(0, heap_len, rw)?;
@@ -289,7 +299,8 @@ impl Guest {
         // SAFETY: fresh reservations, the guest's from now on; this thread runs it.
         unsafe {
             guest::boot(guest::Boot {
-                arena: (arena as usize, memory),
+                arena: (arena as usize, memory + zone),
+                image_zone: zone,
                 heap: (heap, heap_len),
                 stacks: sched::Stacks { base: stacks, len: stacks_len, size: COROUTINE_STACK, guard: true },
                 cmdline: &cmdline,
@@ -310,12 +321,15 @@ impl Guest {
                 sysinfo_ehdr: aux(libc::AT_SYSINFO_EHDR),
                 minsigstksz: aux(libc::AT_MINSIGSTKSZ),
             },
+            zone: (arena as usize + memory, arena as usize + memory + zone),
         })
     }
 
     /// Map an erofs image read-only (a host `mmap`, before lockdown): the guest's read-only block
     /// device `/dev/exobox/<name>` (a memblk disk over the mapping), the name being the file's
-    /// without `.erofs` (for an fd, `image<N>`). Host code.
+    /// without `.erofs` (for an fd, `image<N>`). Mapped a second time, privately, in the arena's
+    /// image zone ([`GuestConfig::image_space`]): the program's mappings of its files are made
+    /// there in place. Host code.
     pub fn map_image<'a>(&mut self, source: impl Into<ImageSource<'a>>) -> Result<Image, Error> {
         self.map_image_named(source.into(), None)
     }
@@ -353,8 +367,33 @@ impl Guest {
             unsafe { std::slice::from_raw_parts(p as *const u8, len) }
         };
         let image = Image { name: Box::leak(name.into_boxed_str()), data };
-        setup::block_device(&image).map_err(Error::io(format!("the guest's {}", image.device().display())))?;
+        let in_zone = self.map_in_zone(&file, len);
+        setup::block_device(&image, in_zone).map_err(Error::io(format!("the guest's {}", image.device().display())))?;
         Ok(image)
+    }
+
+    /// The image mapped again, privately, in the arena's image zone (`exobox_rt::memblk`): what
+    /// the program maps from it is mapped there in place. None when it doesn't fit, or can't be
+    /// mapped executable (a `noexec` mount): its files are copied instead.
+    fn map_in_zone(&mut self, file: &File, len: usize) -> Option<usize> {
+        let (at, end) = self.zone;
+        let size = len.next_multiple_of(4096);
+        if end - at < size {
+            return None;
+        }
+        let rwx = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
+        // SAFETY: over the arena's own reservation, in the zone's unused part: nothing is there.
+        let p = unsafe { libc::mmap(at as *mut _, len, rwx, libc::MAP_PRIVATE | libc::MAP_FIXED, file.as_raw_fd(), 0) };
+        if p == libc::MAP_FAILED {
+            // A failed MAP_FIXED may have unmapped the range: the reservation's zeros back.
+            let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | libc::MAP_FIXED;
+            // SAFETY: as above.
+            let back = unsafe { libc::mmap(at as *mut _, size, rwx, flags, -1, 0) };
+            assert_ne!(back, libc::MAP_FAILED, "the image zone lost a range");
+            return None;
+        }
+        self.zone.0 = at + size;
+        Some(at)
     }
 
     /// Install the routing filter, run `before_exec` as the guest's init (every syscall it makes
@@ -515,15 +554,17 @@ pub struct Config {
 }
 
 /// The images the guest mounts for `config`'s program and allowed paths, built where the cache
-/// lacks them. Host-side, before lockdown; nothing is opened or mapped yet.
+/// lacks them (the closure too is cached there: [`store::Cache::closure`]). Host-side, before
+/// lockdown; nothing is opened or mapped yet.
 pub fn store(config: &Config) -> Result<store::Store, Error> {
     let program = config.argv.first().ok_or(Error::NoProgram)?;
-    let closure = store::closure(Path::new(program), &config.allow_paths)?;
     let dir = match &config.image_cache {
         Some(dir) => dir.clone(),
         None => store::Cache::default_dir()?,
     };
-    Ok(store::Cache::new(&dir).images(&closure)?)
+    let cache = store::Cache::new(&dir);
+    let closure = cache.closure(Path::new(program), &config.allow_paths)?;
+    Ok(cache.images(&closure)?)
 }
 
 /// Become the sandbox: [`Sandbox::boot`], the closure's images (and `config.images`) mapped,

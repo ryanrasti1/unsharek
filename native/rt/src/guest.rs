@@ -43,6 +43,7 @@ use crate::exec::{self, Files, Scratch, StackParams};
 use crate::filter::{self, Deny, Params, Policy, Program as Filter};
 use crate::futex::{self, Futexes};
 use crate::host::{self, SysHost};
+use crate::memblk;
 use crate::sched::{Config, Sched, Stacks, Tid};
 use crate::sync::TlsKey;
 use crate::sysmap::{self, Emulate, Rewrite, Route, StatForm, k, lkl};
@@ -160,6 +161,9 @@ pub struct Boot<'a> {
     /// The program's arena, `(base, len)`: page-aligned, read/write/execute, zero, with
     /// `filter::MADV_CHUNK` bytes of the reservation past `len` (the filter's `madvise` bound).
     pub arena: (usize, usize),
+    /// How much of the arena, at its end, is the image zone (`arena::Arena::set_image_zone`,
+    /// `memblk`): where the caller maps images to be mapped in place from. 0 for none.
+    pub image_zone: usize,
     /// The kernel's memory: `mem=` of `cmdline` plus a page.
     pub heap: (*mut u8, usize),
     /// The coroutines' stacks (kernel threads and program threads' control stacks).
@@ -197,7 +201,10 @@ pub unsafe fn boot(b: Boot) -> Result<(), Error> {
         SCHED.init(Config { stacks: b.stacks, switch_fs: true, host: &SYS }).map_err(err("coroutine stacks"))?;
         host::install(&SCHED, b.heap.0, b.heap.1);
         let table: &'static mut [Extent] = &mut ARENA_TABLE.get()[..];
-        let a = Arena::new(b.arena.0, b.arena.1, arena::Mode::Release, table).map_err(err("arena"))?;
+        let mut a = Arena::new(b.arena.0, b.arena.1, arena::Mode::Release, table).map_err(err("arena"))?;
+        if b.image_zone != 0 {
+            a.set_image_zone(b.arena.0 + b.arena.1 - b.image_zone).map_err(err("the image zone"))?;
+        }
         *ARENA.get() = Some(a);
     }
     S.arena_lo.set(b.arena.0);
@@ -410,6 +417,11 @@ impl Files for Guest {
 
 impl Backing for Guest {
     fn read(&mut self, file: u64, offset: u64, addr: usize, len: usize) -> arena::Result<usize> {
+        // An image's file from its host mapping, not through the kernel's page cache (`memblk`).
+        // SAFETY: the arena's range being filled, nothing else's.
+        if let Some(n) = unsafe { memblk::pread(lkl_call, file as usize, offset, addr, len) } {
+            return Ok(n);
+        }
         res(lkl_call(l::__lkl__NR_pread64, [file as usize, addr, len, offset as usize, 0, 0]))
     }
 
@@ -437,6 +449,10 @@ impl Backing for Guest {
     fn release(&mut self, addr: usize, len: usize) -> arena::Result<()> {
         // SAFETY: the arena gives back only pages nothing relies on.
         unsafe { trap::madvise_dontneed(addr, len) }
+    }
+
+    fn locate(&mut self, file: u64, offset: u64) -> Option<(usize, u64)> {
+        memblk::locate(lkl_call, file as usize, offset)
     }
 }
 

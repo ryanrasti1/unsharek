@@ -6,7 +6,8 @@
 //! - [`closure`]: which store paths and host directories, from the program and `--allow-path`s.
 //!   Nix's own tooling (`nix-store --query --requisites`) computes store closures; for files
 //!   outside the store, references are found the way Nix finds them, by scanning bytes for store
-//!   paths.
+//!   paths. [`Cache::closure`] is the same with both cached: a store path's closure is immutable
+//!   (the query was ~19 ms of a 30 ms start), and a host tree's scan is keyed like its image.
 //! - [`Cache::images`]: an image per entry, built if the cache doesn't have it, and where it is.
 //!   Nothing is opened or mapped here: how images are mapped before lockdown is decided later.
 //!
@@ -16,11 +17,16 @@
 //! v<FORMAT>/store/<hash>-<name>.layout   name is the key
 //! v<FORMAT>/host/<dirname>-<key>.erofs   one per allowed host directory; <key> hashes the tree's
 //! v<FORMAT>/host/<dirname>-<key>.layout  metadata, so an edit makes a new key and a rebuild
+//! v<FORMAT>/host/<dirname>-<key>.refs    the store paths the tree mentions (its scan), same key
+//! v<FORMAT>/requisites/<key>             the closure of a set of store paths; <key> hashes their
+//!                                        names, which the file repeats (checked on reading)
 //! ```
 //! `<FORMAT>` is [`exobox_erofs::FORMAT_VERSION`]: a builder that writes differently doesn't read
 //! old images. Each image is written to a temporary file and renamed into place, its layout
 //! before it, so an image that exists is complete and has its layout; racing builders write the
-//! same bytes (the builder is deterministic) and the last rename wins.
+//! same bytes (the builder is deterministic) and the last rename wins. The `.refs` and
+//! `requisites` files are written the same way and carry their own version ([`LIST_VERSION`]) and
+//! an end line, so a file of another version, or cut short, is ignored and made again.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -91,6 +97,10 @@ pub struct Closure {
 /// Paths that don't exist are errors, as is a store path that Nix doesn't know. Relative paths
 /// are from the current directory. Needs `nix-store` on `PATH` (one query for all roots).
 pub fn closure(program: &Path, allow_paths: &[PathBuf]) -> Result<Closure> {
+    closure_in(program, allow_paths, None)
+}
+
+fn closure_in(program: &Path, allow_paths: &[PathBuf], cache: Option<&Cache>) -> Result<Closure> {
     let mut roots = BTreeSet::new();
     let mut host = BTreeSet::new();
     for path in allow_paths {
@@ -121,10 +131,17 @@ pub fn closure(program: &Path, allow_paths: &[PathBuf]) -> Result<Closure> {
     }
     let mut refs = BTreeMap::new();
     for dir in &outer {
-        scan_tree(dir, &mut refs)?;
+        match cache {
+            Some(c) => merge(&mut refs, c.host_refs(dir)?),
+            None => scan_tree(dir, &mut refs)?,
+        }
     }
     roots.extend(resolve(refs));
-    Ok(Closure { store: requisites(&roots)?, host: outer })
+    let store = match cache {
+        Some(c) => c.requisites(&roots)?,
+        None => requisites(&roots)?,
+    };
+    Ok(Closure { store, host: outer })
 }
 
 enum Place {
@@ -200,27 +217,46 @@ const PREFIX: &[u8] = b"/nix/store/";
 /// is split.
 const REF_MAX: usize = PREFIX.len() + HASH_LEN + 1 + NAME_MAX;
 
+/// `from`'s references added to `into`'s, the longer name kept where both have a hash.
+fn merge(into: &mut Refs, from: Refs) {
+    for (hash, name) in from {
+        let longest = into.entry(hash).or_default();
+        if name.len() > longest.len() {
+            *longest = name;
+        }
+    }
+}
+
 /// Every regular file's bytes and every symlink's target under `dir`, without following links.
 fn scan_tree(dir: &Path, refs: &mut Refs) -> Result<()> {
+    let mut buf = vec![0u8; REF_MAX + SCAN_CHUNK];
+    scan_dir(dir, refs, &mut buf)
+}
+
+fn scan_dir(dir: &Path, refs: &mut Refs, buf: &mut [u8]) -> Result<()> {
     for entry in fs::read_dir(dir).map_err(io_err(dir))? {
         let path = entry.map_err(io_err(dir))?.path();
         let md = fs::symlink_metadata(&path).map_err(io_err(&path))?;
         if md.is_dir() {
-            scan_tree(&path, refs)?;
+            scan_dir(&path, refs, buf)?;
         } else if md.is_symlink() {
             let target = fs::read_link(&path).map_err(io_err(&path))?;
             scan_bytes(target.as_os_str().as_bytes(), refs);
         } else if md.is_file() {
-            scan_file(&path, refs)?;
+            scan_file(&path, refs, buf)?;
         }
     }
     Ok(())
 }
 
-fn scan_file(path: &Path, refs: &mut Refs) -> Result<()> {
-    const CHUNK: usize = 1 << 20;
+/// Files are read this much at a time, into one buffer for the whole walk. (A megabyte buffer
+/// per file, allocated and freed 34 times for the fixtures, grew glibc's heap by a megabyte that
+/// every sandbox kept.)
+const SCAN_CHUNK: usize = 256 << 10;
+
+/// `buf` is `REF_MAX + SCAN_CHUNK` bytes, its contents don't matter.
+fn scan_file(path: &Path, refs: &mut Refs, buf: &mut [u8]) -> Result<()> {
     let mut f = File::open(path).map_err(io_err(path))?;
-    let mut buf = vec![0u8; REF_MAX + CHUNK];
     let mut kept = 0;
     loop {
         let n = f.read(&mut buf[kept..]).map_err(io_err(path))?;
@@ -327,6 +363,62 @@ impl Cache {
         self.builds.load(Ordering::Relaxed)
     }
 
+    /// [`closure`], from the cache where it can be: each set of store roots' requisites (a store
+    /// path's closure never changes, so their names are the key), and each host directory's
+    /// references (keyed by its tree, as its image; resolved again on every call, since a store
+    /// path it mentions may have appeared since).
+    pub fn closure(&self, program: &Path, allow_paths: &[PathBuf]) -> Result<Closure> {
+        closure_in(program, allow_paths, Some(self))
+    }
+
+    fn requisites(&self, roots: &BTreeSet<PathBuf>) -> Result<BTreeSet<PathBuf>> {
+        if roots.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let names: Vec<&[u8]> = roots.iter().map(|r| r.as_os_str().as_bytes()).collect();
+        let mut h = DefaultHasher::new();
+        for n in &names {
+            h.write_usize(n.len());
+            h.write(n);
+        }
+        let file = self.root.join("requisites").join(format!("{:016x}", h.finish()));
+        // The roots, an empty line, their closure.
+        if let Some(lines) = read_list(&file)
+            && let Some(split) = lines.iter().position(|l| l.is_empty())
+            && lines[..split] == names[..]
+        {
+            return Ok(lines[split + 1..].iter().map(|l| PathBuf::from(OsStr::from_bytes(l))).collect());
+        }
+        let got = requisites(roots)?;
+        let lines = names.iter().copied().chain([&b""[..]]).chain(got.iter().map(|p| p.as_os_str().as_bytes()));
+        write_list(&file, lines)?;
+        Ok(got)
+    }
+
+    /// The references in host directory `dir` (canonical), as of now.
+    fn host_refs(&self, dir: &Path) -> Result<Refs> {
+        let key = tree_key(dir)?;
+        let file = with_suffix(&self.root.join("host").join(host_name(dir, key)), ".refs");
+        // `<hash>-<name>` each.
+        if let Some(lines) = read_list(&file) {
+            let parse = |l: &[u8]| -> Option<([u8; HASH_LEN], Vec<u8>)> {
+                let (hash, name) = (l.get(..HASH_LEN)?, l.get(HASH_LEN + 1..)?);
+                (l[HASH_LEN] == b'-').then(|| (hash.try_into().unwrap(), name.to_vec()))
+            };
+            if let Some(refs) = lines.iter().map(|l| parse(l)).collect::<Option<Refs>>() {
+                return Ok(refs);
+            }
+        }
+        let mut refs = Refs::new();
+        scan_tree(dir, &mut refs)?;
+        // Cached only if the tree didn't change while it was read (as `host_image` checks).
+        if tree_key(dir)? == key {
+            let lines: Vec<Vec<u8>> = refs.iter().map(|(h, n)| [&h[..], b"-", n].concat()).collect();
+            write_list(&file, lines.iter().map(Vec::as_slice))?;
+        }
+        Ok(refs)
+    }
+
     /// An image for every entry of `closure`, built in parallel where missing.
     pub fn images(&self, closure: &Closure) -> Result<Store> {
         let jobs: Vec<(&Path, bool)> = closure
@@ -335,15 +427,32 @@ impl Cache {
             .map(|p| (p.as_path(), true))
             .chain(closure.host.iter().map(|p| (p.as_path(), false)))
             .collect();
+        // What the cache has is found here, on this thread (a stat, or a host tree's walk): the
+        // usual start builds nothing, and a thread per CPU to find that out cost a malloc arena
+        // each, which every sandbox kept.
+        let mut found = Vec::with_capacity(jobs.len());
+        let mut missing = Vec::new();
+        for (i, &(path, store)) in jobs.iter().enumerate() {
+            let mount = if store {
+                self.mount(path, "store", path.file_name().ok_or_else(|| Error::NotDir(path.to_owned()))?)
+            } else {
+                self.mount(path, "host", &host_name(path, tree_key(path)?))
+            };
+            if exists(&mount.image)? {
+                found.push((i, Ok(mount)));
+            } else {
+                missing.push(i);
+            }
+        }
         let next = AtomicUsize::new(0);
-        let done = Mutex::new(Vec::with_capacity(jobs.len()));
-        let workers = thread::available_parallelism().map_or(1, |n| n.get()).min(jobs.len());
+        let done = Mutex::new(found);
+        let workers = thread::available_parallelism().map_or(1, |n| n.get()).min(missing.len());
         thread::scope(|s| {
             for _ in 0..workers {
                 s.spawn(|| {
                     loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(&(path, store)) = jobs.get(i) else { break };
+                        let Some(&i) = missing.get(next.fetch_add(1, Ordering::Relaxed)) else { break };
+                        let (path, store) = jobs[i];
                         let got = if store { self.store_image(path) } else { self.host_image(path) };
                         done.lock().unwrap().push((i, got));
                     }
@@ -432,6 +541,47 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(suffix);
     s.into()
+}
+
+/// The version of the cache's lists (`.refs`, `requisites/`): what they hold and how. A change
+/// to either, or to what `scan_bytes` finds, bumps it.
+const LIST_VERSION: u32 = 1;
+
+fn list_header() -> String {
+    format!("exobox list v{LIST_VERSION}")
+}
+
+/// A list the cache wrote: its lines, if the file is there, of this version and whole (it ends
+/// with `end`). Anything else is as good as missing: the caller makes it again.
+fn read_list(path: &Path) -> Option<Vec<Vec<u8>>> {
+    let data = fs::read(path).ok()?;
+    let mut lines: Vec<&[u8]> = data.strip_suffix(b"\n")?.split(|&b| b == b'\n').collect();
+    if lines.first()? != &list_header().as_bytes() || lines.pop()? != b"end" {
+        return None;
+    }
+    Some(lines[1..].iter().map(|l| l.to_vec()).collect())
+}
+
+/// Writes a list for [`read_list`], atomically (a temporary file renamed into place: readers see
+/// the old file or the whole new one). Store paths and references hold no newlines.
+fn write_list<'a>(path: &Path, lines: impl IntoIterator<Item = &'a [u8]>) -> Result<()> {
+    let dir = path.parent().unwrap();
+    fs::create_dir_all(dir).map_err(io_err(dir))?;
+    let mut data = list_header().into_bytes();
+    data.push(b'\n');
+    for l in lines {
+        debug_assert!(!l.contains(&b'\n'));
+        data.extend_from_slice(l);
+        data.push(b'\n');
+    }
+    data.extend_from_slice(b"end\n");
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = with_suffix(path, &format!(".{}-{seq}.tmp", process::id()));
+    let written = fs::write(&tmp, &data).and_then(|()| fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written.map_err(io_err(path))
 }
 
 fn exists(path: &Path) -> Result<bool> {
@@ -524,12 +674,12 @@ mod tests {
     fn scan_file_sees_a_reference_across_chunks() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("f");
-        // Puts the reference across the first 1 MiB read's end.
-        let mut data = vec![b'x'; (1 << 20) + REF_MAX - 20];
+        // Puts the reference across the fourth read's end (the first reads `REF_MAX` more).
+        let mut data = vec![b'x'; 4 * SCAN_CHUNK + REF_MAX - 20];
         data.extend_from_slice(format!("/nix/store/{HASH}-glibc-2.44-57\0").as_bytes());
         fs::write(&path, &data).unwrap();
         let mut refs = Refs::new();
-        scan_file(&path, &mut refs).unwrap();
+        scan_file(&path, &mut refs, &mut vec![0; REF_MAX + SCAN_CHUNK]).unwrap();
         assert_eq!(refs[HASH.as_bytes()], b"glibc-2.44-57");
     }
 

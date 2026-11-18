@@ -23,6 +23,10 @@ libc.workspace = true
 syscalls.workspace = true
 thiserror.workspace = true
 
+# build.rs: the C compiler's PIE start files, for the binary's non-PIE link
+[build-dependencies]
+cc.workspace = true
+
 [dev-dependencies]
 exobox-fixtures = { path = "../fixtures" }
 libtest-mimic.workspace = true

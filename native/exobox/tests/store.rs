@@ -150,3 +150,47 @@ fn a_program_outside_the_store_needs_an_allowed_dir() {
     assert!(matches!(store::closure(&bash(), &["/nix".into()]), Err(Error::WholeStore(_))));
 }
 
+/// `Cache::closure` answers from its lists once made: a store query per set of roots, a scan per
+/// state of a host tree. Shown by editing the lists by hand: the edit is what comes back, until
+/// the tree changes (a new key) or a list is cut short (made again).
+#[test]
+fn closures_are_cached() {
+    let tmp = tempfile::tempdir().unwrap();
+    let xz = store_path(&PathBuf::from(env::var_os("EXOBOX_TEST_XZ").expect("EXOBOX_TEST_XZ (devshell)")));
+    let tree = tmp.path().join("tree");
+    fs::create_dir(&tree).unwrap();
+    fs::write(tree.join("script"), format!("#!/bin/sh\nexec {}/bin/xz\n", xz.display())).unwrap();
+    let allow = std::slice::from_ref(&tree);
+    let cache = Cache::new(&tmp.path().join("cache"));
+    let first = cache.closure(&bash(), allow).unwrap();
+    assert_eq!(first, store::closure(&bash(), allow).unwrap());
+    assert!(first.store.contains(&xz), "{first:?}");
+
+    let list = |sub: &str| -> PathBuf {
+        let dir = tmp.path().join(format!("cache/v{}/{sub}", exobox_erofs::FORMAT_VERSION));
+        let mut v: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
+        v.retain(|p| sub != "host" || p.to_string_lossy().ends_with(".refs"));
+        assert_eq!(v.len(), 1, "{v:?}");
+        v.pop().unwrap()
+    };
+    let (requisites, refs) = (list("requisites"), list("host"));
+    const EMPTY: &str = "exobox list v1\nend\n";
+    // The tree's references emptied: xz is no root any more (and those roots aren't cached).
+    let refs_text = fs::read_to_string(&refs).unwrap();
+    fs::write(&refs, EMPTY).unwrap();
+    assert!(!cache.closure(&bash(), allow).unwrap().store.contains(&xz));
+    // The first roots' list with glibc taken out: what the first roots get.
+    fs::write(&refs, &refs_text).unwrap();
+    let text = fs::read_to_string(&requisites).unwrap();
+    let edited: String = text.lines().filter(|l| !l.contains("-glibc-")).map(|l| format!("{l}\n")).collect();
+    fs::write(&requisites, &edited).unwrap();
+    assert!(glibc(&cache.closure(&bash(), allow).unwrap().store).is_none());
+    // Cut short (no `end`), it is made again.
+    fs::write(&requisites, &text[..text.len() - 4]).unwrap();
+    assert_eq!(cache.closure(&bash(), allow).unwrap(), first);
+    // A tree that changed is scanned again, whatever its old list said.
+    fs::write(&refs, EMPTY).unwrap();
+    fs::write(tree.join("other"), "x").unwrap();
+    assert_eq!(cache.closure(&bash(), allow).unwrap().store, first.store);
+}
+
