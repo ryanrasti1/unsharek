@@ -31,3 +31,11 @@ release build ~3.4 s. Nearly all of it is clap; object's code in the binary is ~
 Tools in the devshell (not linked): cargo-nextest (per-test processes and timeouts), erofs-utils
 (store images for programs outside the store; `fsck.erofs`/`dump.erofs` are the test oracle for
 native/erofs).
+
+## exobox-rt (2026-11-18): the in-sandbox runtime (native/rt)
+no_std, no allocation. Its size is measured once it's linked into `exobox`.
+
+| Crate | For | Where | Cost noted |
+|---|---|---|---|
+| rustix 1 (`thread`) | raw Linux syscalls; `thread` for prctl(PR_SET_NO_NEW_PRIVS) before the filter's install (`filter.rs`; seccomp itself is one inline `syscall`, as rustix has no wrapper) | library | `thread` adds linux-raw-sys's prctl constants only |
+| libc 0.2 | fork and waitpid: the filter's real-kernel test | test | test-only (already in the workspace) |

@@ -8,4 +8,9 @@ license.workspace = true
 publish = false
 
 [dependencies]
-rustix = { workspace = true }
+# thread: prctl(PR_SET_NO_NEW_PRIVS) before installing the filter
+rustix = { workspace = true, features = ["thread"] }
+
+[dev-dependencies]
+# fork and waitpid for the filter's real-kernel test
+libc = { workspace = true }
