@@ -150,6 +150,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "exobox-erofs"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "object",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "exobox-fixtures"
 version = "0.0.0"
 dependencies = [
@@ -214,6 +224,21 @@ name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+
+[[package]]
+name = "memchr"
+version = "2.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "object"
+version = "0.40.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd229a0361b9d0d4396176e02d65897f487eebeab7caa6d443855ee152ca0b9c"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "once_cell"

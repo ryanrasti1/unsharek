@@ -25,7 +25,9 @@
           bc
           python3
           strace
-          # guest store images for programs outside the Nix store (the test fixtures)
+          # the test oracle for native/erofs (fsck.erofs checks and extracts its images; dump.erofs
+          # inspects them), and guest store images for programs outside the Nix store (the test
+          # fixtures)
           erofs-utils
         ];
 
