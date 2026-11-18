@@ -3,6 +3,14 @@
 
   # capnix's revision, so the two share store paths.
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/5d2b81a7a3be3e2f832879028e4d60abbf58e9a0";
+  # The kernel's source (lkl/README.md): stock LKL plus exobox's series, built by lkl/Makefile.
+  # TODO: enable once exobox/native is pushed, for the final `nix build` (and add `linux` to the
+  # outputs' arguments). Dev builds don't use it: they build from EXOBOX_LKL_SRC, a local checkout
+  # (default /home/ryan/src/lkl-exobox), incrementally.
+  # inputs.linux = {
+  #   url = "github:ryanrasti/linux/exobox/native";
+  #   flake = false;
+  # };
 
   outputs = { self, nixpkgs }:
     let
@@ -29,6 +37,11 @@
           # inspects them), and guest store images for programs outside the Nix store (the test
           # fixtures)
           erofs-utils
+          # bindgen's libclang for native/lkl-sys: sets LIBCLANG_PATH, and BINDGEN_EXTRA_CLANG_ARGS
+          # to the C compiler's include paths (a bare libclang finds neither glibc's headers nor
+          # its own stddef.h). Its setup hook runs when the shell is entered, so devshell.sh's
+          # cached environment has both.
+          rustPlatform.bindgenHook
         ];
 
         # Programs from nixpkgs the test suite runs in the sandbox (native/tests).
