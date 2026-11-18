@@ -111,7 +111,13 @@ that mounts `/dev/exobox/<name>` with `mount(2)` and execs the next one).
 6. Within the performance budgets (`./test --perf`): startup, memory per sandbox, parallel builds.
 7. Code mapped in place from the store images, and a streaming image builder for stores that
    write images as paths arrive.
-8. Custom kernels, at build time: the kernel as its own Nix build (`lib.exoboxKernel { src, config }`:
+8. For capnix (`~/src/capnix-proper`, "What exobox needs to provide"): a host fd passed to the guest
+   at a given fd (its Cap'n Web channel at 1000), with the filter widened to exactly that fd; the
+   program run as a given uid (setup is the guest's init, as root, and can drop to it before exec);
+   a read-write block device served over a channel (a new kernel driver: Nix's `/nix/var` on
+   ext4); FUSE in the store's kernel (a config fragment); the streaming image builder (item 7) to
+   the API in capnix's `spikes/storefs/README.md`.
+9. Custom kernels, at build time: the kernel as its own Nix build (`lib.exoboxKernel { src, config }`:
    a source and a config fragment over `lkl/defconfig`, for more drivers or filesystems; LKL has
    no loadable modules), and `lib.mkExobox { kernel }` for an exobox built with it. In development,
    `EXOBOX_LKL_SRC` and `EXOBOX_LKL_CONFIG` (a fragment) select them.
