@@ -6,6 +6,7 @@
 
 use std::convert::Infallible;
 use std::ffi::OsString;
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -103,8 +104,8 @@ pub struct Config {
     pub deny: Deny,
     /// Host syscalls allowed on top of the mode's own.
     pub rules: Vec<Rule>,
-    /// Host paths outside the Nix store the program may map and see (its closure in the store
-    /// always is).
+    /// More host paths the program may see and map, besides its own closure: a store path
+    /// brings its closure; a path outside the store is shown as is, read-only.
     pub allow_paths: Vec<PathBuf>,
     /// Writable and executable memory (JITs). Off: W^X.
     pub jit: bool,
@@ -120,6 +121,31 @@ pub struct Config {
 pub fn run(config: Config) -> Result<Infallible, Error> {
     let _ = config;
     Err(Error::NotImplemented("the sandbox"))
+}
+
+/// A booted kernel with no program, forked once per sandbox: each child loads its own program,
+/// sharing the template's booted kernel copy-on-write. Starting a sandbox skips the boot, and the
+/// kernel's pages are paid for once.
+pub struct Template {
+    _config: Config,
+}
+
+impl Template {
+    /// Boot a template in a process of its own. `config.argv` is ignored: each [`spawn`] names
+    /// its program.
+    ///
+    /// [`spawn`]: Template::spawn
+    pub fn start(config: Config) -> Result<Template, Error> {
+        let _ = config;
+        Err(Error::NotImplemented("templates"))
+    }
+
+    /// Fork a sandbox running `argv` with these stdin, stdout and stderr. Returns its host pid
+    /// (a child of the template's process, not of this one).
+    pub fn spawn(&self, argv: &[OsString], stdio: [OwnedFd; 3]) -> Result<u32, Error> {
+        let _ = (argv, stdio);
+        Err(Error::NotImplemented("templates"))
+    }
 }
 
 #[cfg(test)]

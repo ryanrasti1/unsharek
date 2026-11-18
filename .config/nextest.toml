@@ -1,7 +1,16 @@
 # Each trial bounds itself (native/exobox/tests/suite.rs: per-case timeouts of seconds); this is the
 # backstop for anything that doesn't, and for the unit tests.
 [profile.default]
+default-filter = "not binary(perf)"
 slow-timeout = { period = "5s", terminate-after = 4 }
 failure-output = "immediate-final"
 status-level = "fail"
 final-status-level = "fail"
+
+# ./test --perf: the budgets (native/exobox/tests/perf.rs), one at a time so they don't load each
+# other, each printing its measurements.
+[profile.perf]
+default-filter = "binary(perf)"
+test-threads = 1
+slow-timeout = { period = "30s", terminate-after = 4 }
+success-output = "immediate"

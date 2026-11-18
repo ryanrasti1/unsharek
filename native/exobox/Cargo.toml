@@ -26,3 +26,8 @@ libc.workspace = true
 [[test]]
 name = "suite"
 harness = false
+
+# The performance budgets (./test --perf).
+[[test]]
+name = "perf"
+harness = false

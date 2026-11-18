@@ -33,6 +33,10 @@
         EXOBOX_TEST_BASH = "${pkgs.bash}/bin/bash";
         EXOBOX_TEST_COREUTILS = "${pkgs.coreutils}";
         EXOBOX_TEST_PYTHON = "${pkgs.python3}/bin/python3";
+        # ./test --perf (native/exobox/tests/perf.rs): parallel work and a C build
+        EXOBOX_TEST_XZ = "${pkgs.xz}/bin/xz";
+        EXOBOX_TEST_MAKE = "${pkgs.gnumake}/bin/make";
+        EXOBOX_TEST_GCC = "${pkgs.gcc}/bin/gcc";
         # Marks this shell, so ./test runs inside it directly.
         EXOBOX_DEVSHELL = "1";
       };

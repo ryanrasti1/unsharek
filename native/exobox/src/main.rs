@@ -25,7 +25,8 @@ enum Command {
         /// Allow one more host syscall: name[:argN=V|argN=LO..HI,...]. Repeatable.
         #[arg(long = "allow", value_name = "RULE")]
         rules: Vec<exobox::Rule>,
-        /// A host path outside the Nix store the program may see and map. Repeatable.
+        /// More the program may see and map: a store path (with its closure) or a host path
+        /// (read-only). Repeatable.
         #[arg(long = "allow-path", value_name = "PATH")]
         allow_paths: Vec<PathBuf>,
         /// Allow writable and executable memory (JITs).
