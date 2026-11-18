@@ -23,6 +23,7 @@ pub mod futex;
 pub mod guest;
 pub mod host;
 pub mod memblk;
+pub mod par;
 pub mod sched;
 pub mod sync;
 pub mod sysmap;

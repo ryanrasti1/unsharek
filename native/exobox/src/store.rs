@@ -592,9 +592,15 @@ fn exists(path: &Path) -> Result<bool> {
     }
 }
 
-/// `<dirname>-<key>`, the name only to tell images apart by eye.
+/// `<dirname>-<key>`, the name only to tell images apart by eye. Leading dots go: the name is also
+/// the guest's device name (`/dev/exobox/<name>`), which mustn't be hidden or `.`/`..` (a
+/// `tempfile` directory is `.tmpXXXXXX`).
 fn host_name(dir: &Path, key: u64) -> std::ffi::OsString {
     let base = dir.file_name().map_or(b"root".as_slice(), |n| n.as_bytes());
+    let base = match base.iter().position(|&b| b != b'.') {
+        Some(i) => &base[i..],
+        None => b"root".as_slice(),
+    };
     let mut name: String = base
         .iter()
         .take(64)

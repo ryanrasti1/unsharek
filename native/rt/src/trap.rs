@@ -188,54 +188,54 @@ pub unsafe fn exit_thread() -> ! {
 }
 
 /// A new host thread (`clone` with [`CLONE_HOST_THREAD`], the only flags the filter allows) that
-/// runs `entry(arg)` on the stack below `stack_top`. Returns its tid. The kernel writes 0 to
-/// `*ctid` (and futex-wakes it) when the thread exits, so set it nonzero first to tell.
-///
-/// The child returns from the gate's `syscall` on the new stack, so its first instruction is the
-/// gate's `ret`: the stack is prepared so that `ret` lands in a trampoline that calls `entry`.
+/// runs `entry(arg)` on the stack below `run_top`, with `[alt, alt + alt_len)` installed as its
+/// own alternate signal stack. Returns its tid. The kernel writes 0 to `*ctid` (and futex-wakes
+/// it) when the thread exits, so set it nonzero first to tell.
 ///
 /// The new thread has no alternate signal stack (the kernel clears it for a `CLONE_VM` child,
-/// `sas_ss_reset` in copy_process), and `sigaltstack` is not in the filter: a trap on it would be
-/// delivered on whatever stack it traps on. It must not trap until that is settled. The way
-/// capnix settled it (tier A, `27955f1c`), with no filter entry: prepare the child's stack so
-/// that it `ret`s into `rt_sigreturn` on a frame copied from the trapped `clone`'s, whose
-/// `uc_stack` names the new thread's own alternate stack. `rt_sigreturn` (allowed from anywhere)
-/// installs it (`restore_altstack`), and the thread starts in the runtime with the program's
-/// signal mask.
+/// `sas_ss_reset` in copy_process), and `sigaltstack` is not in the filter: a trap delivered on
+/// its ordinary stack would overrun it (Go's ~128-byte spare). The way capnix settled it (tier A,
+/// `27955f1c`), with no filter entry: the child returns from the gate's `syscall` on a stack
+/// whose first word is the SIGSYS restorer, so the gate's `ret` lands in `rt_sigreturn` on a frame
+/// built from the trapping `clone`'s own ucontext (`tmpl`). `rt_sigreturn` (allowed from anywhere)
+/// restores that frame, installing the alternate stack (`restore_altstack`) and resuming at
+/// `entry(arg)` with the program's signal mask.
 ///
 /// # Safety
-/// `stack_top` is the top of writable memory only this thread will use (it needs ~64 bytes plus
-/// what `entry` uses); `ctid` stays valid until the thread has exited; `entry` never returns.
+/// `run_top` is the top of writable memory only this thread will use (room for the frame built
+/// here plus what `entry` uses); `alt` is this thread's alone; `ctid` stays valid until the thread
+/// has exited; `tmpl` is a valid ucontext (the trapping clone's); `entry` never returns.
 pub unsafe fn clone_thread(
-    stack_top: usize,
+    run_top: usize,
+    alt: usize,
+    alt_len: usize,
     ctid: *mut u32,
+    tmpl: &Ucontext,
     entry: extern "C" fn(usize) -> !,
     arg: usize,
 ) -> Result<u32, Errno> {
-    // The child's sp: [clone_start, entry, arg]. After `ret` and two pops it is 16-aligned, so
-    // `clone_start`'s `call` gives `entry` the SysV alignment (rsp % 16 == 8).
-    let sp = (stack_top & !15) - 24;
-    let words = [clone_start as *const () as usize, entry as usize, arg];
-    for (i, w) in words.iter().enumerate() {
-        // SAFETY: inside the caller's stack.
-        unsafe { (sp as *mut usize).add(i).write(*w) };
-    }
-    // x86-64 clone: (flags, newsp, parent_tid, child_tid, tls).
-    // SAFETY: the caller's contract; the child runs only from the prepared stack.
-    let r = unsafe { gate(NR_CLONE as usize, CLONE_HOST_THREAD as usize, sp, 0, ctid as usize, 0, 0) };
+    // The rt_sigframe the child `ret`s onto: pretcode (the restorer) then the ucontext, 16-aligned
+    // so the restored rsp (below) is clean; room for `entry`'s frame below it.
+    let frame = ((run_top - 8 - size_of::<Ucontext>()) & !63) - 8;
+    // SAFETY: inside the caller-provided stack.
+    unsafe { (frame as *mut usize).write(restorer as *const () as usize) };
+    let uc = frame + 8;
+    let mut u = *tmpl;
+    u.link = 0;
+    u.stack = StackT { sp: alt, flags: 0, size: alt_len };
+    u.mcontext.rip = entry as *const () as u64;
+    u.mcontext.rdi = arg as u64;
+    // As if `call`ed: a fresh stack below the frame, 16-aligned then one word down.
+    u.mcontext.rsp = (((frame - 256) & !15) - 8) as u64;
+    u.mcontext.rbp = 0;
+    u.mcontext.fpregs = 0; // the FPU starts in its initial state
+    // SAFETY: `uc` is inside the stack, aligned for a Ucontext.
+    unsafe { (uc as *mut Ucontext).write(u) };
+    // x86-64 clone: (flags, newsp, parent_tid, child_tid, tls). The child starts at the gate's
+    // `ret`, which pops the restorer at `frame`.
+    // SAFETY: the caller's contract; the child runs only from the prepared frame.
+    let r = unsafe { gate(NR_CLONE as usize, CLONE_HOST_THREAD as usize, frame, 0, ctid as usize, 0, 0) };
     check(r).map(|tid| tid as u32)
-}
-
-/// Where a `clone_thread` child's `ret` from the gate lands: `entry(arg)`, as a fresh call.
-#[unsafe(naked)]
-unsafe extern "C" fn clone_start() -> ! {
-    core::arch::naked_asm!(
-        "pop rax",
-        "pop rdi",
-        "xor ebp, ebp", // ends frame-pointer walks here
-        "call rax",
-        "ud2",
-    )
 }
 
 /// Wait for an eventfd's count (a CPU token): `read` of its 8 bytes, which blocks while it is 0.
