@@ -107,8 +107,6 @@ pub struct Config {
     /// More host paths the program may see and map, besides its own closure: a store path
     /// brings its closure; a path outside the store is shown as is, read-only.
     pub allow_paths: Vec<PathBuf>,
-    /// Writable and executable memory (JITs). Off: W^X.
-    pub jit: bool,
     /// Fork mode: the most processes alive at once, the first one included.
     pub max_procs: Option<u32>,
     /// The program and its arguments; `argv[0]` is the program's path.

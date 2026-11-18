@@ -160,9 +160,8 @@ fn cases() -> Vec<Case> {
         fixture("stdio_meminfo", ALL),
         fixture("sigsys", ALL),
         Case { cpu_budget: Some(Duration::from_millis(100)), ..fixture("idle", ALL) },
-        // W^X everywhere unless --jit (fork mode too: exec maps programs from the store image).
-        fixture("wx", ALL).native(None),
-        fixture("wx", ALL).renamed("wx_jit").flags(&["--jit"]).env(&[("EXOBOX_TEST_RWX", "1")]),
+        // JITs work with no flag: W^X would be hardening of the program, not the sandbox's.
+        fixture("rwx", ALL),
         // How a run ends.
         case("exit_code", Prog::Fixture("exit_status"), ALL, status(Status::Code(42)))
             .args(vec![Arg::Lit("exit42")]),

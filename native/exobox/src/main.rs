@@ -29,9 +29,6 @@ enum Command {
         /// (read-only). Repeatable.
         #[arg(long = "allow-path", value_name = "PATH")]
         allow_paths: Vec<PathBuf>,
-        /// Allow writable and executable memory (JITs).
-        #[arg(long)]
-        jit: bool,
         /// Fork mode: the most processes alive at once.
         #[arg(long)]
         max_procs: Option<u32>,
@@ -55,7 +52,7 @@ enum Deny {
 }
 
 fn main() -> ExitCode {
-    let Command::Run { mode, deny, rules, allow_paths, jit, max_procs, argv } = Cli::parse().command;
+    let Command::Run { mode, deny, rules, allow_paths, max_procs, argv } = Cli::parse().command;
     let config = exobox::Config {
         mode: match mode {
             Mode::Coroutine => exobox::Mode::Coroutine,
@@ -68,7 +65,6 @@ fn main() -> ExitCode {
         },
         rules,
         allow_paths,
-        jit,
         max_procs,
         argv,
     };
