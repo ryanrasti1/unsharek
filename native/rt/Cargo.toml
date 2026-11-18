@@ -1,0 +1,11 @@
+[package]
+name = "exobox-rt"
+version = "0.0.0"
+description = "exobox's in-sandbox runtime: what runs after lockdown, in the SIGSYS handler and on the guest kernel's behalf"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+rustix = { workspace = true }

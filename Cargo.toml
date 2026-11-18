@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["native/erofs", "native/exobox", "native/fixtures"]
+members = ["native/erofs", "native/exobox", "native/fixtures", "native/rt"]
 
 [workspace.package]
 edition = "2024"
@@ -10,6 +10,8 @@ repository = "https://github.com/ryanrasti/exobox"
 
 [workspace.dependencies]
 clap = { version = "4", features = ["derive"] }
+# raw Linux syscalls, no libc: the runtime after lockdown
+rustix = { version = "1", default-features = false }
 syscalls = "0.6"
 thiserror = "2"
 # tests
@@ -19,4 +21,8 @@ tempfile = "3"
 libc = "0.2"
 
 [profile.dev]
+panic = "abort"
 debug = 1
+
+[profile.release]
+panic = "abort"
