@@ -1,0 +1,7 @@
+# Each trial bounds itself (native/exobox/tests/suite.rs: per-case timeouts of seconds); this is the
+# backstop for anything that doesn't, and for the unit tests.
+[profile.default]
+slow-timeout = { period = "5s", terminate-after = 4 }
+failure-output = "immediate-final"
+status-level = "fail"
+final-status-level = "fail"

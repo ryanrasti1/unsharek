@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["native/exobox", "native/fixtures"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-2.0-only"
+repository = "https://github.com/ryanrasti/exobox"
+
+[workspace.dependencies]
+clap = { version = "4", features = ["derive"] }
+syscalls = "0.6"
+thiserror = "2"
+# tests
+cc = "1"
+libtest-mimic = "0.8"
+tempfile = "3"
+libc = "0.2"
+
+[profile.dev]
+debug = 1

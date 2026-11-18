@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Build incrementally and run every test: the unit tests and the regression suite
+# (native/exobox/tests/suite.rs), natively and in each mode. Seconds, warm. Arguments go to
+# cargo-nextest, e.g.:
+#   ./test -E 'test(/::fork$/)'      one mode
+#   ./test -E 'test(/^escape/)'      the filter's cases
+#   ./test --no-fail-fast            (the default stops at the first failure)
+set -euo pipefail
+root="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=devshell.sh
+source "$root/devshell.sh"
+cd "$root"
+exec cargo nextest run --workspace --no-tests=warn "$@"

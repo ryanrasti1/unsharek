@@ -1,0 +1,28 @@
+[package]
+name = "exobox"
+version = "0.0.0"
+description = "Unmodified Linux programs on an in-process Linux kernel (LKL), behind a strict seccomp filter"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "exobox"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+syscalls.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+exobox-fixtures = { path = "../fixtures" }
+libtest-mimic.workspace = true
+tempfile.workspace = true
+libc.workspace = true
+
+# The regression suite: one table of cases, each run natively and in every mode it names.
+[[test]]
+name = "suite"
+harness = false
