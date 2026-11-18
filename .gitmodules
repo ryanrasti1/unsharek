@@ -1,0 +1,4 @@
+[submodule "lkl/linux"]
+	path = lkl/linux
+	url = /home/ryan/src/lkl-linux
+	branch = exobox/native

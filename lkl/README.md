@@ -65,17 +65,15 @@ Known limits, from building them: an exec from a non-main thread leaves `gettid 
 
 ## Building
 Built out of tree by `make` (`lkl/Makefile`, into `target/lkl`; incremental, the cold build ~20 s
-on 24 cores) from one commit of the branch: the one flake.lock pins for the flake input `linux`,
-in development and in `nix build` alike. During development it is extracted from
-`EXOBOX_LKL_REPO` (default `/home/ryan/src/lkl-linux`) into `target/lkl-src`; for work on the
-kernel, `EXOBOX_LKL_REF` names another commit or a branch to follow, and `EXOBOX_LKL_SRC` a
-checkout to build as it is. `EXOBOX_LKL_CONFIG` adds a config fragment over `lkl/defconfig`. For
-`nix build` the kernel is its own derivation (`lib.exoboxKernel`), linked through lkl-sys's
-`EXOBOX_LKL_PREBUILT`.
+on 24 cores) from the submodule `lkl/linux`, in development and in `nix build` alike (`nix build`
+sees it through the flake's `inputs.self.submodules`). `EXOBOX_LKL_SRC` names another checkout,
+`EXOBOX_LKL_CONFIG` adds a config fragment over `lkl/defconfig`. For `nix build` the kernel is its
+own derivation (`lib.exoboxKernel`), linked through lkl-sys's `EXOBOX_LKL_PREBUILT`.
 
-A commit of the series reaches exobox by a bump, in one exobox commit: `nix flake update linux`
-(flake.lock's pin moves to the branch's head), and exobox's side of the change (the host-operations
-table in `native/rt`, when the host interface moved) until `./test` passes. Until then, exobox
-builds the kernel it was last bumped to, whatever the branch has. `native/lkl-sys` runs the make from its build.rs and links the kernel object alone
+The series is a branch of the kernel's repository (`exobox/native`; the submodule's URL, today the
+local `/home/ryan/src/lkl-linux`). Work on it happens in the submodule; a commit of it reaches
+exobox as the submodule's new commit together with exobox's side of the change (the
+host-operations table in `native/rt`, when the host interface moved), in one exobox commit.
+`native/lkl-sys` runs the make from its build.rs and links the kernel object alone
 (`liblkl-kernel.a`, tools/lkl's `lib/lkl.o`), not `tools/lkl/lib`: exobox provides the host ops
 itself. The stock posix host (`liblkl-posix.a`) is linked only by lkl-sys's smoke test.

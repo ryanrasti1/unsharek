@@ -17,6 +17,11 @@
   make for the kernel. No `nix build` or `nix develop` in the loop: `./test` sources
   `devshell.sh`, which caches the devshell's environment keyed on flake.nix and flake.lock.
 - One `nix build` makes the distributed binary at the end. It is not part of the loop.
+- The kernel is the submodule `lkl/linux`. Kernel work happens there, on a branch of the kernel's
+  repository; it lands in exobox as the submodule's new commit plus exobox's side of it, in one
+  commit. A secondary worktree of this repository has no submodule checked out: build it with
+  `EXOBOX_LKL_SRC=` pointing at a kernel checkout (or `git submodule update --init lkl/linux` in it,
+  ~1.3 GB).
 
 ## Tests
 - A bug found gets a regression test first: a program in `native/fixtures/c/` (its comment says

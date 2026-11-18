@@ -1,22 +1,5 @@
 {
   "nodes": {
-    "linux": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1795042542,
-        "narHash": "sha256-H4D6DDUZr8Jz05HdkDSHod3fPan78w/8In+wz8ad4ZM=",
-        "ref": "exobox/native",
-        "rev": "8eeb771cd7d6f8565f850c5bac07dc5200cc0aff",
-        "revCount": 1312540,
-        "type": "git",
-        "url": "file:///home/ryan/src/lkl-linux"
-      },
-      "original": {
-        "ref": "exobox/native",
-        "type": "git",
-        "url": "file:///home/ryan/src/lkl-linux"
-      }
-    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1794644783,
@@ -35,7 +18,6 @@
     },
     "root": {
       "inputs": {
-        "linux": "linux",
         "nixpkgs": "nixpkgs"
       }
     }

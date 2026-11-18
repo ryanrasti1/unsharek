@@ -141,7 +141,7 @@ binary's text). `hello` starts and ends in ~30 ms, of which ~19 ms is the store'
 
 ## The Nix package (2026-11-18): `nix build` (flake.nix's `mkExobox`, `exoboxKernel`)
 Nothing new in Cargo.lock: `rustPlatform.buildRustPackage` vendors it offline (`cargoLock`). The
-kernel is its own derivation (lkl/Makefile from the flake's `linux` input; lkl-sys links it through
+kernel is its own derivation (lkl/Makefile from the submodule lkl/linux; lkl-sys links it through
 `EXOBOX_LKL_PREBUILT`), so a change to the Rust code rebuilds only the Rust.
 
 - **The package** (`exobox`, `exobox-erofs`): closure 57.3 MiB (`nix path-info -Sh ./result`),
@@ -153,8 +153,7 @@ kernel is its own derivation (lkl/Makefile from the flake's `linux` input; lkl-s
   its own closure is 359 MiB, as liblkl-posix.a's debug info names gcc's and glibc's headers.
 - **Build times** (24 cores, `--builders ''`): kernel and package together ~36 s cold (the kernel
   ~23 s, its source a tree of symlinks into the store rather than a 1.7 GB copy; the Rust package
-  ~14 s: a 10 s release build, the tests' build, 0.5 s of tests). The first `nix flake lock` fetched the input in ~3 min
-  (the whole repository into Nix's git cache); `nix flake update linux` after that, ~13 s. A
+  ~14 s: a 10 s release build, the tests' build, 0.5 s of tests). (The kernel was a flake input then; it is the submodule lkl/linux now: `nix build` copies its tree into the store once, ~1.3 GB.) A
   rebuild after a Rust change is the Rust package alone; with nothing changed, `nix build` is
   0.4 s. (A configured remote builder that is unreachable adds its SSH timeout to each build.)
 - **checkPhase** (nextest): lkl-sys's tests (the kernel given boots on the posix host, answers

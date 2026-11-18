@@ -3,19 +3,12 @@
 
   # capnix's revision, so the two share store paths.
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/5d2b81a7a3be3e2f832879028e4d60abbf58e9a0";
-  # The kernel's source (lkl/README.md): stock LKL plus exobox's series (lib.exoboxKernel's
-  # default). flake.lock pins one commit of the branch, and dev builds build that commit too
-  # (lkl/Makefile reads nodes.linux.locked.rev and extracts it from the local repository,
-  # incrementally). A kernel bump is `nix flake update linux` plus exobox's side of it, in one
-  # commit (README, "Building and testing").
-  # TODO: github:ryanrasti/linux/exobox/native once the branch is pushed; until then, the local
-  # repository (so `nix build` works only on this machine).
-  inputs.linux = {
-    url = "git+file:///home/ryan/src/lkl-linux?ref=exobox/native";
-    flake = false;
-  };
+  # The kernel's source is the submodule lkl/linux (lkl/README.md: stock LKL plus exobox's series):
+  # the flake sees it only with submodules on. A kernel change is the submodule's new commit plus
+  # exobox's side of it, in one commit.
+  inputs.self.submodules = true;
 
-  outputs = { self, nixpkgs, linux }:
+  outputs = { self, nixpkgs }:
     let
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
@@ -27,10 +20,10 @@
       # liblkl-posix.a (lkl-sys's boot test, run in mkExobox's checkPhase), include/, and the
       # expanded .config. `config` is a fragment of kernel config lines over lkl/defconfig (later
       # lines win: "CONFIG_SYSVIPC=y\n", or "# CONFIG_X is not set\n").
-      exoboxKernel = { src ? linux, config ? "" }:
+      exoboxKernel = { src ? ./lkl/linux, config ? "" }:
         pkgs.stdenv.mkDerivation {
           pname = "exobox-kernel";
-          version = src.shortRev or "custom";
+          version = src.shortRev or "0";
           inherit src;
           # Only the Makefile and the defconfig: an edit elsewhere in the repository doesn't rebuild
           # the kernel.

@@ -3,11 +3,9 @@
 # this and any other build of it.
 #
 #   make -C lkl                       the kernel object and the posix host (both below), from the
-#                                     commit flake.lock pins for the `linux` input, out of
-#                                     $(EXOBOX_LKL_REPO): what `nix build` links too
-#   make -C lkl EXOBOX_LKL_REF=...    a branch, tag or commit of that repository instead (a
-#                                     branch's committed head, while working on the kernel)
-#   make -C lkl EXOBOX_LKL_SRC=...    a checkout instead, built as it is on disk (kernel work)
+#                                     submodule lkl/linux (the kernel's commit is the submodule's:
+#                                     what `nix build` links too)
+#   make -C lkl EXOBOX_LKL_SRC=...    another checkout instead (another worktree's kernel)
 #   make -C lkl EXOBOX_LKL_CONFIG=/abs/frag.config
 #                                     config lines merged over lkl/defconfig (later lines win, as
 #                                     kconfig reads a .config: CONFIG_SYSVIPC=y, or
@@ -16,8 +14,8 @@
 #                                     (flake.nix's lib.exoboxKernel): see `install` below
 #
 # Normally run by native/lkl-sys's build.rs, incrementally: a cold build is ~20 s on 24 cores, a
-# no-op one ~3.5 s (kbuild walking its tree; build.rs only runs it when lkl/, the fragment,
-# flake.lock, EXOBOX_LKL_REF's repository refs or EXOBOX_LKL_SRC's tree changed).
+# no-op one ~3.5 s (kbuild walking its tree; build.rs only runs it when lkl/, the fragment or the
+# kernel's tree changed).
 #
 # Outputs, in $(KOUT):
 #   liblkl-kernel.a   lkl.o alone (as $(KOUT)/lkl.o, with its stack note: see below): the kernel,
@@ -37,20 +35,11 @@ MAKEFLAGS += -r --no-print-directory
 # The build's root. target/ is cargo's and gitignored; build.rs passes its own (from OUT_DIR).
 KOUT ?= $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../target/lkl)
 
-# The source. By default a commit, not a working tree or a branch: a build from the kernel's
-# working checkout once picked up its uncommitted edits (a host op field the kernel had before
-# exobox did: main stopped compiling), and the branch's head moves ahead of exobox the same way.
-# So the default is the commit flake.lock pins (nodes.linux.locked.rev), the one `nix build`
-# links; a kernel bump is `nix flake update linux` and exobox's side of it, in one commit. It is
-# extracted from $(EXOBOX_LKL_REPO) into $(KOUT)-src (`source` below). EXOBOX_LKL_REF names
-# another commit (a branch, to follow it); EXOBOX_LKL_SRC a checkout to build as it is.
-EXOBOX_LKL_REPO ?= /home/ryan/src/lkl-linux
-EXOBOX_LKL_REF ?=
-FLAKE_LOCK := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../flake.lock)
-ifeq ($(EXOBOX_LKL_SRC),)
-EXOBOX_LKL_SRC := $(KOUT)-src
-FROM_REF := 1
-endif
+# The source: the submodule lkl/linux, as it is on disk. Kernel work happens there (a branch of
+# the kernel's repository, checked out in the submodule), and a kernel change lands in exobox as
+# the submodule's new commit, with exobox's side of it, in one commit. EXOBOX_LKL_SRC names
+# another checkout (a worktree's, whose own submodule isn't checked out).
+EXOBOX_LKL_SRC ?= $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/linux)
 DEFCONFIG := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/defconfig)
 LKL := $(KOUT)/tools/lkl
 STAMP := $(KOUT)/.exobox_defconfig.sha256
@@ -94,8 +83,8 @@ all: $(KOUT)/liblkl-kernel.a $(KOUT)/liblkl-posix.a
 # always recurses into kbuild (its lkl.o rule is FORCE), which finds nothing to do in seconds.
 # Only liblkl.a is asked for (spelled as tools/lkl spells it, with its `//`), not tools/lkl's
 # programs and tests.
-kernel: $(if $(FROM_REF),source)
-	@test -e $(EXOBOX_LKL_SRC)/arch/lkl/Makefile || { echo "EXOBOX_LKL_SRC=$(EXOBOX_LKL_SRC): not an LKL checkout" >&2; exit 1; }
+kernel:
+	@test -e $(EXOBOX_LKL_SRC)/arch/lkl/Makefile || { echo "$(EXOBOX_LKL_SRC): not an LKL checkout (the submodule: git submodule update --init lkl/linux; or EXOBOX_LKL_SRC=<a checkout>)" >&2; exit 1; }
 	@test -z "$(EXOBOX_LKL_CONFIG)" || test -f "$(EXOBOX_LKL_CONFIG)" || { echo "EXOBOX_LKL_CONFIG=$(EXOBOX_LKL_CONFIG): no such file" >&2; exit 1; }
 	@mkdir -p $(LKL)/include $(LKL)/tests
 	@if [ "$$(cat $(STAMP) 2>/dev/null)" != "$$($(CONFIG_TEXT) | sha256sum)" ] || \
@@ -110,27 +99,6 @@ kernel: $(if $(FROM_REF),source)
 	@# Written only when it changes: build.rs watches it (and the other stamps), so a build with
 	@# other settings into this shared $(KOUT) makes every other lkl-sys build script run again.
 	@new=$$($(CONFIG_TEXT) | sha256sum); [ "$$(cat $(STAMP) 2>/dev/null)" = "$$new" ] || echo "$$new" > $(STAMP)
-
-# The commit (flake.lock's, or $(EXOBOX_LKL_REF)'s), in $(KOUT)-src. Finding it takes
-# milliseconds; the tree is only touched when the commit differs from the one last extracted
-# ($(KOUT)-src.commit), and then by read-tree with an index of its own ($(KOUT)-src.index): only the
-# files that differ between the two commits are written or removed, so kbuild rebuilds what the
-# change touches, not everything. Nothing is written to the repository (no worktree registered in
-# it). flake.lock is JSON; python3 is the devshell's (the kernel's build needs it anyway).
-LOCKED_REV = python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["nodes"]["linux"]["locked"]["rev"])' $(FLAKE_LOCK)
-WANTED = $(if $(EXOBOX_LKL_REF),EXOBOX_LKL_REF=$(EXOBOX_LKL_REF),flake.lock's linux)
-.PHONY: source
-source:
-	@want=$$($(if $(EXOBOX_LKL_REF),echo '$(EXOBOX_LKL_REF)',$(LOCKED_REV))) && \
-	commit=$$(git -C $(EXOBOX_LKL_REPO) rev-parse --verify -q "$$want^{commit}") || \
-		{ echo "$(WANTED) ($$want): no such commit in EXOBOX_LKL_REPO=$(EXOBOX_LKL_REPO)" >&2; exit 1; }; \
-	if [ "$$(cat $(KOUT)-src.commit 2>/dev/null)" != "$$commit" ] || [ ! -e $(EXOBOX_LKL_SRC)/Makefile ]; then \
-		echo "  SOURCE  $(WANTED) ($$commit) -> $(EXOBOX_LKL_SRC)"; \
-		rm -f $(KOUT)-src.commit && mkdir -p $(EXOBOX_LKL_SRC) && \
-		GIT_INDEX_FILE=$(KOUT)-src.index git -C $(EXOBOX_LKL_REPO) --work-tree=$(EXOBOX_LKL_SRC) \
-			read-tree --reset -u $$commit && \
-		echo $$commit > $(KOUT)-src.commit; \
-	fi
 
 # The archives are remade only when tools/lkl's objects are newer, so a no-op build leaves their
 # mtimes (and cargo's link step) alone.
