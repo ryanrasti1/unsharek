@@ -50,6 +50,9 @@ enum Arg {
     Lit(&'static str),
     /// The path of a host file with a secret in it, outside every allowed path.
     Secret,
+    /// A path that doesn't exist yet, in a directory of this run's own: whether the run created
+    /// it on the host is checked afterwards (`Expect::creates`).
+    Marker,
     Fixture(&'static str),
     Denied(&'static str),
 }
@@ -69,14 +72,16 @@ struct Expect {
     stdout: Vec<&'static str>,
     stderr: Vec<&'static str>,
     not_stdout: Vec<&'static str>,
+    /// Whether the run made `Arg::Marker`'s file on the host (None: not checked).
+    creates: Option<bool>,
 }
 
 fn ok(marker: &'static str) -> Expect {
-    Expect { status: Status::Code(0), stdout: vec![marker], stderr: vec![], not_stdout: vec![] }
+    Expect { status: Status::Code(0), stdout: vec![marker], ..status(Status::Code(0)) }
 }
 
 fn status(status: Status) -> Expect {
-    Expect { status, stdout: vec![], stderr: vec![], not_stdout: vec![] }
+    Expect { status, stdout: vec![], stderr: vec![], not_stdout: vec![], creates: None }
 }
 
 struct Case {
@@ -186,14 +191,32 @@ fn cases() -> Vec<Case> {
         .native(None),
         // The loader: nothing the program brings runs before lockdown, and nothing outside the
         // allowed paths maps. Natively each one leaks, which shows the test can see a leak.
+        // A hostile PT_INTERP reading a host file, creating one, and calling through the gate
+        // (which only fails if the filter is in place before the loader's first instruction).
         case(
-            "hostile_interp",
+            "hostile_interp_read",
             Prog::Fixture("interp_victim"),
             ALL,
             Expect { not_stdout: vec!["LEAKED"], ..status(Status::Any) },
         )
-        .args(vec![Arg::Secret])
+        .args(vec![Arg::Secret, Arg::Lit("read")])
         .native(Some(Expect { stdout: vec!["LEAKED:"], ..status(Status::Code(0)) })),
+        case(
+            "hostile_interp_write",
+            Prog::Fixture("interp_victim"),
+            ALL,
+            Expect { creates: Some(false), ..status(Status::Any) },
+        )
+        .args(vec![Arg::Marker, Arg::Lit("write")])
+        .native(Some(Expect { stdout: vec!["CREATED"], creates: Some(true), ..status(Status::Code(0)) })),
+        case(
+            "hostile_interp_gate",
+            Prog::Fixture("interp_victim"),
+            ALL,
+            Expect { not_stdout: vec!["GATE_SURVIVED"], ..status(Status::Signal(SIGSYS)) },
+        )
+        .args(vec![Arg::Secret, Arg::Lit("gate")])
+        .native(Some(ok("NO_GATE"))),
         case(
             "hostile_ctor",
             Prog::Fixture("ctor_victim"),
@@ -324,9 +347,12 @@ fn run(c: &Case, mode: Mode, secret: &PathBuf) -> Result<(), Failed> {
             None => return Err(format!("{var} unset: run in the devshell (./test)").into()),
         },
     };
+    let marker_dir = tempfile::tempdir()?;
+    let marker = marker_dir.path().join("created-by-the-program");
     let args = c.args.iter().map(|a| match a {
         Arg::Lit(s) => PathBuf::from(s),
         Arg::Secret => secret.clone(),
+        Arg::Marker => marker.clone(),
         Arg::Fixture(name) => fx::bin(name),
         Arg::Denied(name) => fx::denied_dir().join(name),
     });
@@ -374,6 +400,11 @@ fn run(c: &Case, mode: Mode, secret: &PathBuf) -> Result<(), Failed> {
     for unwanted in &expect.not_stdout {
         if stdout.contains(unwanted) {
             return fail(format!("stdout has {unwanted:?}"));
+        }
+    }
+    if let Some(want) = expect.creates {
+        if marker.exists() != want {
+            return fail(format!("{} {} on the host", marker.display(), if want { "wasn't created" } else { "was created" }));
         }
     }
     if let (Some(budget), Mode::Coroutine | Mode::Threaded | Mode::Fork) = (c.cpu_budget, mode) {

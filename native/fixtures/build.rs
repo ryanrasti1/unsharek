@@ -23,7 +23,9 @@ fn main() {
 
     // The libraries first: programs link against them.
     let libs: Vec<(String, PathBuf, Vec<String>)> = vec![
-        ("evil_interp".into(), interp.clone(), args(&["-nostdlib", "-shared", "-fPIC", "-fno-stack-protector", "-Wl,-e,_start"])),
+        // -ffreestanding: no library calls substituted for loops (GCC turns a strlen loop into a call to
+        // strlen, through a PLT that nothing relocates here).
+        ("evil_interp".into(), interp.clone(), args(&["-nostdlib", "-ffreestanding", "-shared", "-fPIC", "-fno-stack-protector", "-Wl,-e,_start"])),
         ("ctor_escape".into(), bin.join("libctor_escape.so"), args(&["-shared", "-fPIC"])),
         ("plug".into(), bin.join("libplug.so"), args(&["-shared", "-fPIC"])),
     ];
