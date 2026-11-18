@@ -321,6 +321,26 @@ pub fn read_fs() -> usize {
     fs
 }
 
+/// The running thread's GS base. Threaded mode keeps each host thread's own record there (the
+/// program doesn't use the GS base; `arch_prctl(ARCH_SET_GS)` would clobber it and is rare).
+#[inline]
+pub fn read_gs() -> usize {
+    let gs: usize;
+    // SAFETY: reads a register; FSGSBASE as above.
+    unsafe { core::arch::asm!("rdgsbase {}", out(reg) gs, options(nomem, nostack, preserves_flags)) };
+    gs
+}
+
+/// Set the running thread's GS base (threaded mode: its host-thread record).
+///
+/// # Safety
+/// FSGSBASE is required; the value stays valid while this thread reads it.
+#[inline]
+pub unsafe fn write_gs(gs: usize) {
+    // SAFETY: the caller's.
+    unsafe { core::arch::asm!("wrgsbase {}", in(reg) gs, options(nomem, nostack, preserves_flags)) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

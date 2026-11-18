@@ -600,6 +600,7 @@ fn coroutines_switch_inside_the_dispatcher() {
 fn threaded_wrappers() {
     run_child(|| {
         static mut STACK: Mem<{ 64 * 1024 }> = Mem([0; 64 * 1024]);
+        static mut ALT: Mem<{ 64 * 1024 }> = Mem([0; 64 * 1024]);
         static CTID: AtomicU32 = AtomicU32::new(1);
         // SAFETY: a plain eventfd.
         let fd = unsafe { libc::eventfd(0, 0) };
@@ -614,8 +615,14 @@ fn threaded_wrappers() {
             unsafe { exit_thread() }
         }
         let top = &raw mut STACK as usize + 64 * 1024;
-        // SAFETY: the static stack is the thread's alone; CTID is static.
-        let tid = unsafe { clone_thread(top, CTID.as_ptr(), thread, fd as usize) };
+        // A minimal template ucontext: user segment selectors and flags, so rt_sigreturn can
+        // resume in user mode (production copies the trapped clone's). cs=0x33, ss=0x2b.
+        let mut tmpl = Ucontext::default();
+        tmpl.mcontext.csgsfs = 0x33 | (0x2b << 48);
+        tmpl.mcontext.eflags = 0x202;
+        let alt = &raw mut ALT as usize;
+        // SAFETY: the static stacks are the thread's alone; CTID is static.
+        let tid = unsafe { clone_thread(top, alt, 64 * 1024, CTID.as_ptr(), &tmpl, thread, fd as usize) };
         put(0, tid.map_or_else(|e| e.raw_os_error() as u64, |t| t as u64));
         check!(tid.is_ok_and(|t| t > 0), 4);
         check!(eventfd_read(fd) == Ok(5), 5);

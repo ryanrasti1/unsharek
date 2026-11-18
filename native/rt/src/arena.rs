@@ -309,6 +309,12 @@ impl<'t> Arena<'t> {
         self.brk = brk;
     }
 
+    /// Switch how freed pages are given back. Threaded mode sets [`Mode::HighWater`] before the
+    /// program starts (its filter refuses `madvise`), while the arena still holds nothing.
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+    }
+
     /// `brk(2)`: never grows, whatever is asked; the current break tells glibc it failed, and
     /// glibc's malloc falls back to `mmap`.
     pub fn brk(&self, _addr: usize) -> usize {

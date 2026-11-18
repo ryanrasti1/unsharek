@@ -183,6 +183,10 @@ struct Slot {
     detached: Cell<bool>,
     joiner: Cell<u16>,
     exit: Cell<usize>,
+    /// Threaded mode: the host-thread slot this coroutine runs on ([`NONE`]: unbound, runs on
+    /// whichever host thread holds the CPU token). A program thread's coroutine is bound to its
+    /// own host thread; LKL's kernel threads and timers stay unbound. Unused in coroutine mode.
+    home: Cell<u16>,
     tls: [Cell<usize>; TLS_KEYS],
 }
 
@@ -207,6 +211,7 @@ impl Slot {
             detached: Cell::new(false),
             joiner: Cell::new(NONE),
             exit: Cell::new(0),
+            home: Cell::new(NONE),
             tls: [const { Cell::new(0) }; TLS_KEYS],
         }
     }
@@ -257,6 +262,17 @@ pub struct Sched {
     default_fs: Cell<usize>,
     tls_used: Cell<u32>,
     tls_dtors: [Cell<Option<unsafe extern "C" fn(*mut c_void)>>; TLS_KEYS],
+    /// Threaded mode's driver ([`Par`]): when set, [`Sched::schedule`] delegates to it (a host
+    /// thread per program thread, taking turns on one CPU token). `None` in coroutine mode.
+    par: Cell<Option<&'static dyn Par>>,
+}
+
+/// Threaded mode's scheduler driver (`par`): the single hook [`Sched::schedule`] delegates to when
+/// it is installed. It runs on the token holder, like coroutine mode's `schedule`, but switching to
+/// a coroutine bound to another host thread becomes a CPU-token hand-off instead of a local switch.
+/// It returns when the coroutine that called the blocking operation is running again.
+pub trait Par: Sync {
+    fn schedule(&self, s: &'static Sched);
 }
 
 // SAFETY: a Sched is used by one host thread at a time: in coroutine mode only ever one; threaded
@@ -317,6 +333,7 @@ impl Sched {
             default_fs: Cell::new(0),
             tls_used: Cell::new(0),
             tls_dtors: [const { Cell::new(None) }; TLS_KEYS],
+            par: Cell::new(None),
         }
     }
 
@@ -499,6 +516,13 @@ impl Sched {
     /// Run the next runnable coroutine. The caller has already set the current one's state (on
     /// the run queue, blocked, exited). Returns when the current coroutine runs again.
     fn schedule(&self) {
+        if let Some(par) = self.par.get() {
+            // SAFETY: a Sched that has a `par` installed is the `&'static` one (install_par takes
+            // `&'static self`); the driver only ever runs on it.
+            let s: &'static Sched = unsafe { &*(self as *const Sched) };
+            par.schedule(s);
+            return;
+        }
         loop {
             self.expire_timers(self.run_head.get() == NONE);
             let next = self.pop_ready();
@@ -511,8 +535,174 @@ impl Sched {
         }
     }
 
+    // ---- threaded mode (par) ----
+
+    /// Install the threaded-mode driver; [`Sched::schedule`] delegates to it from now on. Once.
+    pub fn install_par(&'static self, par: &'static dyn Par) {
+        assert!(self.par.get().is_none(), "install_par twice");
+        self.par.set(Some(par));
+    }
+
+    /// The current coroutine's slot index (threaded mode's host records key on it).
+    pub fn current_raw(&self) -> Tid {
+        self.current()
+    }
+
+    /// Bind `tid` to host-thread slot `home` (threaded mode): its coroutine runs only on that
+    /// host thread. `home == NONE` (`u16::MAX`) leaves it unbound.
+    pub fn bind(&self, tid: Tid, home: u16) {
+        if let Some(i) = self.lookup(tid) {
+            self.slots[i as usize].home.set(home);
+        }
+    }
+
+    /// Make `current` bound to `home` (for the main thread and newly started program threads,
+    /// which set their own binding).
+    pub fn bind_current(&self, home: u16) {
+        self.slots[self.current.get() as usize].home.set(home);
+    }
+
+    /// A coroutine running `par_loop(arg)` that is **not** placed on the run queue: threaded mode's
+    /// per-host scheduler coroutine, entered only by explicit [`Sched::par_switch`]. Bound to
+    /// `home` so nothing else runs it.
+    pub fn spawn_sched_loop(&'static self, f: fn(usize) -> usize, arg: usize, home: u16, fs: usize) -> Result<Tid, SpawnError> {
+        let i = self.free_head.get();
+        if i == NONE {
+            return Err(SpawnError::Full);
+        }
+        let s = &self.slots[i as usize];
+        self.free_head.set(s.run_next.get());
+        let g = s.generation.get().wrapping_add(1).max(1);
+        s.generation.set(g);
+        s.home.set(home);
+        s.start.set(Start::Rust(f, arg));
+        // SAFETY: the slot's stack is free (it was on the free list); nothing runs on it.
+        unsafe { *s.ctx.get() = Context::new(s.stack_hi.get(), coroutine_entry, self as *const Sched as usize, fs) };
+        s.state.set(State::Blocked); // off the run queue; only par_switch enters it
+        self.live.set(self.live.get() + 1);
+        Ok(Tid::new(i, g))
+    }
+
+    /// Switch to `tid` (threaded mode: the driver's explicit switch, between a coroutine and its
+    /// host's scheduler coroutine, or to a runnable coroutine the holder may run).
+    pub fn par_switch(&self, tid: Tid) {
+        if let Some(i) = self.lookup(tid) {
+            self.switch_to(i);
+        }
+    }
+
+    /// Switch from `from` to `to` (threaded mode: the host thread tracks its own running coroutine,
+    /// since the shared `current` is set by whichever host last held the token).
+    pub fn par_context_switch(&self, from: Tid, to: Tid) {
+        if let (Some(f), Some(t)) = (self.lookup(from), self.lookup(to)) {
+            self.do_switch(f, t);
+        }
+    }
+
+    /// Make `tid` the current coroutine without a switch: threaded mode, when a host thread takes
+    /// the token to serve a trap on its bound coroutine (already running on its control stack).
+    pub fn par_set_current(&self, tid: Tid) {
+        if let Some(i) = self.lookup(tid) {
+            self.slots[i as usize].state.set(State::Running);
+            self.current.set(i);
+        }
+    }
+
+    /// A "root-like" coroutine bound to host `home`: a control stack but no entry, entered by a
+    /// trap (not a switch), its context filled when it first blocks. For a lazy program thread,
+    /// which runs user code on its own host thread and needs a Sched task only for its traps.
+    pub fn adopt_root(&self, home: u16) -> Result<Tid, SpawnError> {
+        let i = self.free_head.get();
+        if i == NONE {
+            return Err(SpawnError::Full);
+        }
+        let s = &self.slots[i as usize];
+        self.free_head.set(s.run_next.get());
+        let g = s.generation.get().wrapping_add(1).max(1);
+        s.generation.set(g);
+        s.home.set(home);
+        s.start.set(Start::None);
+        s.state.set(State::Blocked); // off the run queue until a trap makes it current
+        // SAFETY: the slot's stack is free; its context is filled by the first switch away.
+        unsafe { *s.ctx.get() = Context::empty() };
+        self.live.set(self.live.get() + 1);
+        Ok(Tid::new(i, g))
+    }
+
+    /// Free an adopted (or sched-loop) coroutine that never ran (threaded mode, on a spawn
+    /// failure).
+    pub fn drop_adopted(&self, tid: Tid) {
+        if let Some(i) = self.lookup(tid) {
+            self.free_slot(i);
+        }
+    }
+
+    /// A coroutine's control stack `[lo, hi)` (threaded mode: where its traps' frames go).
+    pub fn stack_of(&self, tid: Tid) -> (usize, usize) {
+        match self.lookup(tid) {
+            Some(i) => (self.slots[i as usize].stack_lo.get(), self.slots[i as usize].stack_hi.get()),
+            None => (0, 0),
+        }
+    }
+
+    /// Pop the first runnable coroutine that `host` may run (unbound, or bound to `host`), off the
+    /// run queue. Coroutines bound to other host threads are left in place for their own host.
+    pub fn par_pick(&self, host: u16) -> Option<Tid> {
+        let mut prev = NONE;
+        let mut i = self.run_head.get();
+        while i != NONE {
+            let next = self.slots[i as usize].run_next.get();
+            let home = self.slots[i as usize].home.get();
+            if home == NONE || home == host {
+                // Unlink i.
+                if prev == NONE {
+                    self.run_head.set(next);
+                } else {
+                    self.slots[prev as usize].run_next.set(next);
+                }
+                if self.run_tail.get() == i {
+                    self.run_tail.set(prev);
+                }
+                return Some(Tid::new(i, self.slots[i as usize].generation.get()));
+            }
+            prev = i;
+            i = next;
+        }
+        None
+    }
+
+    /// The home of the first runnable coroutine bound to a host other than `host` (the CPU token's
+    /// directed hand-off target), or `None`.
+    pub fn par_bound_elsewhere(&self, host: u16) -> Option<u16> {
+        let mut i = self.run_head.get();
+        while i != NONE {
+            let home = self.slots[i as usize].home.get();
+            if home != NONE && home != host {
+                return Some(home);
+            }
+            i = self.slots[i as usize].run_next.get();
+        }
+        None
+    }
+
+    /// Fire due timers (threaded mode drives this from the token holder's idle).
+    pub fn par_expire(&self, force: bool) {
+        self.expire_timers(force);
+    }
+
+    /// The earliest armed timer deadline (CLOCK_MONOTONIC ns), or `None`.
+    pub fn par_next_deadline(&self) -> Option<u64> {
+        (self.heap_len.get() > 0).then(|| self.slots[self.heap[0].get() as usize].deadline.get())
+    }
+
     fn switch_to(&self, next: u16) {
-        let prev = self.current.get();
+        self.do_switch(self.current.get(), next);
+    }
+
+    /// Switch from `prev` to `next`, saving `prev`'s context and running `next`. `prev` is the
+    /// coroutine actually running (coroutine mode: always `current`; threaded mode: the host
+    /// thread's own running coroutine, passed explicitly).
+    fn do_switch(&self, prev: u16, next: u16) {
         self.slots[next as usize].state.set(State::Running);
         if next == prev {
             return;
