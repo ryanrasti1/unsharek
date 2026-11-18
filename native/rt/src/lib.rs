@@ -20,6 +20,7 @@ pub mod context;
 pub mod exec;
 pub mod filter;
 pub mod futex;
+pub mod guest;
 pub mod host;
 pub mod sched;
 pub mod sync;
