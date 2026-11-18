@@ -645,6 +645,14 @@ fn writeback() {
 /// `task_exit`, init's last (pid 1) with the status.
 fn exit_group(code: usize) -> ! {
     writeback();
+    if par::enabled() {
+        // Threaded mode: end the whole sandbox at once (the gate's `exit_group` ends every host
+        // thread). Going through the kernel would leave a program thread blocked in an emulated
+        // futex (parked in the scheduler, not in LKL) unwoken: the kernel's group-exit reaches a
+        // task only at its next syscall, which such a thread never makes. The status is the
+        // program's own.
+        finish(code as i32 & 0xff);
+    }
     lkl_call(l::__lkl__NR_exit_group, [code, 0, 0, 0, 0, 0]);
     // Only if the kernel refused (it doesn't): end anyway.
     finish(code as i32 & 0xff)
