@@ -130,7 +130,8 @@ that mounts `/dev/exobox/<name>` with `mount(2)` and execs the next one).
 10. Custom kernels, at build time: the kernel as its own Nix build (`lib.exoboxKernel { src, config }`:
    a source and a config fragment over `lkl/defconfig`, for more drivers or filesystems; LKL has
    no loadable modules), and `lib.mkExobox { kernel }` for an exobox built with it. In development,
-   `EXOBOX_LKL_SRC` and `EXOBOX_LKL_CONFIG` (a fragment) select them.
+   `EXOBOX_LKL_REF` or `EXOBOX_LKL_SRC`, and `EXOBOX_LKL_CONFIG` (a fragment) select them. (Done:
+   see "Building and testing".)
 
 ## Building and testing
 
@@ -140,8 +141,56 @@ that mounts `/dev/exobox/<name>` with `mount(2)` and execs the next one).
 ```
 
 `./test` enters the devshell (`flake.nix`, cached by `devshell.sh`) and builds the kernel out of
-tree on first use (about 20 s). The kernel's source is `EXOBOX_LKL_SRC` (default: a checkout of
-`exobox/native`). See `AGENTS.md` for how to work on it.
+tree on first use (about 20 s). The kernel's source is the commit `flake.lock` pins for the `linux`
+input, the same one `nix build` links, taken from `EXOBOX_LKL_REPO` (default
+`/home/ryan/src/lkl-linux`) into `target/lkl-src` (when the pin changes, only the files that
+changed are rewritten). `EXOBOX_LKL_REF` names another commit or a branch (its committed head,
+followed as it moves) and `EXOBOX_LKL_SRC` a checkout to build as it is, both for work on the
+kernel. `EXOBOX_LKL_CONFIG` names a fragment of kernel config lines merged over `lkl/defconfig`
+(later lines win; a path relative to the repository's root, or absolute). A change to any of them
+rebuilds what it touches:
+
+```sh
+echo CONFIG_SYSVIPC=y > sysv.config
+EXOBOX_LKL_CONFIG=sysv.config ./test
+EXOBOX_LKL_REF=exobox/native ./test      # the kernel branch's committed head
+EXOBOX_LKL_SRC=~/src/my-lkl ./test       # a kernel checkout, uncommitted edits included
+```
+
+A kernel bump is one commit: `nix flake update linux` (the pin moves to the branch's head), then
+whatever exobox needs for it (the host-operations table, when the host interface moved), until
+`./test` passes; flake.lock and those changes are committed together. See `AGENTS.md` for how to
+work on it.
+
+The distributed binary is one `nix build`. The kernel is its own derivation, built once (by
+`lkl/Makefile`, from the flake's `linux` input) and linked by the Rust build
+(`EXOBOX_LKL_PREBUILT`):
+
+```sh
+nix build                # exobox and exobox-erofs, in ./result/bin
+nix build .#kernel       # the kernel alone: its archives, headers and .config
+nix flake update linux   # bump the pinned kernel (flake.lock) to the branch's head: see above
+```
+
+A custom kernel (more drivers or filesystems: LKL has no loadable modules) is a source and a config
+fragment, from the flake's `lib`:
+
+```nix
+let exobox = builtins.getFlake "github:ryanrasti/exobox"; in
+exobox.lib.mkExobox {
+  kernel = exobox.lib.exoboxKernel {
+    config = ''
+      CONFIG_SYSVIPC=y
+    '';
+    # src = ./my-linux;  # default: the flake's linux input
+  };
+}
+```
+
+or from the command line:
+`nix build --impure --expr 'let f = builtins.getFlake (toString ./.); in f.lib.mkExobox { kernel = f.lib.exoboxKernel { config = "CONFIG_SYSVIPC=y\n"; }; }'`.
+The package's `checkPhase` runs only the hermetic tests: lkl-sys's (the kernel it links boots) and
+the unit tests of exobox and exobox-erofs.
 
 ## Modes
 

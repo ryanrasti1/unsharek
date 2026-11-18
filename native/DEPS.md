@@ -138,3 +138,27 @@ binary's text). `hello` starts and ends in ~30 ms, of which ~19 ms is the store'
 | exobox-rt (path) | the sandbox: boot on coroutines, the filters, the dispatcher, exec | library | the kernel and the runtime: ~8 MB of the binary |
 | lkl-sys (path) | the kernel's syscall numbers for the guest's setup (generic `__lkl__NR_*`) | library | none beyond exobox-rt's |
 | libc 0.2 | host setup before the routing filter: reserving memory, mapping images, `getauxval`, `getrandom`, `setrlimit`; the setup closure's `mount(2)` | library | already in the tree; a few calls |
+
+## The Nix package (2026-11-18): `nix build` (flake.nix's `mkExobox`, `exoboxKernel`)
+Nothing new in Cargo.lock: `rustPlatform.buildRustPackage` vendors it offline (`cargoLock`). The
+kernel is its own derivation (lkl/Makefile from the flake's `linux` input; lkl-sys links it through
+`EXOBOX_LKL_PREBUILT`), so a change to the Rust code rebuilds only the Rust.
+
+- **The package** (`exobox`, `exobox-erofs`): closure 57.3 MiB (`nix path-info -Sh ./result`),
+  nearly all of it glibc (36.5 MiB with its libidn2) and gcc-lib (10.3 MiB, for libgcc_s); the
+  package itself is 10.3 MiB. `bin/exobox` is 9,765,712 bytes (Nix's `strip -S`: debug info only;
+  `strip` of everything gives the 8.6 MB above), `bin/exobox-erofs` 1,069,216.
+- **The kernel derivation** (`nix build .#kernel`): 14.9 MiB (lkl.o and liblkl-kernel.a, 6.6 MiB
+  each; liblkl-posix.a, the headers, .config). Not in the package's closure (linked statically);
+  its own closure is 359 MiB, as liblkl-posix.a's debug info names gcc's and glibc's headers.
+- **Build times** (24 cores, `--builders ''`): kernel and package together ~36 s cold (the kernel
+  ~23 s, its source a tree of symlinks into the store rather than a 1.7 GB copy; the Rust package
+  ~14 s: a 10 s release build, the tests' build, 0.5 s of tests). The first `nix flake lock` fetched the input in ~3 min
+  (the whole repository into Nix's git cache); `nix flake update linux` after that, ~13 s. A
+  rebuild after a Rust change is the Rust package alone; with nothing changed, `nix build` is
+  0.4 s. (A configured remote builder that is unreachable adds its SSH timeout to each build.)
+- **checkPhase** (nextest): lkl-sys's tests (the kernel given boots on the posix host, answers
+  syscalls and halts; lkl.o's relocations; the shim) and the unit tests of exobox and
+  exobox-erofs, 20 tests. Not the suite, the store test, erofs's image tests or exobox-rt's: they
+  need the devshell's programs (`EXOBOX_TEST_*`, `fsck.erofs`), the host's `nix-store`, or a kernel
+  tree.
