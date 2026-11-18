@@ -177,7 +177,7 @@ fn ppoll() {
 #[test]
 fn madvise() {
     let ok = [ARENA[0].0, 0, MADV_DONTNEED, 0, 0, 0];
-    for mode in [Mode::Coroutine, Mode::Fork] {
+    for mode in [Mode::Coroutine] {
         edges(mode, NR_MADVISE, ok, 0, &ARENA);
         edges(mode, NR_MADVISE, ok, 1, &[(0, MADV_CHUNK)]);
         edges(mode, NR_MADVISE, ok, 2, &[(MADV_DONTNEED, MADV_DONTNEED)]);
@@ -191,11 +191,13 @@ fn madvise() {
             assert_eq!(check(&prog, gate(NR_MADVISE, [ARENA[0].0, 4096, advice, 0, 0, 0])), DENY);
         }
     }
-    // Never in threaded mode, not even inside the arena.
-    let prog = build(Mode::Threaded, Deny::Errno, &[]);
-    for &(lo, hi) in &ARENA {
-        for addr in [lo, hi] {
-            assert_eq!(check(&prog, gate(NR_MADVISE, [addr, 4096, 4, 0, 0, 0])), DENY);
+    // Never where there are host threads, not even inside the arena.
+    for mode in [Mode::Threaded, Mode::Fork] {
+        let prog = build(mode, Deny::Errno, &[]);
+        for &(lo, hi) in &ARENA {
+            for addr in [lo, hi] {
+                assert_eq!(check(&prog, gate(NR_MADVISE, [addr, 4096, 4, 0, 0, 0])), DENY);
+            }
         }
     }
     // No arena: no madvise at all.

@@ -146,7 +146,7 @@ pub struct Params<'a> {
     pub deny: Deny,
     /// The address just past the gate's `syscall` instruction (what the kernel reports).
     pub gate_ip: u64,
-    /// Inclusive address ranges `madvise` may start in (coroutine and fork mode).
+    /// Inclusive address ranges `madvise` may start in (coroutine mode).
     pub arena: &'a [(u64, u64)],
     /// The CPU-token eventfds, an inclusive range (threaded and fork mode; ignored otherwise).
     pub token_fds: (u32, u32),
@@ -241,12 +241,12 @@ const HOST: &[Entry] = &[
     // let the gate change the host's blocked signals, SIGSYS among them).
     Entry { modes: ALL, nr: NR_PPOLL, conds: &[(1, Is::In(0, 1)), (3, Is::Eq(0))] },
     // Freed arena pages back to the host: arena addresses only, one chunk at a time (the
-    // reservation's padding keeps address + length inside it), only MADV_DONTNEED. Not in
-    // threaded mode: madvise concurrent with page faults on other threads is the Dirty-COW race
-    // class, so threaded mode's memory is high-water. Fork mode has it because an exec gives the
-    // old image's pages back.
+    // reservation's padding keeps address + length inside it), only MADV_DONTNEED. Only with one
+    // host thread: madvise concurrent with page faults on other threads is the Dirty-COW race
+    // class, so where there are host threads (threaded and fork mode) memory is high-water and
+    // an exec reuses the old image's pages in place.
     Entry {
-        modes: COROUTINE | FORK,
+        modes: COROUTINE,
         nr: NR_MADVISE,
         conds: &[(0, Is::Arena), (1, Is::In(0, MADV_CHUNK)), (2, Is::Eq(MADV_DONTNEED))],
     },
