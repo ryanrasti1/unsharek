@@ -29,9 +29,13 @@ pub fn mount_erofs(image: &Image, path: impl AsRef<Path>) -> Result<(), Error> {
 
 /// `image`'s disk in the guest (memblk over its host mapping) and its node, `/dev/exobox/<name>`.
 /// Host code before `run` ([`crate::Guest::map_image`]).
-pub(crate) fn block_device(image: &Image) -> io::Result<()> {
+/// `in_zone`: where it is mapped in the arena's image zone too.
+pub(crate) fn block_device(image: &Image, in_zone: Option<usize>) -> io::Result<()> {
     let b = image.bytes();
-    let dev = sys(l::__lkl__NR_memblk_add, [b.as_ptr() as usize, b.len(), 0, 0, 0, 0])?;
+    // SAFETY: an image's mappings are never unmapped, the read-only one never written
+    // (`map_image`), which runs on the guest's one thread.
+    let dev = unsafe { exobox_rt::memblk::add(guest::syscall, b.as_ptr(), b.len(), in_zone) }
+        .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?;
     mkdir(c"/dev/exobox", 0o755)?;
     let node = std::ffi::CString::new(image.device().into_os_string().into_encoded_bytes()).unwrap();
     sys(l::__lkl__NR_mknodat, [AT_FDCWD, p(&node), libc::S_IFBLK as usize | 0o400, dev, 0, 0]).map(|_| ())

@@ -67,6 +67,10 @@ struct Fake {
     releases: Vec<(usize, usize)>,
     closed: Vec<u64>,
     writes: Vec<(u64, u64, usize)>,
+    /// Bytes copied by `read`.
+    read: usize,
+    /// Files in the image zone: where their bytes are, and how many.
+    in_zone: HashMap<u64, (usize, u64)>,
 }
 
 impl Fake {
@@ -90,6 +94,7 @@ impl Backing for Fake {
         }
         let n = min(len, data.len() - off);
         mem(addr, n).copy_from_slice(&data[off..off + n]);
+        self.read += n;
         Ok(n)
     }
     fn write(&mut self, file: u64, offset: u64, addr: usize, len: usize) -> Result<usize> {
@@ -124,6 +129,10 @@ impl Backing for Fake {
         assert_eq!(unsafe { libc::madvise(addr as *mut _, len, libc::MADV_DONTNEED) }, 0);
         self.releases.push((addr, len));
         Ok(())
+    }
+    fn locate(&mut self, file: u64, offset: u64) -> Option<(usize, u64)> {
+        let &(at, len) = self.in_zone.get(&file)?;
+        (offset <= len).then(|| (at + offset as usize, len - offset))
     }
 }
 
@@ -812,5 +821,83 @@ fn brk_mincore_madvise_and_errors() {
     assert_eq!(ret(Err(Errno::NOMEM)), -12);
     // CAPACITY's documented cost: 40 bytes an entry, 2.5 MiB for the table.
     assert_eq!(core::mem::size_of::<Extent>(), 40);
+    a.check();
+}
+
+/// The image zone: a host file mapped privately into the arena's top, the way the runtime maps
+/// the store's images. ld.so's sequence on a library there maps it in place (no copy); what it
+/// writes is its own; anything freed there holds the image's bytes again, and other mappings
+/// never land in it.
+#[test]
+fn image_zone_maps_files_in_place() {
+    let r = Reservation::new(16 * MB);
+    let mut t = table(64);
+    let mut a = arena(&r, Mode::Release, &mut t);
+    let zone = r.base + 8 * MB;
+    // The image: a file of 2.5 pages at block 2, a nonzero byte after its slot (the next file).
+    let mut img = vec![0u8; 8 * PAGE];
+    let file: Vec<u8> = (0..5 * PAGE / 2).map(|i| (i % 251) as u8 + 1).collect();
+    img[2 * PAGE..2 * PAGE + file.len()].copy_from_slice(&file);
+    img[6 * PAGE] = 0xee;
+    // SAFETY: a fresh memfd, mapped privately over the reservation's top (the runtime's zone).
+    unsafe {
+        let fd = libc::memfd_create(c"image".as_ptr(), 0);
+        assert!(fd >= 0);
+        assert_eq!(libc::write(fd, img.as_ptr().cast(), img.len()), img.len() as isize);
+        let p = libc::mmap(zone as *mut _, img.len(), libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_FIXED, fd, 0);
+        assert_eq!(p as usize, zone);
+        libc::close(fd);
+    }
+    a.set_image_zone(zone).unwrap();
+    assert_eq!(a.stats().size, 8 * MB, "the zone isn't the program's memory");
+    let mut b = Fake::new(&r);
+    b.files.insert(7, file.clone());
+    let at = zone + 2 * PAGE;
+    b.in_zone.insert(7, (at, file.len() as u64));
+    let f7 = |offset| Some(FileMap { file: 7, offset });
+
+    // ld.so: the span (3 pages of file, then 1 of .bss: the slot's zero block) from the file...
+    assert_eq!(a.mmap(&mut b, 0, 4 * PAGE, PROT_READ, MAP_PRIVATE, f7(0)), Ok(at));
+    // ...each read-only segment where it already is...
+    assert_eq!(a.mmap(&mut b, at, 2 * PAGE, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_FIXED, f7(0)), Ok(at));
+    assert_eq!(b.read, 0, "nothing copied");
+    assert_eq!(&mem(at, file.len())[..], &file[..]);
+    // ...the writable one copied (its offset differs from its address's), and .bss anonymous.
+    assert_eq!(a.mmap(&mut b, at + 2 * PAGE, PAGE, RW, MAP_PRIVATE | MAP_FIXED, f7(PAGE as u64)), Ok(at + 2 * PAGE));
+    assert_eq!(b.read, PAGE);
+    assert_eq!(mem(at + 2 * PAGE, PAGE), &file[PAGE..2 * PAGE]);
+    mem(at + 2 * PAGE, 1)[0] = 0x55;
+    assert_eq!(a.mmap(&mut b, at + 3 * PAGE, PAGE, RW, ANON | MAP_FIXED, None), Ok(at + 3 * PAGE));
+    assert!(is_zero(at + 3 * PAGE, PAGE));
+    mem(at + 3 * PAGE, 1)[0] = 0x66;
+    a.check();
+
+    // A second mapping of the file while the first lives: a copy, elsewhere.
+    let copy = a.mmap(&mut b, 0, 3 * PAGE, PROT_READ, MAP_PRIVATE, f7(0)).unwrap();
+    assert!(copy < zone);
+    assert_eq!(&mem(copy, file.len())[..], &file[..]);
+    // Nothing else is placed in the zone, however big.
+    let big = a.mmap(&mut b, 0, 7 * MB, RW, ANON, None).unwrap();
+    assert!(big + 7 * MB <= zone);
+    // Unmapped, the zone holds the image again: mapped in place once more, unwritten.
+    a.munmap(&mut b, at, 4 * PAGE).unwrap();
+    assert_eq!(&mem(at, file.len())[..], &file[..]);
+    assert!(is_zero(at + file.len(), 4 * PAGE - file.len()));
+    assert_eq!(a.mmap(&mut b, 0, 4 * PAGE, PROT_READ, MAP_PRIVATE, f7(0)), Ok(at));
+    a.munmap(&mut b, at, 4 * PAGE).unwrap();
+    // Past its slot it can't be (the next file's byte would show where zeros belong): copied.
+    let long = a.mmap(&mut b, 0, 5 * PAGE, PROT_READ, MAP_PRIVATE, f7(0)).unwrap();
+    assert!(long < zone);
+    assert!(is_zero(long + file.len(), 5 * PAGE - file.len()));
+    // An anonymous mapping put in the zone by hand reads zero, and the image is back after it.
+    assert_eq!(a.mmap(&mut b, zone, 8 * PAGE, RW, ANON | MAP_FIXED, None), Ok(zone));
+    assert!(is_zero(zone, 8 * PAGE));
+    a.munmap(&mut b, zone, 8 * PAGE).unwrap();
+    assert_eq!(mem(zone + 6 * PAGE, 1)[0], 0xee);
+    assert_eq!(a.mmap(&mut b, 0, 3 * PAGE, PROT_READ, MAP_PRIVATE, f7(0)), Ok(at));
+    // Moved, an in-place mapping is a copy that keeps its bytes.
+    let moved = a.mremap(&mut b, at, 3 * PAGE, 4 * PAGE, MREMAP_MAYMOVE, 0).unwrap();
+    assert!(moved < zone);
+    assert_eq!(&mem(moved, file.len())[..], &file[..]);
     a.check();
 }

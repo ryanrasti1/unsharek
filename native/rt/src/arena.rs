@@ -4,8 +4,9 @@
 //! mapping (read/write/execute: programs load their code into it, and JITs make theirs). After lockdown
 //! the host allows no `mmap`, `mprotect`, `munmap` or `brk`, so the program's memory calls are
 //! trapped and served here, inside `[base, base + len)`. This module never maps host memory; it
-//! hands out addresses inside the reservation, copies file contents in, and gives pages back
-//! through the caller ([`Backing`]).
+//! hands out addresses inside the reservation, copies file contents in (or hands out where an
+//! image already holds them: the image zone, below), and gives pages back through the caller
+//! ([`Backing`]).
 //!
 //! # State
 //! One sorted table of extents covers the whole arena: each extent is free or mapped, and says
@@ -40,6 +41,19 @@
 //!   again, only the pages that actually hold a nonzero byte: reading a page the program never
 //!   touched maps the host's shared zero page (free), writing it would make it the sandbox's.
 //!
+//! # The image zone: files mapped in place
+//! The arena's top part can be the image zone ([`Arena::set_image_zone`]): the runtime maps the
+//! store's images there (privately, before lockdown), each file's bytes block-aligned and each
+//! ELF's memory image left free after them (exobox-erofs' slots). A private mapping of a file
+//! whose bytes are there ([`Backing::locate`]) is answered with their address instead of a copy,
+//! when the range still holds the image's bytes and what it covers past the file's end is zero:
+//! ld.so's reservation of a library, then its read-only segments `MAP_FIXED` where they already
+//! are. The program's code is then the host's page cache, shared by every sandbox and by the
+//! host's own processes, as a native libc is. Only in release mode: what was mapped there is
+//! given back when freed, which restores the image's bytes (the file's, under the private
+//! mapping); that is how the zone knows it still holds them (`Kind::Image`). Nothing is placed
+//! in the zone; a mapping put there `MAP_FIXED` is cleared first, like any reuse.
+//!
 //! # What is not Linux
 //! - **No protections after lockdown.** `mprotect` records the protection (for `/proc/self/maps`
 //!   and for clean tracking) and has no host effect. Guard pages a program places after lockdown
@@ -48,7 +62,8 @@
 //!   is recorded like any protection: the sandbox's boundary is the host filter, and JITs work.
 //! - **`brk` never grows.** It returns the current break whatever is asked, which glibc reads as
 //!   failure and falls back to `mmap` for its main heap (capnix did the same).
-//! - **File mappings are copies** made at `mmap` through [`Backing::read`]. A `MAP_SHARED`
+//! - **File mappings are copies** made at `mmap` through [`Backing::read`] (private ones of an
+//!   image's files, mapped in place, are the host's copy-on-write pages instead). A `MAP_SHARED`
 //!   mapping that is writable at `mmap` is written back through [`Backing::write`] at `msync`,
 //!   `munmap` (and anything that replaces it) and [`Arena::writeback_all`] (exit): the rule
 //!   linux-workers' `NOMMU_LINUX_MAPPINGS` and capnix used. The whole range is written back, not
@@ -168,9 +183,16 @@ pub trait Backing {
     /// No mapping refers to a handle from [`Backing::retain`] any more.
     fn close(&mut self, file: u64);
     /// Give `[addr, addr + len)` back to the host (`madvise(MADV_DONTNEED)`): afterwards it reads
-    /// zero. `len <= MADV_CHUNK`; [`Mode::Release`] only. On error the arena clears the range in
-    /// place instead.
+    /// zero (in the image zone, the image's bytes). `len <= MADV_CHUNK`; [`Mode::Release`] only.
+    /// On error the arena clears the range in place instead.
     fn release(&mut self, addr: usize, len: usize) -> Result<()>;
+    /// Where `file`'s bytes from `offset` to its end already are in the image zone
+    /// ([`Arena::set_image_zone`]), and how many there are: `(address, bytes)`. None if they
+    /// aren't (the default: no zone).
+    fn locate(&mut self, file: u64, offset: u64) -> Option<(usize, u64)> {
+        let _ = (file, offset);
+        None
+    }
 }
 
 /// A file to map: the handle the dispatcher resolved the program's fd to, and the offset.
@@ -222,7 +244,12 @@ enum Kind {
     Free { dirty: bool },
     /// Mapped with `prot`. `dirty`: may hold data (it is or was writable since it was zero, or
     /// holds a file's bytes). `anon`: zeros, not a file's bytes (what `MADV_DONTNEED` restores).
+    /// In the image zone a mapping is always dirty, except one mapped in place
+    /// (`anon: false, dirty: false`): the image's own bytes, never writable.
     Mapped { prot: u8, dirty: bool, anon: bool, shared: Option<Shared> },
+    /// Not mapped, in the image zone: holds the images' bytes (in release mode, as the host's
+    /// file mapping has them, so it can be mapped in place); never placed.
+    Image,
 }
 
 const FREE_CLEAN: Kind = Kind::Free { dirty: false };
@@ -240,16 +267,40 @@ impl Kind {
             k => k,
         }
     }
+    /// Free to place a mapping in.
     fn is_free(self) -> bool {
         matches!(self, Kind::Free { .. })
     }
     fn is_mapped(self) -> bool {
-        !self.is_free()
+        matches!(self, Kind::Mapped { .. })
+    }
+    /// Not mapped, as the program sees it (free or image).
+    fn is_unmapped(self) -> bool {
+        !self.is_mapped()
     }
     fn is_dirty(self) -> bool {
         match self {
             Kind::Free { dirty } | Kind::Mapped { dirty, .. } => dirty,
+            Kind::Image => false,
         }
+    }
+    /// The image's bytes, as the host's file mapping has them: unmapped, or mapped in place.
+    fn is_pristine(self) -> bool {
+        matches!(self, Kind::Image | Kind::Mapped { anon: false, dirty: false, .. })
+    }
+}
+
+/// `k` as it must be at `s` with the image zone from `zone`: there, unmapped is [`Kind::Image`]
+/// and a mapping is dirty unless mapped in place (a zero anonymous page there was written zero,
+/// over the image's bytes, so it must be given back when freed).
+fn in_zone(zone: usize, s: usize, k: Kind) -> Kind {
+    if s < zone {
+        return k;
+    }
+    match k {
+        Kind::Free { .. } => Kind::Image,
+        Kind::Mapped { prot, anon: true, shared, .. } => Kind::Mapped { prot, dirty: true, anon: true, shared },
+        k => k,
     }
 }
 
@@ -277,6 +328,11 @@ pub struct Arena<'t> {
     high: usize,
     released: u64,
     zeroed: u64,
+    /// Where the image zone starts (`end` if there is none): see [`Arena::set_image_zone`].
+    zone: usize,
+    /// Files are mapped in place from the zone: release mode, and no release in the zone has
+    /// failed (a failed one is cleared to zero, and the zone would no longer hold the images).
+    in_place: bool,
 }
 
 fn page_up(len: usize) -> Option<usize> {
@@ -296,7 +352,28 @@ impl<'t> Arena<'t> {
             return Err(Errno::INVAL);
         }
         table[0] = Extent { start: base, kind: FREE_CLEAN };
-        Ok(Arena { base, end: base + len, mode, table, n: 1, brk: 0, high: base, released: 0, zeroed: 0 })
+        let end = base + len;
+        Ok(Arena { base, end, mode, table, n: 1, brk: 0, high: base, released: 0, zeroed: 0, zone: end, in_place: false })
+    }
+
+    /// Make `[zone, end)` the image zone, before anything is mapped there: where the host maps
+    /// the images (privately, before lockdown), so that a file on one is mapped by handing out
+    /// the address of its bytes ([`Backing::locate`]) instead of copying them. The program's code
+    /// is then the host's page cache, shared by every sandbox, not a copy in each (libc alone is
+    /// 2 MB). Nothing is placed in the zone; a mapping put there `MAP_FIXED` works, cleared
+    /// first. In place only in release mode: a range is mapped in place only while it holds the
+    /// image's bytes, which giving pages back restores and nothing else does.
+    ///
+    /// Not counted in [`Stats::size`]: it is the images', not the program's memory.
+    pub fn set_image_zone(&mut self, zone: usize) -> Result<()> {
+        if !zone.is_multiple_of(PAGE) || zone <= self.base || zone >= self.end || !self.all(zone, self.end, |k| k == FREE_CLEAN) {
+            return Err(Errno::INVAL);
+        }
+        self.room(1)?;
+        self.zone = zone;
+        self.apply(zone, self.end, &|_, _| Kind::Image);
+        self.in_place = self.mode == Mode::Release;
+        Ok(())
     }
 
     /// `[addr, addr + len)` lies inside the arena.
@@ -318,7 +395,7 @@ impl<'t> Arena<'t> {
     pub fn stats(&self) -> Stats {
         let mapped = (0..self.n).filter(|&i| self.table[i].kind.is_mapped()).map(|i| self.ext_end(i) - self.table[i].start).sum();
         Stats {
-            size: self.end - self.base,
+            size: self.zone - self.base,
             mapped,
             high_water: self.high - self.base,
             released: self.released,
@@ -336,7 +413,7 @@ impl<'t> Arena<'t> {
                 prot: prot as u32,
                 shared: shared.map(|s| FileMap { file: s.file, offset: s.offset }),
             }),
-            Kind::Free { .. } => None,
+            Kind::Free { .. } | Kind::Image => None,
         })
     }
 
@@ -359,13 +436,20 @@ impl<'t> Arena<'t> {
             }
             f.offset.checked_add(len as u64).ok_or(Errno::OVERFLOW)?;
         }
+        if let Some(f) = file
+            && !shared
+            && flags & MAP_FIXED_NOREPLACE == 0
+            && let Some(at) = self.in_place(b, addr, len, prot, flags & MAP_FIXED != 0, f)
+        {
+            return Ok(at);
+        }
         let lo = if flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0 {
             if !addr.is_multiple_of(PAGE) {
                 return Err(Errno::INVAL);
             }
             let hi = self.range(addr, len).ok_or(Errno::NOMEM)?;
             // NOREPLACE wins when both are set, as in Linux's do_mmap.
-            if flags & MAP_FIXED_NOREPLACE != 0 && !self.all(addr, hi, Kind::is_free) {
+            if flags & MAP_FIXED_NOREPLACE != 0 && !self.all(addr, hi, Kind::is_unmapped) {
                 return Err(Errno::EXIST);
             }
             addr
@@ -412,6 +496,59 @@ impl<'t> Arena<'t> {
         self.apply(lo, hi, &new);
         self.high = max(self.high, hi);
         Ok(lo)
+    }
+
+    /// A private file mapping made by handing out where the file's bytes already are, in the
+    /// image zone: `len` bytes from `f.offset` at the address [`Backing::locate`] gives, if the
+    /// range there holds them as the image has them (unmapped; or, with `fixed`, mapped in place
+    /// already: ld.so reserves a library's span with one mapping of the file, answered here, then
+    /// maps each segment `MAP_FIXED` over it, and the read-only ones are where they already are)
+    /// and whatever the mapping covers past the file's end reads zero (the file's slot in the
+    /// image, or its last block's padding). With `fixed`, only at `addr`. None: copy it.
+    fn in_place<B: Backing>(&mut self, b: &mut B, addr: usize, len: usize, prot: u32, fixed: bool, f: FileMap) -> Option<usize> {
+        if !self.in_place {
+            return None;
+        }
+        let (at, avail) = b.locate(f.file, f.offset)?;
+        let hi = self.range(at, len)?;
+        if at < self.zone || !at.is_multiple_of(PAGE) || (fixed && addr != at) {
+            return None;
+        }
+        let ok: fn(Kind) -> bool = if fixed { Kind::is_pristine } else { |k| k == Kind::Image };
+        if !self.all(at, hi, ok) {
+            return None;
+        }
+        // Past the file's end: zero, as Linux's last page of a mapping (and the pages after it,
+        // which Linux would fault, read zero in a copy).
+        if avail < len as u64 {
+            let from = at + avail as usize;
+            let page = page_up(from)?;
+            // SAFETY: inside the zone, which is mapped (the images, and zeros between them).
+            let tail = unsafe { core::slice::from_raw_parts(from as *const u8, page - from) };
+            // SAFETY: as above, whole pages.
+            if tail.iter().any(|&x| x != 0) || (page..hi).step_by(PAGE).any(|p| unsafe { !page_is_zero(p) }) {
+                return None;
+            }
+        }
+        let new = move |_: usize, _: Kind| Kind::Mapped { prot: prot as u8, dirty: prot & PROT_WRITE != 0, anon: false, shared: None };
+        self.room(self.splits(at, hi, &new)).ok()?;
+        // What was mapped here in place is replaced by the file's bytes, as a new mapping would
+        // be (a byte written to it, whether it was writable or not, goes).
+        self.vacate(b, at, hi, false, false);
+        self.apply(at, hi, &new);
+        self.high = max(self.high, hi);
+        Some(at)
+    }
+
+    /// A private mapping of `len` bytes of `f` in place ([`Arena::set_image_zone`]), or None
+    /// (nothing done): for a loader that reserves a span the way ld.so does, from the file, only
+    /// where that costs no copy.
+    pub fn mmap_in_place<B: Backing>(&mut self, b: &mut B, len: usize, prot: u32, f: FileMap) -> Option<usize> {
+        let len = page_up(len)?;
+        if len == 0 || !f.offset.is_multiple_of(PAGE as u64) {
+            return None;
+        }
+        self.in_place(b, 0, len, prot, false, f)
     }
 
     /// `munmap(2)`. Writable shared file mappings in the range are written back first.
@@ -611,7 +748,7 @@ impl<'t> Arena<'t> {
                         r = r.and(Err(err));
                     }
                 }
-                Kind::Free { .. } => r = r.and(Err(Errno::NOMEM)),
+                Kind::Free { .. } | Kind::Image => r = r.and(Err(Errno::NOMEM)),
                 _ => {}
             }
             at = e;
@@ -688,7 +825,7 @@ impl<'t> Arena<'t> {
             }
             let ps = max(s, lo);
             let k = self.table[i].kind.shifted(ps - s);
-            f(ps, k) != k
+            in_zone(self.zone, ps, f(ps, k)) != k
         };
         changes_at(lo) as usize + (hi < self.end && changes_at(hi)) as usize
     }
@@ -702,7 +839,7 @@ impl<'t> Arena<'t> {
         }
         let ps = max(s, lo);
         let k = kind.shifted(ps - s);
-        if f(ps, k) == k {
+        if in_zone(self.zone, ps, f(ps, k)) == k {
             return;
         }
         self.table.copy_within(i + 1..self.n, i + 2);
@@ -710,8 +847,8 @@ impl<'t> Arena<'t> {
         self.n += 1;
     }
 
-    /// Map every extent of `[lo, hi)` through `f(piece start, kind)`, splitting at the ends and
-    /// merging neighbours that end up alike. The caller has checked [`Arena::room`] for
+    /// Map every extent of `[lo, hi)` through `f(piece start, kind)` (then [`in_zone`]), splitting
+    /// at the ends and merging neighbours that end up alike. The caller has checked [`Arena::room`] for
     /// [`Arena::splits`].
     fn apply(&mut self, lo: usize, hi: usize, f: &impl Fn(usize, Kind) -> Kind) {
         debug_assert!(self.n + self.splits(lo, hi, f) <= self.table.len());
@@ -724,7 +861,7 @@ impl<'t> Arena<'t> {
             let (s, e) = (self.table[k].start, self.ext_end(k));
             // An extent left whole across lo or hi is one f doesn't change.
             if s >= lo && e <= hi {
-                self.table[k].kind = f(s, self.table[k].kind);
+                self.table[k].kind = in_zone(self.zone, s, f(s, self.table[k].kind));
             }
         }
         self.coalesce(i.saturating_sub(1), min(j + 1, self.n - 1));
@@ -735,7 +872,8 @@ impl<'t> Arena<'t> {
         let mut w = a;
         for r in a + 1..=b {
             let (prev, cur) = (self.table[w], self.table[r]);
-            if prev.kind.shifted(cur.start - prev.start) != cur.kind {
+            // Never across the image zone's start, where the kinds mean different things.
+            if prev.kind.shifted(cur.start - prev.start) != cur.kind || cur.start == self.zone {
                 w += 1;
                 self.table[w] = cur;
             }
@@ -773,7 +911,7 @@ impl<'t> Arena<'t> {
     fn first_fit(&self, len: usize, align: usize) -> Option<usize> {
         let mut i = 0;
         while i < self.n {
-            if self.table[i].kind.is_mapped() {
+            if !self.table[i].kind.is_free() {
                 i += 1;
                 continue;
             }
@@ -825,7 +963,18 @@ impl<'t> Arena<'t> {
                     b.close(s.file);
                 }
             }
-            if k.is_dirty() && (reuse || self.mode == Mode::Release) {
+            if at >= self.zone {
+                // Every mapping here is given back, even one mapped in place (a stray write to a
+                // page it never made writable would otherwise stay): the image's bytes come
+                // back, and they are cleared only for reuse.
+                if k.is_mapped() && self.mode == Mode::Release {
+                    self.release(b, at, e);
+                }
+                if reuse {
+                    // SAFETY: inside the arena (Arena::new's contract).
+                    self.zeroed += unsafe { zero_nonzero(at, e - at) } as u64;
+                }
+            } else if k.is_dirty() && (reuse || self.mode == Mode::Release) {
                 self.clear(b, at, e);
             }
             at = e;
@@ -833,12 +982,16 @@ impl<'t> Arena<'t> {
     }
 
     /// Make `[lo, hi)` read zero: given back in release mode, cleared in place in high-water mode.
+    /// In the image zone (where `lo` is, `hi` too) given back is the image's bytes: cleared too.
     fn clear<B: Backing>(&mut self, b: &mut B, lo: usize, hi: usize) {
-        match self.mode {
-            Mode::Release => self.release(b, lo, hi),
-            // SAFETY: inside the arena (Arena::new's contract).
-            Mode::HighWater => self.zeroed += unsafe { zero_nonzero(lo, hi - lo) } as u64,
+        if self.mode == Mode::Release {
+            self.release(b, lo, hi);
+            if lo < self.zone {
+                return;
+            }
         }
+        // SAFETY: inside the arena (Arena::new's contract).
+        self.zeroed += unsafe { zero_nonzero(lo, hi - lo) } as u64;
     }
 
     fn release<B: Backing>(&mut self, b: &mut B, lo: usize, hi: usize) {
@@ -847,8 +1000,14 @@ impl<'t> Arena<'t> {
             let n = min(hi - a, MADV_CHUNK);
             match b.release(a, n) {
                 Ok(()) => self.released += n as u64,
-                // SAFETY: inside the arena (Arena::new's contract).
-                Err(_) => self.zeroed += unsafe { zero_nonzero(a, n) } as u64,
+                Err(_) => {
+                    // SAFETY: inside the arena (Arena::new's contract).
+                    self.zeroed += unsafe { zero_nonzero(a, n) } as u64;
+                    // Zero, not the image's bytes: nothing is mapped in place from now on.
+                    if a >= self.zone {
+                        self.in_place = false;
+                    }
+                }
             }
             a += n;
         }
@@ -907,6 +1066,11 @@ impl<'t> Arena<'t> {
         while at < shi {
             let (e, k) = self.piece(at, shi);
             let d = dst + (at - src);
+            // Moved, a page mapped in place is a copy of the image's bytes like any file's.
+            let k = match k {
+                Kind::Mapped { prot, anon: false, shared, .. } => Kind::Mapped { prot, dirty: true, anon: false, shared },
+                k => k,
+            };
             if k.is_dirty() {
                 // SAFETY: both inside the arena and disjoint (dst was free or vacated, src mapped).
                 unsafe { copy_nonzero(d, at, e - at) };
@@ -934,6 +1098,10 @@ impl<'t> Arena<'t> {
             if self.mode == Mode::Release {
                 assert_ne!(self.table[i].kind, Kind::Free { dirty: true }, "release mode frees clean");
             }
+            let k = self.table[i].kind;
+            assert_eq!(in_zone(self.zone, s, k), k, "extent {i} [{s:#x}, {e:#x}) as the zone has it");
+            assert!(s >= self.zone || k != Kind::Image, "an image extent outside the zone");
+            assert!(s >= self.zone || e <= self.zone, "extent {i} across the zone's start");
             if i > 0 {
                 let p = self.table[i - 1];
                 assert_ne!(p.kind.shifted(s - p.start), self.table[i].kind, "extents {} and {i} unmerged", i - 1);
