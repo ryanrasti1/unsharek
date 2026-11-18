@@ -310,6 +310,10 @@ pub static HOST_OPS: HostOps = HostOps(UnsafeCell::new(lkl_host_operations {
     // end ends its coroutine (thread_exit).
     task_exit: None,
     hostfd_rw: Some(hostfd_rw),
+    // Items 8 (signals at a syscall's return) and 9 (fork as a host fork): the dispatcher's, in
+    // the modes that use them.
+    signal_handler: None,
+    fork: None,
 }));
 
 // ---- print and panic ----
