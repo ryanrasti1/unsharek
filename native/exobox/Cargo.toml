@@ -33,6 +33,11 @@ tempfile.workspace = true
 name = "suite"
 harness = false
 
+# The library's layers (Guest alone, Sandbox), each in a child process of its own.
+[[test]]
+name = "guest"
+harness = false
+
 # The performance budgets (./test --perf).
 [[test]]
 name = "perf"
