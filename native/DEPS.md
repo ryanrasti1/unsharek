@@ -28,6 +28,13 @@ release build ~3.4 s. Nearly all of it is clap; object's code in the binary is ~
 | thiserror 2 | the library's error type | library | none at run time (a derive) |
 | tempfile 3 | scratch trees and images | test | test-only |
 
+## exobox-rt (2026-11-18): the syscall table (native/rt: sysmap, xabi)
+No new runtime dependency; the table is ~7.5 KB of routes plus its names.
+
+| Crate | For | Where | Cost noted |
+|---|---|---|---|
+| libc 0.2 | x86-64 struct layouts (`stat`, `statfs`, `epoll_event`, `utsname`) and constants the translations are checked against | test | test-only (already in the tree for the suite) |
+
 Tools in the devshell (not linked): cargo-nextest (per-test processes and timeouts), erofs-utils
 (store images for programs outside the store; `fsck.erofs`/`dump.erofs` are the test oracle for
 native/erofs).

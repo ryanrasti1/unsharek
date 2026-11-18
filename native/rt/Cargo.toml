@@ -9,3 +9,7 @@ publish = false
 
 [dependencies]
 rustix = { workspace = true }
+
+[dev-dependencies]
+# struct layouts and constants checked against glibc's x86-64 ABI (sysmap, xabi)
+libc = { workspace = true }
