@@ -144,7 +144,8 @@ pub const MAX_CONDS: usize = 6;
 pub struct Params<'a> {
     pub mode: Mode,
     pub deny: Deny,
-    /// The address just past the gate's `syscall` instruction (what the kernel reports).
+    /// The address just past the gate's `syscall` instruction (what the kernel reports):
+    /// `trap::gate_ip()`.
     pub gate_ip: u64,
     /// Inclusive address ranges `madvise` may start in (coroutine mode).
     pub arena: &'a [(u64, u64)],

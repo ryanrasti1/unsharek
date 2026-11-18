@@ -9,8 +9,10 @@
 //!   runtime's state is reached through globals or explicit pointers.
 //! - **No unwinding.** The crate is built `panic=abort` into the binary; a panic is a bug that
 //!   ends the sandbox.
-//! - **Host syscalls only through rustix's raw Linux backend**, and only those the filter
-//!   (`filter`) allows from the gate.
+//! - **Host syscalls through the gate after lockdown** (`trap::gate` and its typed wrappers), and
+//!   only those the filter (`filter`) allows from it. rustix's raw Linux backend (or the gate) is
+//!   for setup before lockdown: rustix's own `syscall` instructions are not the gate, so after
+//!   lockdown they trap.
 #![cfg_attr(not(test), no_std)]
 
 pub mod arena;
@@ -20,6 +22,7 @@ pub mod futex;
 pub mod sched;
 pub mod sync;
 pub mod sysmap;
+pub mod trap;
 pub mod xabi;
 #[cfg(test)]
 mod testutil;
