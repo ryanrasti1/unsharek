@@ -122,3 +122,19 @@ working storage (`exec::Scratch`, ~19 KiB) is the caller's.
 |---|---|---|---|
 | object 0.40 (no default features; read_core, elf) | the ELF file and program headers: the header's checks (magic, class, version, byte order) and the field accessors | library | a few KB; pulls memchr (no std); `extern crate alloc` in object, but nothing on the loader's path allocates |
 | exobox-fixtures (path) | the programs the loader tests load and run (static_start, static_start_nopie, hello, hello_nopie) | rt tests | test-only; the fixtures' build (~1 s cold, cached) |
+
+## exobox on the runtime (2026-11-18): Guest, Sandbox, the dispatcher (native/rt/src/guest.rs)
+Nothing new from crates.io: exobox now depends on exobox-rt and lkl-sys (the kernel) and has libc
+as a normal dependency (it was the tests'). The release `exobox` binary: 9,799,104 / 8,596,664
+bytes (unstripped / stripped), from 1.2 / 0.9 MB: the kernel object (~5.9 MB) and the runtime.
+The runtime's statics are bss, paid for as touched: the arena's extent table (2.5 MiB), the
+loader's scratch and the guest execve's string buffer (1 MiB), the scheduler's and futexes' tables.
+A sandbox running `idle` (release): PSS 19.3 MB (9.9 MB anonymous, 9.4 MB file-backed: the
+binary's text). `hello` starts and ends in ~30 ms, of which ~19 ms is the store's `nix-store
+--query` and the kernel's boot ~4 ms; native hello is ~1.5 ms.
+
+| Crate | For | Where | Cost noted |
+|---|---|---|---|
+| exobox-rt (path) | the sandbox: boot on coroutines, the filters, the dispatcher, exec | library | the kernel and the runtime: ~8 MB of the binary |
+| lkl-sys (path) | the kernel's syscall numbers for the guest's setup (generic `__lkl__NR_*`) | library | none beyond exobox-rt's |
+| libc 0.2 | host setup before the routing filter: reserving memory, mapping images, `getauxval`, `getrandom`, `setrlimit`; the setup closure's `mount(2)` | library | already in the tree; a few calls |

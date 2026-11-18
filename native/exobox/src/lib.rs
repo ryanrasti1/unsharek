@@ -258,9 +258,13 @@ impl Guest {
         const PAGE: usize = 4096;
         // No core dumps: the sandbox killed by its filter (SIGSYS) would dump GiBs of reserved
         // memory (the suite's escape_kill took longer than its 5 s timeout writing it), and the
-        // dump of a sandbox is the host's business only by accident.
-        // SAFETY: sets a flag of this process.
-        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+        // dump of a sandbox is the host's business only by accident. RLIMIT_CORE 0, not
+        // PR_SET_DUMPABLE 0, which would also hide /proc/<pid>/smaps_rollup (perf.rs's PSS) from
+        // its owner. A piped core_pattern (systemd-coredump) is still started, sees the limit and
+        // stops reading.
+        let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: sets a limit of this process.
+        unsafe { libc::setrlimit(libc::RLIMIT_CORE, &none) };
         let memory = config.memory.next_multiple_of(PAGE);
         let rwx = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
         let rw = libc::PROT_READ | libc::PROT_WRITE;
