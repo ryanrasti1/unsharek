@@ -19,6 +19,7 @@ cc = "1"
 libtest-mimic = "0.8"
 tempfile = "3"
 libc = "0.2"
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 [profile.dev]
 panic = "abort"

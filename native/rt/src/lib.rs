@@ -12,3 +12,5 @@
 //! - **Host syscalls only through rustix's raw Linux backend**, and only those the filter
 //!   (`filter`) allows from the gate.
 #![cfg_attr(not(test), no_std)]
+
+pub mod arena;

@@ -31,3 +31,14 @@ release build ~3.4 s. Nearly all of it is clap; object's code in the binary is ~
 Tools in the devshell (not linked): cargo-nextest (per-test processes and timeouts), erofs-utils
 (store images for programs outside the store; `fsck.erofs`/`dump.erofs` are the test oracle for
 native/erofs).
+
+## exobox-rt arena tests (2026-11-18): property tests of the arena (native/rt/src/arena)
+Test-only: nothing reaches the runtime or the binary. The rt crate's test build goes from rustix
+alone to 17 crates; cold `cargo build -p exobox-rt --tests` 4.4 s, of which proptest and its
+dependencies are ~3.5 s (zerocopy 1.9 s via rand_chacha's ppv-lite86, proptest 1.5 s,
+regex-syntax 1.1 s, in parallel). Warm, nothing.
+
+| Crate | For | Where | Cost noted |
+|---|---|---|---|
+| proptest 1 (default-features off, std) | random sequences of mmap/munmap/mremap/mprotect against a model, shrunk to a minimal failing sequence | rt tests | test-only; without `fork`/`timeout` (no rusty-fork, tempfile, wait-timeout); `failure_persistence` off, so no files written |
+| libc 0.2 | a real `MAP_NORESERVE` reservation, `madvise` as the release hook, `mincore` to see what the host holds | rt tests | test-only (already the suite's) |
