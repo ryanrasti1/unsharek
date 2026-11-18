@@ -111,6 +111,10 @@ that mounts `/dev/exobox/<name>` with `mount(2)` and execs the next one).
 6. Within the performance budgets (`./test --perf`): startup, memory per sandbox, parallel builds.
 7. Code mapped in place from the store images, and a streaming image builder for stores that
    write images as paths arrive.
+8. Custom kernels, at build time: the kernel as its own Nix build (`lib.exoboxKernel { src, config }`:
+   a source and a config fragment over `lkl/defconfig`, for more drivers or filesystems; LKL has
+   no loadable modules), and `lib.mkExobox { kernel }` for an exobox built with it. In development,
+   `EXOBOX_LKL_SRC` and `EXOBOX_LKL_CONFIG` (a fragment) select them.
 
 ## Building and testing
 
