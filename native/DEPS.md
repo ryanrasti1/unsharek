@@ -35,8 +35,8 @@ of routes plus its names.
 
 | Crate | For | Where | Cost noted |
 |---|---|---|---|
-| rustix 1 (no default features; thread, mm) | raw Linux syscalls, no libc: no_new_privs before the filter's install (seccomp itself is one inline `syscall`: rustix has no wrapper), `mprotect` for the coroutine stacks' guard pages | library | only the calls used are linked; pulls bitflags and linux-raw-sys (constants) |
-| libc 0.2 | x86-64 struct layouts and constants the translations are checked against; fork/waitpid for the filter's kernel test | test | test-only (already in the tree for the suite) |
+| rustix 1 (no default features; thread, mm) | raw Linux syscalls, no libc: no_new_privs before the filter's install (seccomp itself is one inline `syscall`: rustix has no wrapper), `mprotect` for the coroutine stacks' guard pages. Not its `runtime` feature (unstable API): `rt_sigaction` and `sigaltstack` go through the gate before lockdown | library | only the calls used are linked; pulls bitflags and linux-raw-sys (constants) |
+| libc 0.2 | x86-64 struct layouts and constants the translations (and the trap's ucontext/siginfo) are checked against; fork/waitpid for the kernel tests (filter, trap) | test | test-only (already in the tree for the suite) |
 
 Tools in the devshell (not linked): cargo-nextest (per-test processes and timeouts), erofs-utils
 (store images for programs outside the store; `fsck.erofs`/`dump.erofs` are the test oracle for
