@@ -12,5 +12,6 @@ publish = false
 rustix = { workspace = true, features = ["thread"] }
 
 [dev-dependencies]
-# fork and waitpid for the filter's real-kernel test
+# fork and waitpid for the filter's real-kernel test; struct layouts and constants checked
+# against glibc's x86-64 ABI (sysmap, xabi)
 libc = { workspace = true }
