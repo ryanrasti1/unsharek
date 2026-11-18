@@ -309,13 +309,13 @@ pub static HOST_OPS: HostOps = HostOps(UnsafeCell::new(lkl_host_operations {
 
 // ---- print and panic ----
 
-/// All of `buf` to the host's stderr, a raw `write` on fd 2 (allowed from the gate after
-/// lockdown). Errors are dropped: there is nowhere else to report them.
+/// All of `buf` to the host's stderr, a `write` on fd 2 through the gate (allowed by every
+/// filter). Not rustix's: once the routing filter is in, a syscall not from the gate traps and
+/// would be served by the guest (as the program's write to its fd 2), from inside the kernel.
+/// Errors are dropped: there is nowhere else to report them.
 fn write_stderr(mut buf: &[u8]) {
-    // SAFETY: fd 2 stays open for the process's life; it is only borrowed for the write.
-    let fd = unsafe { rustix::fd::BorrowedFd::borrow_raw(2) };
     while !buf.is_empty() {
-        match rustix::io::write(fd, buf) {
+        match crate::trap::write(2, buf) {
             Ok(0) => return,
             Ok(n) => buf = &buf[n..],
             Err(rustix::io::Errno::INTR) => {}
@@ -605,8 +605,8 @@ unsafe extern "C" fn memmove(d: *mut c_void, s: *const c_void, n: c_ulong) -> *m
 // ---- the production Host: clocks and the idle wait ----
 
 /// The scheduler's [`Host`] in the sandbox: the host's clocks (rustix's vDSO calls: no syscall,
-/// so nothing the filter must allow) and, with nothing runnable, a `ppoll` with no fds (the
-/// filter's one wait: at most one pollfd, no signal mask).
+/// so nothing the filter must allow) and, with nothing runnable, a `ppoll` with no fds through the
+/// gate (the filter's one wait: at most one pollfd, no signal mask).
 #[derive(Debug, Default)]
 pub struct SysHost;
 
@@ -643,8 +643,10 @@ impl Host for SysHost {
                 Some(timespec(d - now))
             }
         };
-        // EINTR (a signal) is a wake-up like any other.
-        let _ = rustix::event::poll(&mut [], timeout.as_ref());
+        let ts = timeout.map(|t| crate::xabi::Timespec { tv_sec: t.tv_sec, tv_nsec: t.tv_nsec });
+        // Through the gate (the filter's one wait; rustix's poll would trap once the routing
+        // filter is in). EINTR (a signal) is a wake-up like any other.
+        let _ = crate::trap::ppoll(None, ts.as_ref());
     }
 }
 
