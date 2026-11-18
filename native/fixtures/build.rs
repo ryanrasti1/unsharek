@@ -32,7 +32,18 @@ fn main() {
     run_all(&cc, &src, &common, libs);
     fs::copy(bin.join("libplug.so"), denied.join("libplug.so")).unwrap();
 
-    let special = ["evil_interp", "ctor_escape", "plug"];
+    // exobox-rt's loader tests (native/rt/src/exec): a program with no libc, as a static PIE and
+    // at a fixed address (no static glibc in the devshell; it needs none), and hello at a fixed
+    // address with its interpreter.
+    let freestanding = ["-nostdlib", "-ffreestanding", "-fno-stack-protector"];
+    let loader = vec![
+        ("static_start".into(), bin.join("static_start"), args(&[&freestanding[..], &["-static-pie", "-fPIE"]].concat())),
+        ("static_start".into(), bin.join("static_start_nopie"), args(&[&freestanding[..], &["-static", "-no-pie", "-fno-pie"]].concat())),
+        ("hello".into(), bin.join("hello_nopie"), args(&["-no-pie", "-fno-pie"])),
+    ];
+    run_all(&cc, &src, &common, loader);
+
+    let special = ["evil_interp", "ctor_escape", "plug", "static_start"];
     let programs = fs::read_dir(&src)
         .unwrap()
         .filter_map(|e| {

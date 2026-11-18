@@ -248,8 +248,10 @@ dependencies = [
 name = "exobox-rt"
 version = "0.0.0"
 dependencies = [
+ "exobox-fixtures",
  "libc",
  "lkl-sys",
+ "object",
  "proptest",
  "rustix",
 ]
