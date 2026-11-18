@@ -305,6 +305,10 @@ pub static HOST_OPS: HostOps = HostOps(UnsafeCell::new(lkl_host_operations {
     shmem_init: None,
     shmem_mmap: None,
     pci_ops: ptr::null_mut(),
+    // The kernel series' item 6 (a task's exit) and 11 (host fds as guest files): the sandbox's
+    // dispatcher provides them; without task_exit, a task's end ends its host thread.
+    task_exit: None,
+    hostfd_rw: None,
 }));
 
 // ---- print and panic ----
