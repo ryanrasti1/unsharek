@@ -388,15 +388,33 @@ pub struct Sandbox {
     mode: Mode,
     deny: Deny,
     rules: Vec<Rule>,
+    /// Threaded mode: the CPU-token eventfds' inclusive fd range (coroutine: `(0, 0)`).
+    token_fds: (u32, u32),
 }
 
 impl Sandbox {
-    /// Boot a guest for `mode` (coroutine mode only, so far).
+    /// Boot a guest for `mode` (coroutine and threaded; fork is not implemented yet).
     pub fn boot(mode: Mode, config: GuestConfig) -> Result<Sandbox, Error> {
-        if mode != Mode::Coroutine {
-            return Err(Error::NotImplemented("threaded and fork mode"));
+        if mode == Mode::Fork {
+            return Err(Error::NotImplemented("fork mode"));
         }
-        Ok(Sandbox { guest: Guest::boot(config)?, mode, deny: Deny::Kill, rules: vec![] })
+        let guest = Guest::boot(config)?;
+        let token_fds = if mode == Mode::Threaded {
+            // Make the CPU-token eventfds and switch the runtime to threaded (before lockdown),
+            // then start the kernel idler host thread and wait for it to install its signal stack
+            // (the routing filter is synced to it).
+            let range = guest::enable_threaded()?;
+            std::thread::Builder::new()
+                .stack_size(256 * 1024)
+                .name("exobox-kernel".into())
+                .spawn(|| guest::threaded_kernel_main())
+                .map_err(Error::io("the kernel idler thread"))?;
+            guest::threaded_wait_ready();
+            range
+        } else {
+            (0, 0)
+        };
+        Ok(Sandbox { guest, mode, deny: Deny::Kill, rules: vec![], token_fds })
     }
 
     /// What a refused host syscall gets (default: kill).
@@ -444,7 +462,7 @@ impl Sandbox {
             },
             gate_ip: exobox_rt::trap::gate_ip(),
             arena: &arena,
-            token_fds: (0, 0),
+            token_fds: self.token_fds,
             extra: &extra,
         };
         filter::compile(&params, prog).map_err(|e| Error::Io {
@@ -452,12 +470,15 @@ impl Sandbox {
             source: std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()),
         })?;
         let prog: &'static filter::Program = prog;
+        // Threaded mode: sync the mode filter to every host thread (the kernel idler, and the
+        // program's threads made lazily inherit it). SECCOMP_FILTER_FLAG_TSYNC = 1.
+        let flags: u32 = if self.mode == Mode::Coroutine { 0 } else { 1 };
         self.guest.run(argv, env, move || {
             setup().map_err(Into::into)?;
             // The mode's list allows no host memory calls: setup code that still makes one gets
             // ENOMEM (mmap) or nothing done, not the filter's verdict.
             guest::host_memory(false);
-            filter::install(prog, 0)
+            filter::install(prog, flags)
                 .map_err(|e| Error::io("installing the filter")(std::io::Error::from_raw_os_error(e.raw_os_error())))
         })
     }

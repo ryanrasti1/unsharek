@@ -43,6 +43,7 @@ use crate::exec::{self, Files, Scratch, StackParams};
 use crate::filter::{self, Deny, Params, Policy, Program as Filter};
 use crate::futex::{self, Futexes};
 use crate::host::{self, SysHost};
+use crate::par;
 use crate::sched::{Config, Sched, Stacks, Tid};
 use crate::sync::TlsKey;
 use crate::sysmap::{self, Emulate, Rewrite, Route, StatForm, k, lkl};
@@ -237,9 +238,35 @@ pub fn route() -> Result<(), Error> {
     // SAFETY: the static program, used only here and in `lock`, one at a time.
     let prog = unsafe { FILTER.get() };
     filter::compile(&p, prog).map_err(|_| Error { what: "the routing filter", errno: Errno::INVAL })?;
-    filter::install(prog, 0).map_err(err("installing the routing filter"))?;
+    // Threaded mode: sync to every thread (the kernel idler host thread already exists), so its
+    // syscalls route through the gate too. SECCOMP_FILTER_FLAG_TSYNC = 1.
+    let flags = if par::enabled() { 1 } else { 0 };
+    filter::install(prog, flags).map_err(err("installing the routing filter"))?;
     S.phase.set(Phase::Setup);
     Ok(())
+}
+
+/// Switch the runtime to threaded mode (a host thread per program thread): bind the main thread,
+/// make the CPU-token eventfds (before lockdown), set memory high-water (the mode filter refuses
+/// `madvise`), and install the scheduler driver. Returns the token eventfds' inclusive fd range,
+/// for the mode filter. Call once, after [`boot`] and before [`route`], on the main thread. The
+/// caller must also start the kernel idler host thread on [`threaded_kernel_main`].
+pub fn enable_threaded() -> Result<(u32, u32), Error> {
+    with_arena(|a, _| a.set_mode(arena::Mode::HighWater));
+    // SAFETY: once, on the main (boot) thread, before lockdown.
+    unsafe { par::enable(&SCHED, SCHED.current()) }.map_err(err("enabling threaded mode"))
+}
+
+/// The body of threaded mode's kernel idler host thread (the caller spawns it before [`route`]).
+/// Never returns.
+pub fn threaded_kernel_main() -> ! {
+    par::kernel_main()
+}
+
+/// Wait until the kernel idler host thread has installed its signal stack: the main thread calls
+/// this after spawning it and before [`route`] (whose filter is synced to every thread).
+pub fn threaded_wait_ready() {
+    par::wait_kernel_ready()
 }
 
 /// The arena as the mode filter's `madvise` range (inclusive): `filter::Params::arena`.
@@ -514,8 +541,9 @@ fn me() -> &'static Thread {
 
 /// `lkl_syscall` as the current coroutine's task (attaching a new thread's first).
 fn lkl_call(nr: c_long, a: [usize; 6]) -> isize {
-    let t = me();
-    let tid = t.attach.replace(0);
+    // Threaded mode keeps the per-thread attach word in the host-thread record (the bound
+    // coroutine is reached by a trap, not the per-coroutine TLS `me()`).
+    let tid = if par::enabled() { par::take_attach() } else { me().attach.replace(0) };
     if tid != 0 {
         let mut p = [tid as c_long, 0, 0, 0, 0, 0];
         // SAFETY: the kernel runs; attach_thread takes the thread new_thread made for us.
@@ -552,7 +580,7 @@ fn clone(uc: &Ucontext, a: [usize; 6]) -> Result<usize, Errno> {
     {
         return Err(Errno::FAULT);
     }
-    let i = S.threads.iter().position(|t| !t.used.get()).ok_or(Errno::AGAIN)?;
+    let coroutine_slot = if par::enabled() { 0 } else { S.threads.iter().position(|t| !t.used.get()).ok_or(Errno::AGAIN)? };
     let tid = res(lkl_call(l::__lkl__NR_new_thread, [0; 6]))?;
     let m = &uc.mcontext;
     let regs = Registers {
@@ -575,15 +603,22 @@ fn clone(uc: &Ucontext, a: [usize; 6]) -> Result<usize, Errno> {
         rip: m.rip,
     };
     let fs = if flags & CLONE_SETTLS != 0 { tls } else { m.fs_base as usize };
-    // SAFETY: the program's own state after its `clone`, as Linux starts the child.
-    // TODO: on failure the guest thread new_thread made stays, never run (item 6 will end it).
-    let co: Tid = unsafe { SCHED.spawn_registers(&regs, fs) }.map_err(|_| Errno::AGAIN)?;
-    let _ = SCHED.detach(co);
-    let t = &S.threads[i];
-    t.used.set(true);
-    t.co.set(co.raw());
-    t.attach.set(tid as i32);
-    t.clear_tid.set(if flags & CLONE_CHILD_CLEARTID != 0 { ctid } else { 0 });
+    let clear_tid = if flags & CLONE_CHILD_CLEARTID != 0 { ctid } else { 0 };
+    if par::enabled() {
+        // Threaded mode: a host thread of its own for the new program thread, which starts in user
+        // mode. If it can't be made, the guest thread new_thread made is left (ended later).
+        par::spawn_thread(&regs, fs, tid as i32, clear_tid, uc).map_err(|_| Errno::AGAIN)?;
+    } else {
+        // SAFETY: the program's own state after its `clone`, as Linux starts the child.
+        // TODO: on failure the guest thread new_thread made stays, never run (item 6 will end it).
+        let co: Tid = unsafe { SCHED.spawn_registers(&regs, fs) }.map_err(|_| Errno::AGAIN)?;
+        let _ = SCHED.detach(co);
+        let t = &S.threads[coroutine_slot];
+        t.used.set(true);
+        t.co.set(co.raw());
+        t.attach.set(tid as i32);
+        t.clear_tid.set(clear_tid);
+    }
     if flags & CLONE_PARENT_SETTID != 0 {
         write_user(ptid, tid as u32)?;
     }
@@ -618,13 +653,13 @@ fn exit_group(code: usize) -> ! {
 /// A thread's `exit`: its tid word cleared and woken, then the guest's exit, which comes back as
 /// `task_exit`.
 fn exit_thread(code: usize) -> ! {
-    let t = me();
-    let ct = t.clear_tid.replace(0);
+    let ct = if par::enabled() { par::take_clear_tid() } else { me().clear_tid.replace(0) };
     if ct != 0 && write_user(ct, 0u32).is_ok() {
         futexes().wake(&SCHED, ct, 1, futex::FUTEX_BITSET_MATCH_ANY);
     }
-    if S.threads.iter().filter(|t| t.used.get()).count() == 1 {
-        // The process's last thread: its exit is the process's.
+    if !par::enabled() && S.threads.iter().filter(|t| t.used.get()).count() == 1 {
+        // The process's last thread: its exit is the process's. (Threaded mode writes back when
+        // the process ends, through the kernel's init-ending; a lone `exit` is rare there.)
         writeback();
     }
     lkl_call(l::__lkl__NR_exit, [code, 0, 0, 0, 0, 0]);
@@ -638,6 +673,11 @@ unsafe extern "C" fn task_exit(pid: core::ffi::c_int, status: core::ffi::c_int) 
     if pid == 1 {
         let code = if status & 0x7f == 0 { (status >> 8) & 0xff } else { 128 + (status & 0x7f) };
         finish(code);
+    }
+    if par::enabled() {
+        // A program thread's guest task ended: end its host thread (its Sched coroutine is freed
+        // when the slot is reused). Never returns.
+        par::thread_exited(par::my_id());
     }
     let t = me();
     if core::ptr::eq(t, &S.threads[0]) {
@@ -829,7 +869,14 @@ fn ret(r: Result<usize, Errno>) -> isize {
 /// phase, on the root's stack).
 fn target(uc: &Ucontext) -> usize {
     let sp = uc.mcontext.rsp as usize;
-    let (lo, size) = SCHED.stack();
+    // Threaded mode: the trapping host thread's bound coroutine (via its GS record), not the shared
+    // `current` (set by whichever host last held the token). `(0, 0)`: the main thread's root.
+    let (lo, size) = if par::enabled() {
+        let (l, h) = par::target_ctl();
+        (l, h - l)
+    } else {
+        SCHED.stack()
+    };
     if size == 0 {
         // The root: the host thread's own stack, whose extent the scheduler doesn't know.
         let top = S.root_top.get();
@@ -843,6 +890,17 @@ fn target(uc: &Ucontext) -> usize {
 /// The dispatcher (`trap::Dispatch`).
 fn dispatch(uc: &mut Ucontext) {
     let (nr, a) = uc.syscall();
+    if par::enabled() {
+        // Threaded mode: hold the CPU token while serving (the kernel, the scheduler, the futexes
+        // and the arena are shared). A call that blocks releases and reclaims it inside the
+        // scheduler; the exit paths end the host thread holding it. Program code runs in parallel
+        // outside the token, so no fairness yield is needed.
+        let id = par::enter();
+        let r = serve(uc, nr, a);
+        uc.set_return(r);
+        par::leave(id);
+        return;
+    }
     let r = serve(uc, nr, a);
     uc.set_return(r);
     // No preemption here: a thread whose calls never block (a poll with timeout 0 in a loop)
@@ -1084,7 +1142,11 @@ fn emulate(uc: &mut Ucontext, e: Emulate, nr: usize, a: [usize; 6]) -> isize {
         E::ExitGroup => exit_group(a[0]),
         E::SetRobustList => 0, // TODO: robust futexes are not released at a thread's death
         E::SetTidAddress => {
-            me().clear_tid.set(a[0]);
+            if par::enabled() {
+                par::set_clear_tid(a[0]);
+            } else {
+                me().clear_tid.set(a[0]);
+            }
             lkl_call(l::__lkl__NR_gettid, [0; 6])
         }
         E::Futex if !program => {
