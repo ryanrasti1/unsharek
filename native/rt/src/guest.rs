@@ -97,6 +97,10 @@ fn futexes() -> &'static Futexes {
     unsafe { &*FUTEXES.0.get() }
 }
 static ARENA_TABLE: Local<[Extent; arena::CAPACITY]> = Local::new([Extent::EMPTY; arena::CAPACITY]);
+/// The image zone's writable ranges (`Arena::add_zone_writable`): one or two per ELF in the
+/// closure's images (python's closure has ~1,500 ELFs). 256 KiB of bss, touched as used.
+static ZONE_RW: Local<[(usize, usize); ZONE_RW_CAP]> = Local::new([(0, 0); ZONE_RW_CAP]);
+const ZONE_RW_CAP: usize = 16 << 10;
 static ARENA: Local<Option<Arena<'static>>> = Local::new(None);
 static SCRATCH: Local<Scratch> = Local::new(Scratch::new());
 static FILTER: Local<Filter> = Local::new(Filter::new());
@@ -286,6 +290,7 @@ pub unsafe fn boot(b: Boot) -> Result<(), Error> {
         let mut a = Arena::new(b.arena.0, b.arena.1, arena::Mode::Release, table).map_err(err("arena"))?;
         if b.image_zone != 0 {
             a.set_image_zone(b.arena.0 + b.arena.1 - b.image_zone).map_err(err("the image zone"))?;
+            a.set_zone_writable_table(&mut ZONE_RW.get()[..]);
         }
         *ARENA.get() = Some(a);
     }
@@ -437,6 +442,13 @@ pub fn threaded_kernel_main() -> ! {
 /// this after spawning it and before [`route`] (whose filter is synced to every thread).
 pub fn threaded_wait_ready() {
     par::wait_kernel_ready()
+}
+
+/// `[lo, hi)` of the image zone is writable on the host (an ELF's writable segments in its slot;
+/// the rest of an image is mapped read-only there): `arena::Arena::add_zone_writable`. Before
+/// lockdown, as each image is mapped.
+pub fn zone_writable(lo: usize, hi: usize) -> Result<(), Error> {
+    with_arena(|a, _| a.add_zone_writable(lo, hi)).map_err(err("the image zone's writable pages"))
 }
 
 /// The arena as the mode filter's `madvise` range (inclusive): `filter::Params::arena`.

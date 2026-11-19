@@ -335,6 +335,16 @@ fn cases() -> Vec<Case> {
                 ])
                 .uses(&["EXOBOX_TEST_GCC", "EXOBOX_TEST_COREUTILS"])
         },
+        // Libraries mapped in place at every exec, from a forked child too, their code never
+        // writable (native/fixtures/c/libcode.c).
+        case("libcode_inplace", Prog::Fixture("libcode"), ALL, ok("LIBCODE_OK")).args(vec![Arg::Lit("inplace"), Arg::Lit("4")]),
+        case("libcode_inplace_fork", Prog::Fixture("libcode"), FORK, ok("LIBCODE_OK"))
+            .args(vec![Arg::Lit("inplace"), Arg::Lit("6"), Arg::Lit("fork")]),
+        case("libcode_write", Prog::Fixture("libcode"), ALL, Expect { not_stdout: vec!["LIBCODE_WROTE"], ..status(Status::Signal(11)) })
+            .args(vec![Arg::Lit("write")]),
+        case("libcode_mprotect", Prog::Fixture("libcode"), ALL, ok("MPROTECT_EACCES"))
+            .args(vec![Arg::Lit("mprotect")])
+            .native(Some(ok("MPROTECT_OK"))),
         // The CPUs a program is told: the host's where its threads run in parallel, one in
         // coroutine mode (rustc sized its codegen from it).
         Case { check: Some(nproc_is_hosts), ..case("nproc", Prog::Fixture("nproc"), THREADED_FORK, ok("NPROC ")) },

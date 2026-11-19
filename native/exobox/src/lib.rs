@@ -372,14 +372,16 @@ impl Guest {
         self.own(None)?;
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (file, name_default): (File, String) = match source {
+        // The layout exobox-erofs wrote beside it (`X.layout` for `X.erofs`): where its ELFs are.
+        let (file, name_default, layout): (File, String, Option<PathBuf>) = match source {
             ImageSource::Path(p) => {
                 let f = File::open(p).map_err(Error::io(p.display().to_string()))?;
                 let base = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                 let stem = base.strip_suffix(".erofs").unwrap_or(&base).to_owned();
-                (f, if stem.is_empty() { format!("image{n}") } else { stem })
+                let layout = base.strip_suffix(".erofs").map(|s| p.with_file_name(format!("{s}.layout")));
+                (f, if stem.is_empty() { format!("image{n}") } else { stem }, layout)
             }
-            ImageSource::Fd(fd) => (File::from(fd), format!("image{n}")),
+            ImageSource::Fd(fd) => (File::from(fd), format!("image{n}"), None),
         };
         let name = name.map_or(name_default, str::to_owned);
         if name.is_empty() || name.contains('/') || name.starts_with('.') {
@@ -402,7 +404,11 @@ impl Guest {
             unsafe { std::slice::from_raw_parts(p as *const u8, len) }
         };
         let image = Image { name: Box::leak(name.into_boxed_str()), data };
-        let in_zone = self.map_in_zone(&file, len);
+        let in_zone = match layout.and_then(|l| std::fs::read(l).ok()) {
+            Some(layout) => self.map_in_zone(&file, data, len, &layout)?,
+            // No layout, no known slots: its files are copied when mapped.
+            None => None,
+        };
         setup::block_device(&image, in_zone).map_err(Error::io(format!("the guest's {}", image.device().display())))?;
         Ok(image)
     }
@@ -410,25 +416,47 @@ impl Guest {
     /// The image mapped again, privately, in the arena's image zone (`exobox_rt::memblk`): what
     /// the program maps from it is mapped there in place. None when it doesn't fit, or can't be
     /// mapped executable (a `noexec` mount): its files are copied instead.
-    fn map_in_zone(&mut self, file: &File, len: usize) -> Option<usize> {
+    ///
+    /// Read-only and executable, but for each ELF's writable segments in its slot (from the
+    /// image's `layout` and the ELFs' own program headers), which are made writable here and
+    /// told to the arena: so every other page of the zone is always the image's bytes, in every
+    /// mode, after any fork, and a library is mapped in place at every exec (its data pages copied,
+    /// as Linux copies them on write). When the zone was writable, a library's data written by one
+    /// program kept it from ever being mapped in place again where nothing gives pages back
+    /// (threaded and fork mode): fork mode copied nearly every exec's libraries, code and all
+    /// (make -j4 copied 2.3 GB for 142 execs: native/PERF.md).
+    fn map_in_zone(&mut self, file: &File, data: &[u8], len: usize, layout: &[u8]) -> Result<Option<usize>, Error> {
         let (at, end) = self.zone;
         let size = len.next_multiple_of(4096);
         if end - at < size {
-            return None;
+            return Ok(None);
         }
-        let rwx = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
+        let rx = libc::PROT_READ | libc::PROT_EXEC;
         // SAFETY: over the arena's own reservation, in the zone's unused part: nothing is there.
-        let p = unsafe { libc::mmap(at as *mut _, len, rwx, libc::MAP_PRIVATE | libc::MAP_FIXED, file.as_raw_fd(), 0) };
+        let p = unsafe { libc::mmap(at as *mut _, len, rx, libc::MAP_PRIVATE | libc::MAP_FIXED, file.as_raw_fd(), 0) };
         if p == libc::MAP_FAILED {
             // A failed MAP_FIXED may have unmapped the range: the reservation's zeros back.
+            let rwx = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
             let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | libc::MAP_FIXED;
             // SAFETY: as above.
             let back = unsafe { libc::mmap(at as *mut _, size, rwx, flags, -1, 0) };
             assert_ne!(back, libc::MAP_FAILED, "the image zone lost a range");
-            return None;
+            return Ok(None);
         }
         self.zone.0 = at + size;
-        Some(at)
+        for (lo, hi) in writable_pages(data, layout) {
+            let (lo, hi) = (at + lo, (at + hi).min(at + size));
+            if lo >= hi {
+                continue;
+            }
+            // Executable too: a page shared by the end of the code and the start of the data.
+            // SAFETY: pages of the mapping just made, which nothing uses yet.
+            if unsafe { libc::mprotect(lo as *mut _, hi - lo, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) } != 0 {
+                return Err(Error::io("the image zone's writable pages")(std::io::Error::last_os_error()));
+            }
+            guest::zone_writable(lo, hi)?;
+        }
+        Ok(Some(at))
     }
 
     /// `program`'s Nix closure (plus `allow_paths`, each a store path with its closure or a
@@ -1103,4 +1131,63 @@ mod tests {
         assert_eq!(6 + 1 + p[6].jf as usize, start);
         assert_eq!(1 + 1 + p[1].jt as usize, 3);
     }
+}
+
+/// The pages of an image (offsets in it) where its ELFs' writable segments land when mapped in
+/// place: for each ELF of `layout` (exobox-erofs' `offset slot size elf|data path` lines), each
+/// writable PT_LOAD's pages, placed as ld.so places them over the reservation of the file's span
+/// (at the file's offset of its lowest segment, `exobox_erofs`'s `elf.rs`), within its slot. An
+/// ELF whose headers can't be read has none (nothing of it can then be written in place: it is
+/// copied).
+fn writable_pages(image: &[u8], layout: &[u8]) -> Vec<(usize, usize)> {
+    const PAGE: u64 = 4096;
+    let mut out = Vec::new();
+    for line in layout.split(|&b| b == b'\n') {
+        let mut f = line.splitn(5, |&b| b == b' ');
+        let num = |x: Option<&[u8]>| x.and_then(|x| std::str::from_utf8(x).ok()?.parse::<u64>().ok());
+        let (Some(offset), Some(slot), Some(size)) = (num(f.next()), num(f.next()), num(f.next())) else { continue };
+        if f.next() != Some(b"elf".as_slice()) {
+            continue;
+        }
+        let Some(elf) = image.get(offset as usize..(offset + size) as usize) else { continue };
+        let Some(loads) = elf_loads(elf) else { continue };
+        let Some(&(vaddr0, off0, _, _, _)) = loads.iter().min_by_key(|l| l.0) else { continue };
+        let lo = vaddr0 / PAGE * PAGE;
+        let base = offset + off0 / PAGE * PAGE;
+        for &(vaddr, _, memsz, writable, _) in &loads {
+            if !writable {
+                continue;
+            }
+            let Some(end) = vaddr.checked_add(memsz).and_then(|e| e.checked_next_multiple_of(PAGE)) else { continue };
+            let (s, e) = (base + (vaddr / PAGE * PAGE - lo), (base + (end - lo)).min(offset + slot));
+            if s < e {
+                out.push((s as usize, e as usize));
+            }
+        }
+    }
+    out
+}
+
+/// An ELF64 little-endian file's PT_LOADs: (p_vaddr, p_offset, p_memsz, writable, p_filesz).
+/// None if its headers aren't whole.
+fn elf_loads(elf: &[u8]) -> Option<Vec<(u64, u64, u64, bool, u64)>> {
+    let u16_at = |o: usize| Some(u16::from_le_bytes(elf.get(o..o + 2)?.try_into().ok()?));
+    let u32_at = |o: usize| Some(u32::from_le_bytes(elf.get(o..o + 4)?.try_into().ok()?));
+    let u64_at = |o: usize| Some(u64::from_le_bytes(elf.get(o..o + 8)?.try_into().ok()?));
+    if elf.get(..6)? != b"\x7fELF\x02\x01" {
+        return None;
+    }
+    let (phoff, phentsize, phnum) = (u64_at(0x20)? as usize, u16_at(0x36)? as usize, u16_at(0x38)? as usize);
+    let mut loads = Vec::new();
+    for i in 0..phnum {
+        let ph = phoff.checked_add(i.checked_mul(phentsize)?)?;
+        const PT_LOAD: u32 = 1;
+        const PF_W: u32 = 2;
+        if u32_at(ph)? != PT_LOAD {
+            continue;
+        }
+        let flags = u32_at(ph + 4)?;
+        loads.push((u64_at(ph + 16)?, u64_at(ph + 8)?, u64_at(ph + 40)?, flags & PF_W != 0, u64_at(ph + 32)?));
+    }
+    Some(loads)
 }

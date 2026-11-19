@@ -164,9 +164,11 @@ against threaded mode (`threads`), and the host filter refusing a hostile progra
   or a symlink (a setup hook, a source tarball) gets an image whose root holds it: the file is
   bind-mounted from it onto its store path (nothing copied), the symlink made. Their layout pads each ELF
   file to its memory image, so code is mapped in place: each image is mapped twice before
-  lockdown, read-only for the guest's block device and privately into the arena's top, and the
-  program's mappings of its files are answered with where their bytes already are there, shared by
-  every sandbox through the host's page cache (what it writes is copy-on-write, its own).
+  lockdown, read-only for the guest's block device and privately into the arena's top (read-only
+  there too, but for each ELF's writable segments, from the image's layout), and the program's
+  mappings of its files are answered with where their bytes already are there, shared by every
+  sandbox through the host's page cache, at every exec in every mode (its data pages get the
+  file's bytes copied in, its own). Library code is never writable, as natively.
 - **The network.** The kernel impersonates the program's AF_INET sockets (its `tsi.c`, after
   libkrunfw's Transparent Socket Impersonation, with direct calls to the host instead of vsock):
   loopback, binds and listens are an inner socket of the guest's own; any other connect is a host

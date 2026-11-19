@@ -44,19 +44,20 @@
 //! # The image zone: files mapped in place
 //! The arena's top part can be the image zone ([`Arena::set_image_zone`]): the runtime maps the
 //! store's images there (privately, before lockdown), each file's bytes block-aligned and each
-//! ELF's memory image left free after them (exobox-erofs' slots). A private mapping of a file
-//! whose bytes are there ([`Backing::locate`]) is answered with their address instead of a copy,
-//! when the range still holds the image's bytes and what it covers past the file's end is zero:
-//! ld.so's reservation of a library, then its read-only segments `MAP_FIXED` where they already
-//! are. The program's code is then the host's page cache, shared by every sandbox and by the
-//! host's own processes, as a native libc is. In release mode what was mapped there is given back
-//! when freed, which restores the image's bytes (the file's, under the private mapping); that is
-//! how the zone knows it still holds them (`Kind::Image`). In high-water mode nothing is given
-//! back: a range is in place while it was never written (a library's code, again and again; its
-//! data only the first time), and a written one stays dirty when freed, copied from instead. A
-//! fork mode child's zone is its parent's, written pages and all, with the parent's table.
-//! Nothing is placed in the zone; a mapping put there `MAP_FIXED` is cleared first, like any
-//! reuse.
+//! ELF's memory image left free after them (exobox-erofs' slots). The zone is read-only on the
+//! host but for each ELF's writable segments in its slot ([`Arena::add_zone_writable`]), so its
+//! other pages are always the image's bytes, in every mode and after every fork. A private
+//! mapping of a file whose bytes are there ([`Backing::locate`]) is answered with their address
+//! instead of a copy: ld.so's reservation of a library (unmapped in this process), then its
+//! read-only segments `MAP_FIXED` where they already are; the writable pages a mapping covers get
+//! the file's bytes copied in (what they held never matters), and read-only pages past the file's
+//! end must read zero. The program's code is then the host's page cache, shared by every sandbox
+//! and by the host's own processes, as a native libc is. Nothing is placed in the zone; memory of
+//! the program's own goes there `MAP_FIXED` only onto writable pages (ENOMEM elsewhere), and the
+//! read-only ones can't be made writable (`mprotect`: EACCES). (The zone was writable, and in
+//! high-water mode, which gives nothing back, a library's written data kept it from being mapped
+//! in place again: fork mode copied nearly every exec's libraries whole.) A non-PIE program
+//! (gcc's cc1) is still copied: it must be at its own addresses.
 //!
 //! # What is not Linux
 //! - **No protections after lockdown.** `mprotect` records the protection (for `/proc/self/maps`
@@ -288,10 +289,6 @@ impl Kind {
             Kind::Image => false,
         }
     }
-    /// The image's bytes, as the host's file mapping has them: unmapped, or mapped in place.
-    fn is_pristine(self) -> bool {
-        matches!(self, Kind::Image | Kind::Mapped { anon: false, dirty: false, .. })
-    }
 }
 
 /// `k` as it must be at `s` with the image zone from `zone`: there, unmapped and clean is
@@ -338,9 +335,13 @@ pub struct Arena<'t> {
     zeroed: u64,
     /// Where the image zone starts (`end` if there is none): see [`Arena::set_image_zone`].
     zone: usize,
-    /// Files are mapped in place from the zone: release mode, and no release in the zone has
-    /// failed (a failed one is cleared to zero, and the zone would no longer hold the images).
+    /// Files are mapped in place from the zone (it is set).
     in_place: bool,
+    /// The zone's writable pages, sorted and disjoint `[lo, hi)` ranges (`rw[..n_rw]`): the pages
+    /// of each ELF's writable segments in its slot ([`Arena::add_zone_writable`]). Every other
+    /// zone page is read-only on the host: always the image's bytes.
+    rw: &'t mut [(usize, usize)],
+    n_rw: usize,
 }
 
 fn page_up(len: usize) -> Option<usize> {
@@ -361,7 +362,21 @@ impl<'t> Arena<'t> {
         }
         table[0] = Extent { start: base, kind: FREE_CLEAN };
         let end = base + len;
-        Ok(Arena { base, end, mode, table, n: 1, brk: 0, high: base, released: 0, zeroed: 0, zone: end, in_place: false })
+        Ok(Arena {
+            base,
+            end,
+            mode,
+            table,
+            n: 1,
+            brk: 0,
+            high: base,
+            released: 0,
+            zeroed: 0,
+            zone: end,
+            in_place: false,
+            rw: &mut [],
+            n_rw: 0,
+        })
     }
 
     /// Make `[zone, end)` the image zone, before anything is mapped there: where the host maps
@@ -382,6 +397,78 @@ impl<'t> Arena<'t> {
         self.apply(zone, self.end, &|_, _| Kind::Image);
         self.in_place = true;
         Ok(())
+    }
+
+    /// The storage for the zone's writable ranges ([`Arena::add_zone_writable`]): its length is
+    /// how many there can be.
+    pub fn set_zone_writable_table(&mut self, table: &'t mut [(usize, usize)]) {
+        self.rw = table;
+        self.n_rw = 0;
+    }
+
+    /// `[lo, hi)` (whole pages, in the zone) is writable on the host: an ELF's writable segments
+    /// in its slot, made writable when its image was mapped (every other zone page is mapped
+    /// read-only there). A mapping in place copies the file's bytes into these pages; nothing
+    /// relies on what they held before. `ENOMEM` when the table is full.
+    pub fn add_zone_writable(&mut self, lo: usize, hi: usize) -> Result<()> {
+        if !lo.is_multiple_of(PAGE) || !hi.is_multiple_of(PAGE) || lo >= hi || lo < self.zone || hi > self.end {
+            return Err(Errno::INVAL);
+        }
+        // Merged with what it overlaps or touches, kept sorted.
+        let i = self.rw[..self.n_rw].partition_point(|r| r.1 < lo);
+        let mut j = i;
+        let (mut l, mut h) = (lo, hi);
+        while j < self.n_rw && self.rw[j].0 <= hi {
+            l = min(l, self.rw[j].0);
+            h = max(h, self.rw[j].1);
+            j += 1;
+        }
+        if j == i {
+            if self.n_rw == self.rw.len() {
+                return Err(Errno::NOMEM);
+            }
+            self.rw.copy_within(i..self.n_rw, i + 1);
+            self.n_rw += 1;
+        } else if j > i + 1 {
+            self.rw.copy_within(j..self.n_rw, i + 1);
+            self.n_rw -= j - i - 1;
+        }
+        self.rw[i] = (l, h);
+        Ok(())
+    }
+
+    /// The zone's writable parts of `[lo, hi)`, in order.
+    fn zone_rw(&self, lo: usize, hi: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+        let i = self.rw[..self.n_rw].partition_point(|r| r.1 <= lo);
+        self.rw[i..self.n_rw].iter().take_while(move |r| r.0 < hi).map(move |r| (max(r.0, lo), min(r.1, hi)))
+    }
+
+    /// At most 8 of [`Arena::zone_rw`]'s ranges, for a loop that changes the arena (a library's
+    /// span holds one or two). None if there are more.
+    fn zone_rw_list(&self, lo: usize, hi: usize) -> Option<([(usize, usize); 8], usize)> {
+        let mut rw = [(0usize, 0usize); 8];
+        let mut n = 0;
+        for r in self.zone_rw(lo, hi) {
+            *rw.get_mut(n)? = r;
+            n += 1;
+        }
+        Some((rw, n))
+    }
+
+    /// Some page of `[lo, hi)` is a read-only page of the zone (the image's bytes: never written).
+    fn zone_ro(&self, lo: usize, hi: usize) -> bool {
+        let lo = max(lo, self.zone);
+        if lo >= hi {
+            return false;
+        }
+        let mut at = lo;
+        for (s, e) in self.zone_rw(lo, hi) {
+            if s > at {
+                return true;
+            }
+            at = e;
+        }
+        at < hi
     }
 
     /// `[addr, addr + len)` lies inside the arena.
@@ -462,6 +549,12 @@ impl<'t> Arena<'t> {
                 return Err(Errno::INVAL);
             }
             let hi = self.range(addr, len).ok_or(Errno::NOMEM)?;
+            // The zone's read-only pages are the image's: only a mapping of its own bytes in place
+            // goes there (above), never memory of the program's (ENOMEM, Linux's answer for a
+            // mapping it can't make).
+            if self.zone_ro(addr, hi) {
+                return Err(Errno::NOMEM);
+            }
             // NOREPLACE wins when both are set, as in Linux's do_mmap.
             if flags & MAP_FIXED_NOREPLACE != 0 && !self.all(addr, hi, Kind::is_unmapped) {
                 return Err(Errno::EXIST);
@@ -513,12 +606,18 @@ impl<'t> Arena<'t> {
     }
 
     /// A private file mapping made by handing out where the file's bytes already are, in the
-    /// image zone: `len` bytes from `f.offset` at the address [`Backing::locate`] gives, if the
-    /// range there holds them as the image has them (unmapped; or, with `fixed`, mapped in place
-    /// already: ld.so reserves a library's span with one mapping of the file, answered here, then
-    /// maps each segment `MAP_FIXED` over it, and the read-only ones are where they already are)
-    /// and whatever the mapping covers past the file's end reads zero (the file's slot in the
-    /// image, or its last block's padding). With `fixed`, only at `addr`. None: copy it.
+    /// image zone: `len` bytes from `f.offset` at the address [`Backing::locate`] gives. Without
+    /// `fixed` (ld.so's reservation of a library's span, or any mapping of the file) the range must
+    /// be unmapped in this process; with `fixed` (ld.so's segments over that reservation) only at
+    /// `addr`, over whatever is there. The zone's read-only pages are the image's bytes as they
+    /// are; its writable ones (an ELF's data and .bss pages in its slot) get the file's bytes
+    /// copied in, zeros past its end; what the range covers past the file's end on read-only pages
+    /// must read zero (its slot's, or its last block's padding). None: copy it.
+    ///
+    /// The read-only pages are why this holds in every mode and after every fork: nothing can
+    /// write them. (They were writable, and a library's written data pages kept it from being
+    /// mapped in place again in high-water mode: fork mode copied nearly every exec's libraries
+    /// whole, code and all.)
     fn in_place<B: Backing>(&mut self, b: &mut B, addr: usize, len: usize, prot: u32, fixed: bool, f: FileMap) -> Option<usize> {
         if !self.in_place {
             return None;
@@ -528,27 +627,38 @@ impl<'t> Arena<'t> {
         if at < self.zone || !at.is_multiple_of(PAGE) || (fixed && addr != at) {
             return None;
         }
-        let ok: fn(Kind) -> bool = if fixed { Kind::is_pristine } else { |k| k == Kind::Image };
-        if !self.all(at, hi, ok) {
+        if !fixed && !self.all(at, hi, Kind::is_unmapped) {
             return None;
         }
-        // Past the file's end: zero, as Linux's last page of a mapping (and the pages after it,
-        // which Linux would fault, read zero in a copy).
-        if avail < len as u64 {
-            let from = at + avail as usize;
-            let page = page_up(from)?;
-            // SAFETY: inside the zone, which is mapped (the images, and zeros between them).
-            let tail = unsafe { core::slice::from_raw_parts(from as *const u8, page - from) };
-            // SAFETY: as above, whole pages.
-            if tail.iter().any(|&x| x != 0) || (page..hi).step_by(PAGE).any(|p| unsafe { !page_is_zero(p) }) {
+        // Past the file's end, read-only pages must read zero (Linux's last page of a mapping,
+        // and the pages after it, which Linux would fault, read zero in a copy).
+        let fend = at.checked_add(usize::try_from(avail).ok()?)?;
+        if fend < hi {
+            let page = page_up(fend)?;
+            let ro_zero = |lo: usize, hi: usize| {
+                // SAFETY: inside the zone, which is mapped (the images, and zeros between them).
+                !self.zone_ro(lo, hi) || unsafe { core::slice::from_raw_parts(lo as *const u8, hi - lo) }.iter().all(|&x| x == 0)
+            };
+            if !ro_zero(fend, min(page, hi)) || !(page..hi).step_by(PAGE).all(|p| ro_zero(p, p + PAGE)) {
                 return None;
             }
         }
+        let (rw, n) = self.zone_rw_list(at, hi)?;
         let new = move |_: usize, _: Kind| Kind::Mapped { prot: prot as u8, dirty: prot & PROT_WRITE != 0, anon: false, shared: None };
         self.room(self.splits(at, hi, &new)).ok()?;
-        // What was mapped here in place is replaced by the file's bytes, as a new mapping would
-        // be (a byte written to it, whether it was writable or not, goes).
         self.vacate(b, at, hi, false, false);
+        // The writable pages: the file's bytes, then zeros. (A failure leaves the range unmapped,
+        // and the caller copies it, or fails.)
+        for &(s, e) in &rw[..n] {
+            let part = min(e, max(fend, s)) - s;
+            if part > 0 && Self::fill(b, FileMap { file: f.file, offset: f.offset + (s - at) as u64 }, s, part).is_err() {
+                let freed = self.freed();
+                self.apply(at, hi, &freed);
+                return None;
+            }
+            // SAFETY: writable zone pages, this mapping's.
+            unsafe { ptr::write_bytes((s + part) as *mut u8, 0, e - s - part) };
+        }
         self.apply(at, hi, &new);
         self.high = max(self.high, hi);
         Some(at)
@@ -610,6 +720,9 @@ impl<'t> Arena<'t> {
             if new_addr < ohi && old < nhi {
                 return Err(Errno::INVAL);
             }
+            if self.zone_ro(new_addr, nhi) {
+                return Err(Errno::NOMEM);
+            }
             self.room(move_need)?;
             let keep = min(olen, nlen);
             if keep < olen {
@@ -626,6 +739,7 @@ impl<'t> Arena<'t> {
         }
         if let Some(nhi) = self.range(old, nlen)
             && self.all(ohi, nhi, Kind::is_free)
+            && !self.zone_ro(ohi, nhi)
         {
             let tail = self.tail_kind(ohi - PAGE);
             let f = move |_: usize, _: Kind| tail;
@@ -658,6 +772,12 @@ impl<'t> Arena<'t> {
         let hi = self.range(addr, len).ok_or(Errno::NOMEM)?;
         if !self.all(addr, hi, Kind::is_mapped) {
             return Err(Errno::NOMEM);
+        }
+        // An image's read-only pages can't be made writable (no host mprotect after lockdown):
+        // EACCES, as Linux's for a file opened read-only mapped shared. (Text relocations, a
+        // program patching a library's code.)
+        if prot & PROT_WRITE != 0 && self.zone_ro(addr, hi) {
+            return Err(Errno::ACCESS);
         }
         let f = move |_: usize, k: Kind| match k {
             // Writable: the program may write it from now on, so it is no longer known zero.
@@ -980,15 +1100,14 @@ impl<'t> Arena<'t> {
                 }
             }
             if at >= self.zone {
-                // Every mapping here is given back, even one mapped in place (a stray write to a
-                // page it never made writable would otherwise stay): the image's bytes come
-                // back, and they are cleared only for reuse.
-                if k.is_mapped() && self.mode == Mode::Release {
-                    self.release(b, at, e);
-                }
-                if reuse {
-                    // SAFETY: inside the arena (Arena::new's contract).
-                    self.zeroed += unsafe { zero_nonzero(at, e - at) } as u64;
+                // Read-only pages are the image's, as ever: nothing to do. Writable ones are
+                // overwritten by whatever maps them next (in place: the file's bytes; anything
+                // else: cleared here for reuse), so what they held never matters.
+                if reuse && let Some((rw, n)) = self.zone_rw_list(at, e) {
+                    for &(s, t) in &rw[..n] {
+                        // SAFETY: writable zone pages.
+                        self.zeroed += unsafe { zero_nonzero(s, t - s) } as u64;
+                    }
                 }
             } else if k.is_dirty() && (reuse || self.mode == Mode::Release) {
                 self.clear(b, at, e);
@@ -1019,10 +1138,6 @@ impl<'t> Arena<'t> {
                 Err(_) => {
                     // SAFETY: inside the arena (Arena::new's contract).
                     self.zeroed += unsafe { zero_nonzero(a, n) } as u64;
-                    // Zero, not the image's bytes: nothing is mapped in place from now on.
-                    if a >= self.zone {
-                        self.in_place = false;
-                    }
                 }
             }
             a += n;
