@@ -11,8 +11,7 @@ Workloads (`--work`, comma-separated):
           its codegen parallelism from sched_getaffinity unless given a jobserver.
   xz      xz -T4 -3 --block-size=2MiB on 16 MB of text (perf.rs's input): four compressing threads.
   make    make -j4 of 32 generated C files and a link, from bash (fork mode only).
-  cargo   cargo build -j4 --offline of a generated 6-crate workspace (fork mode only; the cargo
-          binary crashes the sandbox today: PERF.md).
+  cargo   cargo build -j4 --offline of a generated 6-crate workspace (fork mode only).
   rustmake  the same workspace's crates by rustc under make -jN, cargo's release flags, linked by
           cc: cargo's work without cargo (fork mode only).
 
@@ -258,7 +257,7 @@ def w_cargo(a, tmp):
 
 
 def w_rustmake(a, tmp):
-    """cargo's work without cargo (its binary crashes the sandbox today: PERF.md): the workspace's
+    """cargo's work without cargo (made while cargo crashed the sandbox; kept: no cargo in it): the workspace's
     crates compiled by rustc under make -jN, the binary linked by cc."""
     w_cargo(a, tmp)  # generates the sources and rust.mk
     bash, make, cu = os.environ['EXOBOX_TEST_BASH'], os.environ['EXOBOX_TEST_MAKE'], os.environ['EXOBOX_TEST_COREUTILS']
