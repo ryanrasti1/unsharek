@@ -19,6 +19,7 @@ libc.workspace = true
 futures-io = "0.3"
 tempfile.workspace = true
 
-# escape: the hostile guest program (c/gate_probe.c)
+# escape: the hostile guest program (c/gate_probe.c); the binaries' fixed-address link
 [build-dependencies]
 cc.workspace = true
+exobox-build = { path = "../native/build" }

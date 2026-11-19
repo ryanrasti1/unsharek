@@ -36,9 +36,9 @@ tokio = { version = "1", default-features = false, optional = true }
 [features]
 tokio = ["dep:tokio"]
 
-# build.rs: the C compiler's PIE start files, for the binary's non-PIE link
+# build.rs: the binary's fixed-address link (the C compiler's PIE start files)
 [build-dependencies]
-cc.workspace = true
+exobox-build = { path = "../build" }
 
 [dev-dependencies]
 exobox-fixtures = { path = "../fixtures" }
