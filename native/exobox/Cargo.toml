@@ -26,6 +26,8 @@ thiserror.workspace = true
 seccompiler = "0.5"
 [features]
 tokio = ["exobox-kit/tokio"]
+# The runtime's measurement counters, printed at the sandbox's end (exobox-rt's src/stats.rs).
+stats = ["exobox-rt/stats"]
 
 # build.rs: the binary's fixed-address link (the C compiler's PIE start files)
 [build-dependencies]

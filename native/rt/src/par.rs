@@ -163,7 +163,7 @@ impl HostSlot {
 pub struct Threaded {
     sched: Cell<Option<&'static Sched>>,
     slots: [HostSlot; N_SLOTS],
-    owner: AtomicU32,
+    owner: crate::stats::Owner<{ KERNEL as u32 }>,
     spin: AtomicBool,
     /// Acquire-waiter FIFO (slot ids), under `spin`.
     whead: Cell<u16>,
@@ -202,7 +202,7 @@ pub static PAR: Threaded = Threaded {
         }
         a
     },
-    owner: AtomicU32::new(NONE_SLOT),
+    owner: crate::stats::Owner::new(NONE_SLOT),
     spin: AtomicBool::new(false),
     whead: Cell::new(u16::MAX),
     wtail: Cell::new(u16::MAX),
@@ -303,6 +303,7 @@ fn unlock() {
 
 /// Hand `id` the token: a write on its eventfd (its blocking read returns).
 fn poke(id: u16) {
+    crate::stats::count(crate::stats::K::Poke, 0);
     let _ = trap::eventfd_write(slot(id).efd, 1);
 }
 
@@ -314,6 +315,7 @@ fn poke(id: u16) {
 /// is the sandbox's, or it crashed on the host), nothing would hand this thread the token again,
 /// and the process ends here instead of waiting for good (holding the sandbox's stdout open).
 fn wait_token(id: u16) {
+    let _w = crate::stats::wait_token(|| PAR.owner.load(Ordering::Relaxed) != id as u32);
     wait_token_inner(id);
     // Held: not in the queue any more (a thread put back in line after a lost offer can be
     // assigned the token by a directed hand-off instead of from the queue).
@@ -400,9 +402,11 @@ pub fn acquire(id: u16) {
     let o = PAR.owner.load(Ordering::Relaxed);
     if o == id as u32 {
         unlock(); // already held (e.g. the main thread between setup syscalls)
+        crate::stats::count(crate::stats::K::AcqHeld, 0);
         return;
     }
     if o == NONE_SLOT {
+        crate::stats::count(crate::stats::K::AcqFree, 0);
         PAR.owner.store(id as u32, Ordering::Release);
         unlock();
         return;
@@ -417,6 +421,7 @@ pub fn acquire(id: u16) {
     }
     PAR.wtail.set(id);
     unlock();
+    let _c = crate::stats::contended(owner == KERNEL);
     poke(owner);
     wait_token(id);
 }
@@ -521,6 +526,7 @@ fn sched_loop(arg: usize) -> usize {
         }
         if id != KERNEL {
             // A program thread with nothing to run: give the token away, wait for it back.
+            crate::stats::count(crate::stats::K::SchedIdle, 0);
             give(id, true);
             wait_token(id);
             continue;
@@ -604,7 +610,8 @@ fn sched_loop(arg: usize) -> usize {
             let ns = d.saturating_sub(s.now());
             Timespec { tv_sec: (ns / 1_000_000_000) as i64, tv_nsec: (ns % 1_000_000_000) as i64 }
         });
-        if trap::ppoll_fds(&mut fds[..n], ts.as_ref()).is_ok_and(|r| r > 0) {
+        let polled = crate::stats::time(crate::stats::K::KernelPpoll, || trap::ppoll_fds(&mut fds[..n], ts.as_ref()));
+        if polled.is_ok_and(|r| r > 0) {
             if fds[0].revents != 0 {
                 let _ = trap::eventfd_read(h.efd);
             }
@@ -848,6 +855,7 @@ pub fn alt_stack(id: u16) -> (usize, usize) {
 /// `stack_top` is 16-aligned private memory below `frame`, free; `frame` is a valid frame whose
 /// registers start the child.
 pub unsafe fn host_fork(stack_top: usize, flags: u64, frame: usize) -> isize {
+    let _t = crate::stats::timed(crate::stats::K::Fork, 0); // the parent's: the child doesn't return
     // SAFETY: the caller's.
     unsafe { fork_trampoline(stack_top, flags, frame) }
 }

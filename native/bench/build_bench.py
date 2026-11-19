@@ -20,8 +20,9 @@ binary (an experiment's build) in that mode, for A/B comparisons in one interlea
 runs every mode once, in order, so load from other processes on the machine hits all of them
 alike; min, median and the paired (same-rep) ratio to native are reported.
 
-`--exobox PATH` runs another exobox binary (an instrumented one: native/bench/instrumented);
-its `EXOBOX_STATS` lines (stderr) are kept in the log and summarised.
+`--exobox PATH` runs another exobox binary. `--variant stats` (no path) is the runtime's counters
+(the cargo feature `stats`, built by native/bench/run): its `EXOBOX_STATS` lines (stderr) are kept
+in the log and summarised.
 """
 
 import argparse
@@ -279,7 +280,7 @@ FORK_ONLY = {'make', 'cargo', 'rustmake'}
 
 
 def parse_stats(err):
-    """EXOBOX_STATS lines (an instrumented build's) into a dict."""
+    """EXOBOX_STATS lines (the `stats` build's) into a dict."""
     st = {'k': {}, 'sys': {}}
     for line in err.splitlines():
         if not line.startswith('EXOBOX_STATS '):
@@ -293,6 +294,12 @@ def parse_stats(err):
         else:
             st.setdefault('top', {}).update(kv)
     return st
+
+
+def parse_variants(vs):
+    """`--variant NAME=PATH`s into {NAME: PATH}. A NAME alone is target/release/exobox-NAME: `stats`,
+    the runtime's counters (the cargo feature `stats`), which native/bench/run builds there."""
+    return {n: p or os.path.join(ROOT, 'target', 'release', 'exobox-' + n) for n, _, p in (v.partition('=') for v in vs)}
 
 
 def main():
@@ -314,7 +321,7 @@ def main():
     ap.add_argument('--log', default=None, help='JSON lines, one per run')
     ap.add_argument('--tmp', default=None, help='work directory (default: a fresh one)')
     a = ap.parse_args()
-    variants = dict(v.split('=', 1) for v in a.variant)
+    variants = parse_variants(a.variant)
     tmp = a.tmp or tempfile.mkdtemp(prefix='exobox-bench-')
     os.makedirs(tmp, exist_ok=True)
     log = open(a.log, 'a') if a.log else None
@@ -417,7 +424,7 @@ def summarize(st, wall):
     print(f'  arena: zeroed {g("zero", "bytes") / 2**20:.0f} MiB in {g("zero") / 1e3:.1f} ms; '
           f'file maps copied {g("file_copy", "bytes") / 2**20:.0f} MiB in {g("file_copy") / 1e3:.1f} ms; '
           f'mremap copied {g("mremap_copy", "bytes") / 2**20:.0f} MiB in {g("mremap_copy") / 1e3:.1f} ms; '
-          f'released {g("release", "bytes") / 2**20:.0f} MiB; exec loads {g("exec", "n"):.0f} in {g("exec") / 1e3:.1f} ms')
+          f'exec loads {g("exec", "n"):.0f} in {g("exec") / 1e3:.1f} ms')
     tot = sum(v['n'] for v in st['sys'].values())
     print(f'  trapped syscalls: {tot:.0f} ({tot / (wall_us / 1e6):.0f}/s). Top by time in the dispatcher:')
     for nr, v in sorted(st['sys'].items(), key=lambda x: -x[1]['us'])[:12]:

@@ -17,6 +17,10 @@ lkl-sys = { path = "../lkl-sys" }
 # exec: the ELF file and program headers, read in place from fixed buffers (no allocation)
 object = { version = "0.40", default-features = false, features = ["read_core", "elf"] }
 
+[features]
+# The measurement counters (src/stats.rs), compiled out without it.
+stats = []
+
 [dev-dependencies]
 # fork and waitpid for the filter's real-kernel test; struct layouts and constants checked
 # against glibc's x86-64 ABI (sysmap, xabi)

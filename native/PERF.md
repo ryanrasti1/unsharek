@@ -2,8 +2,9 @@
 
 Goal: parallel builds (Rust and C, `-j4`) within 5% of native wall time. This is the measurement
 and analysis that comes first: what each mode costs on real build workloads, where that time goes,
-and what each candidate fix would buy. Nothing in the runtime was changed for it; the counters and
-the experiments below were built in a scratch copy of the tree (`native/bench/instrumented`).
+and what each candidate fix would buy. Nothing in the runtime was changed for it; the experiments
+below were built in a scratch copy of the tree (since deleted: each landed as a fix or was
+rejected), and the counters are the runtime's cargo feature `stats`.
 
 Measured 2026-11-18 on main `6d3364f` (fork mode merged, kernel `35f3326`) and re-measured on
 `92def71` (the full-pipe fix, kernel `ba96290`: the table below), release builds.
@@ -153,7 +154,8 @@ paired ratios, not single numbers.
 ```sh
 native/bench/run --work rustc,xz --modes native,coroutine,threaded --reps 3
 native/bench/run --work make,rustmake --modes native,fork --reps 3 --perf $(command -v perf)
-native/bench/run --work rustc,make --modes native,fork,fork:a --variant a=$(native/bench/instrumented /tmp/x aff8)
+native/bench/run --work rustc,make --modes native,fork,fork:stats --variant stats   # the counters
+native/bench/run --work rustc --modes native,fork,fork:a --variant a=/path/to/another/exobox
 ```
 
 Per run: wall time, CPU time across every process (`perf stat` task-clock; `wait4`'s rusage misses
@@ -164,16 +166,18 @@ has them. JSON lines with `--log`. Workloads: `rustc` (regex-syntax 0.8 from `~/
 a chain of dependencies, and a binary, `-C opt-level=3 -C codegen-units=16`, linked by cc), `cargo`
 (the same workspace, `cargo build -j4 --release`; blocked by the crash). Every run has a timeout.
 
-**Counters** (`native/bench/stats/`: `stats.rs`, a cargo feature `stats`, spliced into a scratch
-copy by `apply.py`; nothing in `native/rt` changed). TSC-based, relaxed atomics in the shared
-section (so fork mode's processes add into one set), printed at the sandbox's end:
-per trapped syscall number, calls and cycles in the dispatcher and how much of that was waiting for
-the token; token acquires (free / contended / found the idler holding it), cycles each holder kept
-it, hand-offs and their latency (owner set → the new owner running), eventfd waits; time inside
-`lkl_syscall`; scheduler switches; arena clearing and copies (bytes, cycles); exec loads; host forks.
-Overhead: the instrumented binary's walls match the plain one's within noise.
+**Counters** (`native/rt/src/stats.rs`, the cargo feature `stats`: one-line calls where each event
+happens, compiled out without it; `--variant stats` builds it as `target/release/exobox-stats`;
+earlier, the same counters were spliced into a scratch copy by a script). TSC-based, relaxed atomics
+in the shared section (so fork mode's processes add into one set), printed at the sandbox's end: per
+trapped syscall number, calls and cycles in the dispatcher and how much of that was waiting for the
+token; token acquires (free / contended / found the idler holding it), cycles each holder kept it,
+hand-offs and their latency (owner set → the new owner running), eventfd waits; time inside
+`lkl_syscall`; scheduler switches; arena clearing and copies (bytes, cycles); exec loads; host
+forks. Overhead: the instrumented binary's walls match the plain one's within noise.
 
-**Experiments** (same scratch copy, `native/bench/instrumented DIR aff8 idler spin`):
+**Experiments** (scratch patches over the instrumented copy, deleted since: `aff8` became fix 1's
+CPU count, `idler` fix 6, `spin` was rejected):
 `aff8` (sched_getaffinity reports 8 CPUs), `idler` (the kernel idler sleeps without the token, and
 a return to user mode hands the token to it only when a timer is due), `spin` (a token waiter spins
 ~20 µs before blocking).

@@ -284,6 +284,7 @@ pub unsafe fn boot(b: Boot) -> Result<(), Error> {
     // SAFETY: the caller's regions and thread.
     unsafe {
         SCHED.init(Config { stacks: b.stacks, switch_fs: true, host: &SYS }).map_err(err("coroutine stacks"))?;
+        crate::stats::start(|| SCHED.now());
         host::install(&SCHED, b.heap.0, b.heap.1);
         crate::executor::install(&SCHED);
         let table: &'static mut [Extent] = &mut ARENA_TABLE.get()[..];
@@ -547,6 +548,7 @@ const NR_EXIT_GROUP: usize = 231;
 /// Open, check and map a program, and build its stack. With `replace`, the old image (the whole
 /// arena) is dropped first, once nothing can fail any more short of memory: the guest's execve.
 fn load(path: &[u8], argv: &[&[u8]], envp: &[&[u8]], replace: bool) -> Result<Registers, Errno> {
+    let _t = crate::stats::timed(crate::stats::K::Exec, 0);
     let aux = S.aux.get();
     let mut g = Guest;
     // SAFETY: the loader's scratch is used only here, once.
@@ -808,6 +810,7 @@ fn lkl_call(nr: c_long, a: [usize; 6]) -> isize {
         debug_assert_eq!(r, 0, "attach_thread({tid})");
     }
     let mut p = a.map(|v| v as c_long);
+    let _t = crate::stats::timed(crate::stats::K::Lkl, 0);
     // SAFETY: the kernel runs; the arguments are the program's (LKL reads its pointers) or ours.
     unsafe { l::lkl_syscall(nr, p.as_mut_ptr()) as isize }
 }
@@ -935,6 +938,7 @@ fn clone(uc: &Ucontext, a: [usize; 6]) -> Result<usize, Errno> {
 /// ends, and as the guest's: its exit_group, whose status its parent waits for (`task_exit` then
 /// ends the host process).
 fn finish(code: i32) -> ! {
+    crate::stats::report(|| SCHED.now(), || (S.phase.get() == Phase::Program).then(|| with_arena(|a, _| a.stats())));
     if par::forked() {
         lkl_call(l::__lkl__NR_exit_group, [code as usize, 0, 0, 0, 0, 0]);
     }
@@ -1600,6 +1604,7 @@ fn dispatch(uc: &mut Ucontext) {
         _ => return crate::passthrough::serve(uc),
     }
     let (nr, a) = uc.syscall();
+    let s = crate::stats::syscall(nr);
     if par::enabled() {
         // Threaded mode: hold the CPU token while serving (the kernel, the scheduler, the futexes
         // and the arena are shared). A call that blocks releases and reclaims it inside the
@@ -1611,6 +1616,7 @@ fn dispatch(uc: &mut Ucontext) {
         return;
     }
     served(uc, nr, a);
+    s.end();
     // No preemption here: a thread whose calls never block (a poll with timeout 0 in a loop)
     // would keep every other coroutine from running, a new thread among them (it isn't the
     // kernel's to schedule until its first call attaches it). So every so many calls, the others
