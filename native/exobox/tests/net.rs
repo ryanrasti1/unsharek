@@ -378,8 +378,9 @@ fn provider() -> (OnConnect, OnResolve, OnListen) {
 }
 
 /// The child: a sandbox for argv (`ARGV`), with the provider (`provider`; `provider_user`: and
-/// the guard drops init to uid/gid 1000), the name-based one (`named`), none (`nohooks`), or fd 3
-/// passed as fd 1000 (`passfd`).
+/// the guard drops init to uid/gid 1000), the name-based one (`named`), or fd 3 passed as fd 1000
+/// (`passfd`). (A sandbox with no hooks is the CLI's: its unreachable network and loopback are
+/// guest-tests' net::unreachable and net::tcp_loopback.)
 fn child(kind: &str) -> ! {
     let argv: Vec<OsString> = std::env::var(ARGV).unwrap().split('\x1f').map(OsString::from).collect();
     let mut b = exobox::Sandbox::builder();
@@ -617,9 +618,7 @@ fn main() {
     case("net_refused", "provider", net("refused", &["10.0.0.66", &echo]), "NET_REFUSED_OK");
     case("net_denied", "provider", net("denied", &["10.0.0.67", &echo]), "NET_DENIED_OK");
     case("net_reset", "provider", net("reset", &["10.0.0.68", &echo]), "NET_RESET_OK");
-    case("net_unreachable", "nohooks", net("unreachable", &["10.0.0.1", &echo]), "NET_UNREACHABLE_OK");
     case("net_loopback", "provider", net("loopback", &[]), "NET_LOOPBACK_OK");
-    case("net_loopback_nohooks", "nohooks", net("loopback", &[]), "NET_LOOPBACK_OK");
     case(
         "net_resolve",
         "provider",

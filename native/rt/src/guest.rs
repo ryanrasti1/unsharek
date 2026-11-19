@@ -1364,7 +1364,7 @@ pub fn program_runs() -> bool {
 /// holding the CPU token). A panic that left the guest mid-change (in a clone, after the new
 /// thread's guest task was made) hung every mode: the guest's SIGABRT ended the panicking
 /// thread's task but never its process, whose new task would never run to end, and the sandbox
-/// waited for good (runtime_panic.c's `clone`; exec_thread_main.c's panic found it).
+/// waited for good (runtime_panic.c's `clone`; guest-tests' exec_then_threads's panic found it).
 pub fn runtime_panic(info: &dyn core::fmt::Display) -> ! {
     struct Buf {
         b: [u8; 1024],

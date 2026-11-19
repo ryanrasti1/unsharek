@@ -1,7 +1,10 @@
-//! The regression suite: one table of cases (`cases()`), each run natively (which checks the test
-//! itself) and under `exobox run` in every mode it names. A run is a trial named
+//! The host-side regression suite: one table of cases (`cases()`), each a program run natively
+//! (which checks the test itself) and under `exobox run` in every mode it names, and checked from
+//! the host: its exit status or signal, its stdio (input given, output read late), its CPU time,
+//! files on the host, the CLI's flags, programs from nixpkgs. A run is a trial named
 //! `<case>::<native|coroutine|threaded|fork>`, with a timeout and an optional CPU budget, so
-//! `cargo nextest run -E 'test(/::fork$/)'` runs one mode and a hang fails in seconds.
+//! `cargo nextest run -E 'test(/::fork$/)'` runs one mode and a hang fails in seconds. What a
+//! program observes inside the guest is native/guest-tests' (Rust #[test]s, a sandbox each).
 
 use std::io::Write;
 use std::os::unix::process::ExitStatusExt;
@@ -182,28 +185,8 @@ fn group_exit(name: &'static str, waiters: &'static str, how: &'static str, st: 
 
 fn cases() -> Vec<Case> {
     let mut c = vec![
-        // Basics, in every mode.
-        fixture("hello", ALL),
-        fixture("shmap", ALL),
-        case("sleepy", Prog::Fixture("sleepy"), ALL, ok("SLEEP_OK")),
-        fixture("threadpoll", ALL),
-        fixture("thread_fds", ALL),
-        fixture("futex_wake", ALL),
-        fixture("small_stack", ALL),
-        fixture("stdio_meminfo", ALL),
-        fixture("sigsys", ALL),
-        // Bad pointers to a call LKL serves: EFAULT, not a fault in the sandbox (cargo).
-        fixture("statx_probe", ALL),
-        // Handlers run as the program (item 8); its fork steps only where there are processes.
-        fixture("signals", ALL),
-        fixture("gsbase", ALL),
-        // The guest kernel's clock is the host's (a new file's mtime, a raw clock_gettime).
-        fixture("clock", ALL),
-        // /dev's nodes are 0666: a user that isn't root writes /dev/null.
-        fixture("devnodes", ALL),
+        // An idle sandbox's host CPU (the guest's own accounting doesn't see the host's spin).
         Case { cpu_budget: Some(Duration::from_millis(100)), ..fixture("idle", ALL) },
-        // JITs work with no flag: W^X would be hardening of the program, not the sandbox's.
-        fixture("rwx", ALL),
         // How a run ends.
         case("exit_code", Prog::Fixture("exit_status"), ALL, status(Status::Code(42)))
             .args(vec![Arg::Lit("exit42")]),
@@ -267,7 +250,6 @@ fn cases() -> Vec<Case> {
             .args(vec![Arg::Fixture("libplug.so"), Arg::Denied("libplug.so")])
             .native(Some(ok("DENIED_LOADED"))),
         // Fork mode.
-        fixture("fork", FORK),
         // Init's end is the sandbox's: a child waiting in pause() doesn't outlive it on the host.
         fixture("fork_ends", FORK).args(vec![Arg::Lit("init_exit")]).native(None),
         // A child's death on the host (the filter's kill) is the sandbox's, by the same signal.
@@ -279,17 +261,6 @@ fn cases() -> Vec<Case> {
         )
         .args(vec![Arg::Lit("child_killed")])
         .native(None),
-
-        fixture("forkthreads", FORK),
-        // Exec's kernel half: close-on-exec fds, handlers reset, the other threads ended.
-        fixture("exec_reset", ALL),
-        fixture("exec_reset", ALL).renamed("exec_reset_threads").args(vec![Arg::Lit("threads")]),
-        // An exec from a thread while the main thread waits, then a new image that makes threads
-        // (threaded and fork mode freed the scheduler's stackless root at the main thread's end,
-        // and the runtime panicked at the new image's first thread, then hung). The main thread
-        // in libtest's timed futex wait, and in exec_reset's pause.
-        fixture("exec_thread_main", ALL).renamed("exec_thread_main_timed").args(vec![Arg::Lit("timed")]),
-        fixture("exec_thread_main", ALL).renamed("exec_thread_main_pause").args(vec![Arg::Lit("pause")]),
         // A panic in the runtime ends the sandbox at once, by SIGABRT (it hung in threaded and
         // fork mode): the debug build's test hook, from the main thread, from another, and in a
         // thread's clone (the guest left mid-change).
@@ -352,9 +323,7 @@ fn cases() -> Vec<Case> {
                 .renamed("stdout_full_child_block")
                 .args(vec![Arg::Lit("child"), Arg::Lit("block")])
         },
-        fixture("fork_rng", FORK),
-        fixture("settid", FORK),
-        // The pipeline that found settid's bug: a C++ program on a pipeline's left side, in a
+        // The pipeline that found guest-tests' process::settid's bug: a C++ program on a pipeline's left side, in a
         // bash exec'd in the guest (it failed ~5 runs in 6 in capnix tier A).
         case(
             "pipeline_cpp",

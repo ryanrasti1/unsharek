@@ -9,7 +9,6 @@
 //   names IP PORT         getpeername is the address connected to, getsockname AF_INET, a port
 //   refused IP PORT       ECONNREFUSED (the provider's Refused)
 //   denied IP PORT        EACCES (Denied)
-//   unreachable IP PORT   ENETUNREACH (no hooks)
 //   reset IP PORT         the provider's stream fails: the next read is ECONNRESET
 //   loopback              a server of the guest's own on 127.0.0.1: still the guest's
 //   resolve NAME IP NX DENIED   getaddrinfo: NAME is IP (no IPv6 address); NX has none
@@ -273,8 +272,6 @@ int main(int argc, char **argv)
 		fails(a, ECONNREFUSED);
 	else if (!strcmp(c, "denied"))
 		fails(a, EACCES);
-	else if (!strcmp(c, "unreachable"))
-		fails(a, ENETUNREACH);
 	else if (!strcmp(c, "reset"))
 		reset(a);
 	else if (!strcmp(c, "loopback"))

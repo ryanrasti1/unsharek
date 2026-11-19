@@ -816,7 +816,7 @@ impl Sched {
             // The root has no stack of its own (it ran on the host thread's: `stack_hi` is 0), so
             // it is never handed out again. Threaded mode frees it when the main thread ends (an
             // exec from another thread ends it); on the free list it became a later coroutine,
-            // made on a stack at 0 (`Context::new` overflowed: exec_thread_main.c).
+            // made on a stack at 0 (`Context::new` overflowed: guest-tests' exec_then_threads).
             self.live.set(self.live.get() - 1);
             return;
         }

@@ -2,8 +2,9 @@
 // threaded and fork mode: std's panic wrote its message and made its abort's tgkill as guest
 // calls, served by the runtime that had panicked (mid-call, holding the CPU token). When the
 // panic had left the guest mid-change (a thread's guest task made, its host thread not: the panic
-// exec_thread_main.c found), the guest's SIGABRT ended the panicking thread's task but never the
-// process, whose other task never runs; that host thread exited and the idler polled for good.
+// guest-tests' exec_then_threads found), the guest's SIGABRT ended the panicking thread's task but
+// never the process, whose other task never runs; that host thread exited and the idler polled
+// for good.
 //   runtime_panic main    the runtime's test hook (a call debug builds panic on: guest.rs's
 //                         TEST_PANIC), from the main thread
 //   runtime_panic thread  the same from a second thread, the main one waiting in a timed futex
