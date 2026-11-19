@@ -41,6 +41,7 @@ impl Mode {
 
 const ALL: &[Mode] = &[Mode::Coroutine, Mode::Threaded, Mode::Fork];
 const FORK: &[Mode] = &[Mode::Fork];
+const THREADED_FORK: &[Mode] = &[Mode::Threaded, Mode::Fork];
 const SIGSYS: i32 = 31;
 
 enum Prog {
