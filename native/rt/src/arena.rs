@@ -1122,6 +1122,7 @@ impl<'t> Arena<'t> {
     }
 
     fn fill<B: Backing>(b: &mut B, f: FileMap, lo: usize, len: usize) -> Result<()> {
+        let _t = crate::stats::timed(crate::stats::K::FileCopy, len);
         let mut done = 0;
         while done < len {
             match b.read(f.file, f.offset + done as u64, lo + done, len - done)? {
@@ -1190,6 +1191,7 @@ impl<'t> Arena<'t> {
 /// # Safety
 /// The range is mapped read/write, page-aligned.
 unsafe fn zero_nonzero(addr: usize, len: usize) -> usize {
+    let _t = crate::stats::timed(crate::stats::K::Zero, 0);
     let mut written = 0;
     for p in (addr..addr + len).step_by(PAGE) {
         // SAFETY: the caller's.
@@ -1198,6 +1200,7 @@ unsafe fn zero_nonzero(addr: usize, len: usize) -> usize {
             written += PAGE;
         }
     }
+    crate::stats::bytes(crate::stats::K::Zero, written);
     written
 }
 
@@ -1207,6 +1210,7 @@ unsafe fn zero_nonzero(addr: usize, len: usize) -> usize {
 /// # Safety
 /// Both ranges mapped read/write, page-aligned, disjoint.
 unsafe fn copy_nonzero(dst: usize, src: usize, len: usize) {
+    let _t = crate::stats::timed(crate::stats::K::MremapCopy, len);
     for off in (0..len).step_by(PAGE) {
         // SAFETY: the caller's.
         if unsafe { !page_is_zero(src + off) } {

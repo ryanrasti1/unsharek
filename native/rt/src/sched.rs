@@ -791,6 +791,7 @@ impl Sched {
             return;
         }
         self.current.set(next);
+        crate::stats::count(crate::stats::K::Switch, 0);
         let from = self.slots[prev as usize].ctx.get();
         let to = self.slots[next as usize].ctx.get();
         // SAFETY: `next` was suspended by a switch or freshly made; `prev` is us.

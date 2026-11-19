@@ -3,11 +3,13 @@
 # runs. Arguments go to build_bench.py, e.g.:
 #   native/bench/run --work rustc,xz --modes native,coroutine,threaded --reps 3
 #   native/bench/run --work make,cargo --modes native,fork
-#   native/bench/run --exobox /path/to/instrumented/exobox ...   (native/bench/instrumented)
+#   native/bench/run --work rustc --modes native,fork,fork:stats --variant stats   (the counters)
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck source=../../devshell.sh
 source "$root/devshell.sh"
 cd "$root"
-cargo build --release -q -p exobox --bin exobox
+# shellcheck source=build_exobox.sh
+source "$root/native/bench/build_exobox.sh"
+build_exobox "$@"
 exec python3 "$root/native/bench/build_bench.py" "$@"

@@ -34,6 +34,8 @@ tokio = { version = "1", default-features = false, optional = true }
 
 [features]
 tokio = ["dep:tokio"]
+# The runtime's measurement counters, printed at the sandbox's end (exobox-rt's src/stats.rs).
+stats = ["exobox-rt/stats"]
 
 # build.rs: the binary's fixed-address link (the C compiler's PIE start files)
 [build-dependencies]

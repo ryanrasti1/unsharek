@@ -11,6 +11,7 @@ small versions here were checked to show the same ratios (PERF.md, "The vs-nativ
   ./test --vs-native --modes fork --work make,micro
   ./test --vs-native --exobox PATH         another exobox binary (an experiment's)
   ./test --vs-native --modes fork,fork:old --variant old=PATH   before and after, interleaved
+  ./test --vs-native --modes fork,fork:stats --variant stats     the runtime's counters' build
 
 Workloads: rustc (a generated crate, -C codegen-units=16 --emit=obj: rustc's threads),
 rustmake (4 generated crates and a binary by rustc under make -j4: processes and threads), make
@@ -162,7 +163,8 @@ def main():
     ap.add_argument('--cpus', default=os.environ.get('BENCH_CPUS', '0-7'))
     ap.add_argument('--exobox', default=os.path.join(bb.ROOT, 'target', 'release', 'exobox'))
     ap.add_argument('--variant', action='append', default=[], metavar='NAME=PATH',
-                    help='another exobox binary; a mode MODE:NAME runs it (before/after in one run)')
+                    help='another exobox binary; a mode MODE:NAME runs it (before/after in one run); '
+                    '`stats` alone: the counters\' build')
     ap.add_argument('--timeout', type=float, default=60)
     ap.add_argument('--no-fail', action='store_true', help='report only: exit 0 whatever the ratios')
     ap.add_argument('--tmp', default=os.path.join(bb.ROOT, 'target', 'vs-native'))
@@ -170,7 +172,7 @@ def main():
     os.makedirs(a.tmp, exist_ok=True)
     works = [w for w in a.work.split(',') if w]
     modes = [m for m in a.modes.split(',') if m]
-    variants = dict(v.split('=', 1) for v in a.variant)
+    variants = bb.parse_variants(a.variant)
 
     def mode_of(m):
         return m.partition(':')[0]
@@ -184,9 +186,13 @@ def main():
     walls = {}   # (work, mode) -> [s]
     micro = {}   # (op, mode) -> [value]
     failed = []
+    counters = {}  # what -> the last run's EXOBOX_STATS (the `stats` build's)
 
     def go(cmd, env, what):
         st, wall, _, _, out, err, _ = bb.run(cmd, a.timeout, env=env, cpus=cpus)
+        stats = bb.parse_stats(err)
+        if stats['k']:
+            counters[what] = (stats, wall)
         if st != 0:
             failed.append(f'{what}: status {st}: {err.strip()[-300:]}')
             return None, out
@@ -243,6 +249,9 @@ def main():
             continue
         row(w, walls.get((w, 'native')), {m: walls.get((w, m)) for m in modes}, 's')
     print(f'(best of {a.reps}: builds by wall time, micro costs by median; pinned to CPUs {a.cpus})')
+    for what, (stats, wall) in counters.items():
+        print(f'\n{what}: counters of the last run')
+        bb.summarize(stats, wall)
     for f in failed:
         print('RUN FAILED: ' + f)
     if failed or (over and not a.no_fail):

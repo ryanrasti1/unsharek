@@ -33,6 +33,7 @@ pub mod par;
 pub mod passthrough;
 pub mod sched;
 pub mod share;
+pub mod stats;
 pub mod sync;
 pub mod sysmap;
 pub mod trap;
