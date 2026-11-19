@@ -6,7 +6,7 @@ For every `#[seccomp]` function `f(d: &SeccompData, params…) -> u32`, the prog
   (a) for every call `d` (every syscall number, arch, instruction pointer and argument)
   (b) for every value of `params` (the integer params symbolic; one proof per combination of the bool and enum params)
 
-This is proven by [Kani](https://github.com/model-checking/kani): `#[seccomp]` emits the harness, which asserts `run_bpf(&f_bpf(params), &d) == f(&d, params)` with `d` and `params` from `kani::any()`.
+This is proven by [Kani](https://github.com/model-checking/kani): `#[seccomp]` emits the harnesses, which assert `run_bpf(&f_bpf(params), &d) == f(&d, params)` with `d` and the integer params from `kani::any()`, one harness per combination of the bool and enum params' values (each param's `Sample` list, itself proven complete).
 
 ```rust
 // seccomp-fn/src/examples.rs, `readme::policy`
@@ -25,14 +25,14 @@ The function is kept as written: the proof is about it, not a copy. Constants ar
 
 The claim then rests on:
 - `run_bpf` (`src/bpf.rs`) being classic BPF as the kernel's seccomp runs it: checked against Linux, by installing programs in forked children and comparing verdicts (`tests/kernel.rs`), with argument values whose 32-bit halves differ
-- the harness: every input and param symbolic, the unwind bound exact (Kani fails an unwinding assertion rather than pass a short bound)
+- the harnesses: `d` and the integer params symbolic, every bool and enum value covered; the unwind bound an upper bound on the program's length (Kani fails an unwinding assertion rather than pass a short bound)
 - Toolchain correctness:
   - `rustc`
   - Kani and CBMC
   - `libc` (opcodes, `seccomp_data`'s layout)
 
 ## The subset (v0)
-- `if`/`else`, early `return`, `match` on a field of `d` (`|` patterns, guards, `_`), `let` of param-only values
+- `if`/`else`, early `return`, `match` on `d.nr` (or `d.nr as i64`, so libc's `SYS_*` are patterns as they are; `|` patterns, guards, `_`), `let` of param-only values
 - `==`, `!=`, `<`, `<=`, `>`, `>=` between a field of `d` and a value not involving `d`; `&&`, `||`, `!`
 - params: unsigned integers, `bool`, fieldless enums; comparisons are full-width and unsigned (BPF's)
 

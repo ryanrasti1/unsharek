@@ -18,8 +18,25 @@
     },
     "root": {
       "inputs": {
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "seccomp-fn": "seccomp-fn"
       }
+    },
+    "seccomp-fn": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "path": "./seccomp-fn",
+        "type": "path"
+      },
+      "original": {
+        "path": "./seccomp-fn",
+        "type": "path"
+      },
+      "parent": []
     }
   },
   "root": "root",
