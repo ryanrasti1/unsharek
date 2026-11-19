@@ -43,7 +43,7 @@ pub struct Timespec {
 }
 
 impl Timespec {
-    fn to_ns(self) -> Result<u64, Errno> {
+    pub fn to_ns(self) -> Result<u64, Errno> {
         if self.tv_sec < 0 || !(0..1_000_000_000).contains(&self.tv_nsec) {
             return Err(Errno::INVAL);
         }

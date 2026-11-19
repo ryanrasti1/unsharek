@@ -1985,12 +1985,27 @@ fn futex_call(a: [usize; 6]) -> isize {
         return -(Errno::FAULT.raw_os_error() as isize);
     }
     let cmd = op & !(futex::FUTEX_PRIVATE_FLAG | futex::FUTEX_CLOCK_REALTIME);
+    let (mut op, mut val3) = (op, val3);
     let mut ts = None;
     if (cmd == futex::FUTEX_WAIT || cmd == futex::FUTEX_WAIT_BITSET) && tp != 0 {
         match read_user::<futex::Timespec>(tp) {
             Ok(t) => ts = Some(t),
             Err(e) => return -(e.raw_os_error() as isize),
         }
+    }
+    // A relative timeout made absolute once (FUTEX_WAIT_BITSET on CLOCK_MONOTONIC, any bit): a
+    // wait woken for nothing below waits again until the same deadline. (It returned 0 instead,
+    // and a timed wait came back after ~1 ms, its timeout cut short by whatever woke it: three
+    // 60 ms waits returned at 0.2-1 ms. glibc's loops hide it; std's Condvar::wait_timeout
+    // doesn't: guest-tests' threads::futex_timeout.)
+    if cmd == futex::FUTEX_WAIT
+        && let Some(t) = ts
+    {
+        let Ok(rel) = t.to_ns() else { return -(Errno::INVAL.raw_os_error() as isize) };
+        let d = SCHED.now().saturating_add(rel);
+        ts = Some(futex::Timespec { tv_sec: (d / 1_000_000_000) as i64, tv_nsec: (d % 1_000_000_000) as i64 });
+        op = futex::FUTEX_WAIT_BITSET | (op & futex::FUTEX_PRIVATE_FLAG);
+        val3 = futex::FUTEX_BITSET_MATCH_ANY;
     }
     loop {
         // A wait of the runtime's own, not the kernel's: a group exit, an exec's kill or a signal
@@ -2004,9 +2019,9 @@ fn futex_call(a: [usize; 6]) -> isize {
             return ret(r);
         }
         // Ask the kernel: one call, at whose start a killed task ends (the task_exit host op) and
-        // at whose return a caught signal's handler runs. Neither: nothing for this thread, and an
-        // untimed wait on an unchanged word waits again (the wake is invisible); otherwise a
-        // wakeup for nothing, which a futex wait may return (0). A handler ran: EINTR, as Linux's
+        // at whose return a caught signal's handler runs. Neither: nothing for this thread, and a
+        // wait on an unchanged word waits again (the wake is invisible; a timed one to its
+        // deadline); otherwise a wakeup for nothing, which a futex wait may return (0). A handler ran: EINTR, as Linux's
         // (or the wait again, for an untimed wait under SA_RESTART: Linux's -ERESTARTSYS).
         let t = cur();
         let before = t.handled.get();
@@ -2015,7 +2030,7 @@ fn futex_call(a: [usize; 6]) -> isize {
             // SAFETY: program memory (checked), 4-aligned (futex checked), read atomically.
             let now = unsafe { core::sync::atomic::AtomicU32::from_ptr(uaddr as *mut u32) }
                 .load(core::sync::atomic::Ordering::SeqCst);
-            if ts.is_none() && now == val {
+            if now == val {
                 continue;
             }
             return 0;

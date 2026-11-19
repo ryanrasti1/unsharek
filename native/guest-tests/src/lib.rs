@@ -93,24 +93,28 @@ macro_rules! group {
 #[macro_export]
 macro_rules! all {
     (native) => { $crate::all!(@one [] []); $crate::all!(@processes); };
-    (coroutine) => { $crate::all!(@one [ignore = "guest: a timed FUTEX_WAIT returns 0 early"] []); };
+    (coroutine) => {
+        $crate::all!(@one [ignore = "guest: coroutine mode's timers interrupt the runtime's waits at every tick (CPU while idle)"] []);
+    };
     (threaded) => {
-        $crate::all!(@one [ignore = "guest: a timed FUTEX_WAIT returns 0 early"]
+        $crate::all!(@one []
             [ignore = "guest: threaded/fork exec from a thread panics the runtime"]);
     };
     (fork) => {
-        $crate::all!(@one [ignore = "guest: a timed FUTEX_WAIT returns 0 early"]
+        $crate::all!(@one []
             [ignore = "guest: threaded/fork exec from a thread panics the runtime"]);
         $crate::all!(@processes);
     };
-    // `futex`: the attributes of the tests a timed futex wait's early return breaks (every mode:
-    // FUTEX_WAIT with a timeout returns 0 after ~1 ms). `exec`: of exec_reset, which in threaded
+    // `idle`: of idle_cpu, over its CPU budget in coroutine mode (120 ms for 300 ms of sleeps): every
+    // guest timer's firing interrupts the runtime's own waits (`host::timer_fired`, in case it sent
+    // a signal), a waiter's check is a call into the kernel, which restarts the tick: a timed futex
+    // wait spins at the tick's rate until its deadline. `exec`: of exec_reset, which in threaded
     // and fork mode panics the runtime (native/rt/src/context.rs:62, a subtraction's overflow)
     // after an exec from libtest's test thread while its main thread waits, and the sandbox hangs.
-    (@one [$($futex:meta)*] [$($exec:meta)*]) => {
+    (@one [$($idle:meta)*] [$($exec:meta)*]) => {
         $crate::group!(files: file_rw, dirs, shmap, statx_probe, devnodes);
         $crate::group!(memory: big_alloc, rwx, small_stack, gsbase);
-        $crate::group!(threads: thread_fds, futex_wake, std_sync, sleepy, threadpoll, $(#[$futex])* futex_timeout);
+        $crate::group!(threads: thread_fds, futex_wake, std_sync, sleepy, threadpoll, futex_timeout);
         $crate::group!(signals:
             handler_at_raise, blocked_pending, kill_process, sigqueue_info, timer_eintr, altstack,
             sa_restart, longjmp_out, nested_and_vector_regs, thread_in_waits, every_signal, sigsys,
@@ -121,7 +125,7 @@ macro_rules! all {
         $crate::group!(time: clock);
         $crate::group!(exec: $(#[$exec])* exec_reset);
         $crate::group!(host_side:
-            $(#[$futex])* idle_cpu,
+            $(#[$idle])* idle_cpu,
             #[should_panic(expected = "boom")] should_panic,
             // Run by hand (--run-ignored only) to see how failures look.
             #[ignore] demo_assert_fails,
