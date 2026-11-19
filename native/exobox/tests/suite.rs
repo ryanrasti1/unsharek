@@ -38,6 +38,7 @@ impl Mode {
 
 const ALL: &[Mode] = &[Mode::Coroutine, Mode::Threaded, Mode::Fork];
 const FORK: &[Mode] = &[Mode::Fork];
+const PARALLEL: &[Mode] = &[Mode::Threaded, Mode::Fork];
 const SIGSYS: i32 = 31;
 
 enum Prog {
@@ -348,6 +349,10 @@ fn cases() -> Vec<Case> {
                 ])
                 .uses(&["EXOBOX_TEST_GCC", "EXOBOX_TEST_COREUTILS"])
         },
+        // The CPUs a program is told: the host's where its threads run in parallel, one in
+        // coroutine mode (rustc sized its codegen from it).
+        Case { check: Some(nproc_is_hosts), ..case("nproc", Prog::Fixture("nproc"), PARALLEL, ok("NPROC ")) },
+        case("nproc_one", Prog::Fixture("nproc"), &[Mode::Coroutine], ok("NPROC 1")).native(None),
         fixture("forkbomb", FORK).flags(&["--max-procs=16"]).env(&[("EXOBOX_TEST_MAX_PROCS", "16")]).native(None),
         Case {
             timeout: Duration::from_secs(15),
@@ -375,6 +380,12 @@ fn cases() -> Vec<Case> {
 /// sysaudit's outcome for every number, against docs/syscalls.md's classes (as capnix's tier A
 /// measured them): these two lists, and everything else not skipped served (neither ENOSYS nor
 /// EPERM, and no crash or hang).
+/// The count is this process's own (the sandbox's host threads run where it may).
+fn nproc_is_hosts(out: &str) -> Result<(), String> {
+    let want = std::thread::available_parallelism().map_err(|e| e.to_string())?.get();
+    if out.lines().any(|l| l == format!("NPROC {want}")) { Ok(()) } else { Err(format!("want NPROC {want} in:\n{out}")) }
+}
+
 fn sysaudit_check(out: &str) -> Result<(), String> {
     const EPERM: &[&str] = &[
         "swapon", "swapoff", "sethostname", "setdomainname", "acct",

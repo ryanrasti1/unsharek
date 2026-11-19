@@ -187,7 +187,14 @@ struct State {
     aux: Cell<Aux>,
     /// The running program's absolute path (STOPGAP(item 10): `/proc/self/exe`).
     exe_len: Cell<usize>,
+    /// The host thread's CPU affinity mask at boot (`sched_getaffinity`'s bytes, `cpus_len` of
+    /// them): what threaded and fork mode report, since their threads run on the host's CPUs.
+    cpus: [Cell<u64>; CPU_WORDS],
+    cpus_len: Cell<usize>,
 }
+
+/// The CPU mask's capacity, in words: 1024 CPUs (glibc's `cpu_set_t`).
+const CPU_WORDS: usize = 16;
 
 static S: State = State {
     phase: Cell::new(Phase::Booted),
@@ -219,6 +226,8 @@ static S: State = State {
     routed: Cell::new(false),
     aux: Cell::new(Aux { hwcap: 0, hwcap2: 0, sysinfo_ehdr: 0, minsigstksz: 0 }),
     exe_len: Cell::new(0),
+    cpus: [const { Cell::new(0) }; CPU_WORDS],
+    cpus_len: Cell::new(0),
 };
 
 // SAFETY: one host thread (see `Local`).
@@ -279,6 +288,7 @@ pub unsafe fn boot(b: Boot) -> Result<(), Error> {
         }
         *ARENA.get() = Some(a);
     }
+    host_cpus();
     S.arena_lo.set(b.arena.0);
     S.arena_hi.set(b.arena.0 + b.arena.1);
     let key = TlsKey::alloc(&SCHED, None).ok_or(Error { what: "a TLS key", errno: Errno::NOMEM })?;
@@ -999,6 +1009,7 @@ unsafe extern "C" fn task_exit(pid: core::ffi::c_int, status: core::ffi::c_int) 
 // Numbers the dispatcher looks at before routing.
 
 const NR_READLINK: usize = 89;
+const NR_SCHED_GETAFFINITY: usize = 204;
 const NR_READLINKAT: usize = 267;
 const NR_RT_SIGRETURN: u64 = 15;
 
@@ -1821,12 +1832,7 @@ fn emulate(uc: &mut Ucontext, e: Emulate, nr: usize, a: [usize; 6]) -> isize {
             SCHED.yield_now();
             0
         }
-        E::SchedGetaffinity => {
-            if a[1] < 8 {
-                return -(Errno::INVAL.raw_os_error() as isize);
-            }
-            ret(write_user(a[2], 1u64).map(|_| 8))
-        }
+        E::SchedGetaffinity => sched_getaffinity(a[1], a[2]),
         E::SchedSetaffinity => 0,
         E::Getcpu => {
             for p in [a[0], a[1]] {
@@ -1884,6 +1890,45 @@ fn emulate(uc: &mut Ucontext, e: Emulate, nr: usize, a: [usize; 6]) -> isize {
             }
         }
     }
+}
+
+/// The host's CPU mask, read at boot (before lockdown: a plain syscall through the gate). Every
+/// program thread may run on any of them in threaded and fork mode, and programs size their
+/// thread pools from it (rustc's codegen ran one unit at a time when this said one CPU).
+fn host_cpus() {
+    let mut m = [0u64; CPU_WORDS];
+    // SAFETY: sched_getaffinity(0, len, buf) writes at most `len` bytes into `m`.
+    let r = unsafe { trap::gate(NR_SCHED_GETAFFINITY, 0, size_of_val(&m), m.as_mut_ptr() as usize, 0, 0, 0) };
+    let len = if r > 0 && m.iter().any(|&w| w != 0) { r as usize } else { 0 };
+    for (c, w) in S.cpus.iter().zip(m) {
+        c.set(w);
+    }
+    S.cpus_len.set(len);
+}
+
+/// `sched_getaffinity(pid, len, mask)` (of any thread: they all run anywhere): the host's CPUs in
+/// threaded and fork mode, one CPU in coroutine mode (one host thread runs everything). Returns
+/// the bytes written, as the kernel does.
+fn sched_getaffinity(len: usize, mask: usize) -> isize {
+    let n = if par::enabled() { S.cpus_len.get() } else { 0 };
+    if n == 0 {
+        if len < 8 {
+            return -(Errno::INVAL.raw_os_error() as isize);
+        }
+        return ret(write_user(mask, 1u64).map(|_| 8));
+    }
+    // The kernel's checks: the buffer holds the whole mask, in longs.
+    if len < n || !len.is_multiple_of(8) {
+        return -(Errno::INVAL.raw_os_error() as isize);
+    }
+    if !user(mask, n) {
+        return -(Errno::FAULT.raw_os_error() as isize);
+    }
+    for (i, c) in S.cpus.iter().enumerate().take(n.div_ceil(8)) {
+        // SAFETY: inside the program's memory (checked), possibly unaligned.
+        unsafe { core::ptr::write_unaligned((mask as *mut u64).add(i), c.get()) };
+    }
+    n as isize
 }
 
 fn futex_call(a: [usize; 6]) -> isize {
