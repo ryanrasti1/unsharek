@@ -154,8 +154,28 @@ pub(crate) fn reseed(entropy: &[u8]) -> io::Result<()> {
     add_entropy(entropy, true)
 }
 
-/// The guest's basics, as init's: `/proc`, `/dev` (null, zero, full, random, urandom, tty, devpts,
-/// the fd links), `/tmp`, `/dev/shm`, the RNG seeded with `entropy` from the host (else the
+/// The guest kernel's CLOCK_REALTIME set to the host's, now (host code, before any filter).
+///
+/// The guest kernel's clock is the host's CLOCK_MONOTONIC (the runtime's `time` hook), and LKL
+/// reads its "persistent clock" from that too, so its realtime started at the host's uptime: files
+/// got 1970 mtimes while the program's `clock_gettime` (the host's vDSO) said today, and autoconf
+/// stopped ("newly created file is older than distributed files"). Set once: from here on the
+/// guest's realtime is this instant plus the host's monotonic time since, which runs at the host
+/// realtime's rate (NTP's frequency corrections slew both clocks alike); it departs from the
+/// host's realtime only by what the host steps its realtime clock by later (a `settimeofday`, an
+/// NTP step) and by the time the host spends suspended (CLOCK_MONOTONIC doesn't count it). A
+/// template's children and fork mode's processes share the kernel's clock, so this holds there too.
+fn set_clock() -> io::Result<()> {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: fills a local.
+    if unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    sys(l::__lkl__NR_clock_settime, [libc::CLOCK_REALTIME as usize, (&raw const ts) as usize, 0, 0, 0, 0]).map(|_| ())
+}
+
+/// The guest's basics, as init's: its realtime clock the host's (`set_clock`), `/proc`, `/dev`
+/// (null, zero, full, random, urandom, tty, devpts, the fd links), `/tmp`, `/dev/shm`, the RNG seeded with `entropy` from the host (else the
 /// guest's `getrandom` would wait for entropy a cooperative kernel can't gather), loopback up,
 /// and fds 0-2.
 ///
@@ -163,6 +183,7 @@ pub(crate) fn reseed(entropy: &[u8]) -> io::Result<()> {
 /// writes the runtime does on the host's 0-2 (`exobox_rt::host`'s `hostfd_rw`), so `dup2`, pipes
 /// and inheritance treat them as any file.
 pub fn defaults(entropy: &[u8]) -> io::Result<()> {
+    set_clock()?;
     mkdir(c"/proc", 0o555)?;
     mount(c"proc", c"/proc", c"proc", 0, 0)?;
     mkdir(c"/dev", 0o755)?;

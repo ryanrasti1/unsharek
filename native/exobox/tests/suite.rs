@@ -181,6 +181,8 @@ fn cases() -> Vec<Case> {
         // Handlers run as the program (item 8); its fork steps only where there are processes.
         fixture("signals", ALL),
         fixture("gsbase", ALL),
+        // The guest kernel's clock is the host's (a new file's mtime, a raw clock_gettime).
+        fixture("clock", ALL),
         Case { cpu_budget: Some(Duration::from_millis(100)), ..fixture("idle", ALL) },
         // JITs work with no flag: W^X would be hardening of the program, not the sandbox's.
         fixture("rwx", ALL),

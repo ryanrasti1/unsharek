@@ -462,7 +462,8 @@ impl Guest {
     /// guard drops, every syscall the calling thread makes is served by the guest kernel, as its
     /// init (PID 1, root). Anything the guest kernel can do, a guard can: mounts, files, ids
     /// (`setresuid`: the program is exec'd with init's credentials as they are then), the
-    /// hostname. The first guard installs the routing filter (permanent: seccomp filters can't
+    /// hostname, the clock (`clock_settime`; the program gets EPERM for both, as an unprivileged
+    /// user would). The first guard installs the routing filter (permanent: seccomp filters can't
     /// be removed); after the guard's drop, the runtime passes the trapped syscalls through to the
     /// host (`exobox_rt::passthrough`), so host code behaves as before, until [`Guest::run`].
     /// Guards may come and go any number of times, interleaved with host work.

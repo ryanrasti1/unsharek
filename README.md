@@ -59,7 +59,7 @@ sb.run(&argv, &env)                                    // lockdown, then exec; n
   where missing; `map_store` for a `store::Store` of one's own), each with where it mounts.
 - **`intercept()`** returns a guard: while it lives, every syscall of the calling thread is served
   by the guest kernel, as its init (PID 1, root): anything the guest kernel can do, a guard can
-  (mounts, files, `setresuid`, `sethostname`). Memory calls stay the host's, so what is allocated
+  (mounts, files, `setresuid`, `sethostname`, `clock_settime`). Memory calls stay the host's, so what is allocated
   inside is ordinary host memory. Guards come and go, interleaved with host work: the first
   installs the routing filter (seccomp's: it can't be removed), and after a guard's drop the
   runtime re-issues each trapped syscall on the host (**passthrough**, below), so host code behaves

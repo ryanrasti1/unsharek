@@ -1567,10 +1567,21 @@ fn serve(uc: &mut Ucontext, nr: usize, a: [usize; 6]) -> isize {
     if let Some(r) = exe {
         return r;
     }
-    // Setup names the machine (sethostname, setdomainname: the kernel's 161, 162); the program
-    // gets sysmap's EPERM for them, as a machine's administration.
-    if matches!(nr, 170 | 171) && S.phase.get() == Phase::Setup {
-        return lkl_call(nr as c_long - 9, a);
+    // A guard is the guest's init, the machine's administrator: it names the machine
+    // (sethostname, setdomainname: the kernel's 161, 162) and sets its clock (settimeofday,
+    // clock_settime: 170, 112; their structs are x86-64's). The program gets sysmap's EPERM for
+    // them, as a machine's administration.
+    if S.phase.get() == Phase::Setup {
+        let admin = match nr {
+            170 => 161,
+            171 => 162,
+            164 => 170,
+            227 => 112,
+            _ => 0,
+        };
+        if admin != 0 {
+            return lkl_call(admin, a);
+        }
     }
     match sysmap::route(nr) {
         Route::Lkl(n) if sends_signal(nr) => {

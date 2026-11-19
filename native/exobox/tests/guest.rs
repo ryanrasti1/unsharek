@@ -170,11 +170,28 @@ fn intercept(m: Mode, name: &str) -> exobox::Error {
     {
         let _g = sb.intercept().unwrap();
         check("guard 2: guard 1's file is still there", std::fs::read_to_string("/exobox-guard-test").is_ok_and(|s| s == "made in guard 1"));
-        // SAFETY: the guest's init dropping to uid/gid 1000, naming its host.
+        // SAFETY: the guest's init dropping to uid/gid 1000, naming its host, setting its clock
+        // (to the host's time: the vDSO's, which a guard's clock_gettime is).
         unsafe {
             check("guard 2: sethostname", libc::sethostname(c"box".as_ptr(), 3) == 0);
+            let mut ts = std::mem::zeroed::<libc::timespec>();
+            libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts);
+            check("guard 2: clock_settime", libc::clock_settime(libc::CLOCK_REALTIME, &ts) == 0);
+            let tv = libc::timeval { tv_sec: ts.tv_sec, tv_usec: ts.tv_nsec / 1000 };
+            check("guard 2: settimeofday", libc::settimeofday(&tv, std::ptr::null()) == 0);
             check("guard 2: setresgid", libc::setresgid(1000, 1000, 1000) == 0);
             check("guard 2: setresuid", libc::setresuid(1000, 1000, 1000) == 0);
+        }
+    }
+    {
+        let _g = sb.intercept().unwrap();
+        // A guard's clock_settime is the guest kernel's, which asks for CAP_SYS_TIME: uid 1000
+        // has none. (The program's gets sysmap's EPERM whoever it is: sysaudit.)
+        // SAFETY: a timespec of the host's time.
+        unsafe {
+            let mut ts = std::mem::zeroed::<libc::timespec>();
+            libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts);
+            check("guard 3: uid 1000 can't set the clock", libc::clock_settime(libc::CLOCK_REALTIME, &ts) != 0);
         }
     }
     check("after 2: getpid is the host's", getpid() == pid);
