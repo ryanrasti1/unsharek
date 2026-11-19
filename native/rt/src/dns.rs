@@ -2,7 +2,7 @@
 //! nameserver `/etc/resolv.conf` names reach the host as datagrams (`tsi`'s `net_sendto`), and
 //! the answer is built here from the `on_resolve` hook's addresses. Only what a stub resolver
 //! asks: one question, class IN; `A` answered with the hook's IPv4 addresses; any other type
-//! (`AAAA` among them) with no data (NOERROR, no answers) for a name the hook knows. No
+//! (`AAAA` among them) with no data (NOERROR, no answers), without asking the hook (`tsi`). No
 //! recursion, no EDNS (an OPT record in the query is ignored, and none is sent back).
 
 use alloc::string::String;

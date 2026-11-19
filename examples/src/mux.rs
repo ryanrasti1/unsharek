@@ -1,6 +1,7 @@
 //! A tiny multiplexing protocol for `net-policy`: every connect and lookup of a sandbox over ONE
-//! host fd (a socketpair end the sandbox holds, `Sandbox::hold_fd`), to a proxy process at its
-//! other end. After `native/exobox/tests/net.rs`'s test provider.
+//! host fd (a socketpair end the sandbox holds as "net", `Sandbox::hold_fd_as`, which the hooks
+//! find with `cx.held`), to a proxy process at its other end. After
+//! `native/exobox/tests/net.rs`'s test provider.
 //!
 //! A frame is `id: u32 LE, op: u8, len: u32 LE, payload`. A connect or lookup is a request with a
 //! fresh id, answered by one reply; a connected stream's bytes and closes then go both ways under
@@ -25,7 +26,7 @@ use std::task::{Context, Poll, Waker};
 use exobox::{Cx, HeldFd, NetError, OnConnect, OnResolve};
 use futures_io::{AsyncRead, AsyncWrite};
 
-const CONNECT: u8 = 1; // pid: i32 LE, ip: 4 bytes, port: u16 BE
+const CONNECT: u8 = 1; // pid: i32 LE, ip: 4 bytes, port: u16 BE, the name it was resolved from
 const RESOLVE: u8 = 2; // pid: i32 LE, name
 const DATA: u8 = 3;
 const CLOSE: u8 = 4; // a half-close
@@ -226,29 +227,44 @@ fn error_of(payload: &[u8]) -> NetError {
     payload.first().and_then(|&i| ERRORS.get(i as usize)).copied().unwrap_or(NetError::Io)
 }
 
-/// The sandbox's network hooks over held fd `fd`. The session (a reader and a writer task) starts
-/// on the first hook call: tasks can only be spawned once the executor runs, after lockdown.
-pub fn hooks(fd: HeldFd) -> (OnConnect, OnResolve) {
-    let session: Rc<RefCell<Option<Shared>>> = Rc::default();
-    let start = move |cx: Cx| -> Shared {
-        session
-            .borrow_mut()
+thread_local! {
+    /// The sandbox's one session (every hook and task runs on its one executor).
+    static SESSION: RefCell<Option<Shared>> = const { RefCell::new(None) };
+}
+
+/// The session over the fd held as "net": its reader and writer tasks, started by [`start`] (at
+/// lockdown) or else by the first hook.
+fn session(cx: Cx) -> Shared {
+    SESSION.with(|s| {
+        s.borrow_mut()
             .get_or_insert_with(|| {
+                let fd = cx.held("net").expect("no fd held as \"net\"");
                 let s = Shared::default();
                 cx.spawn(reader(fd, s.clone()));
                 cx.spawn(writer(fd, s.clone()));
                 s
             })
             .clone()
-    };
-    let start2 = start.clone();
-    let connect = OnConnect::new(move |cx, pid, addr| {
-        let s = start(cx);
+    })
+}
+
+/// For `Builder::on_start`: the session up at lockdown, before the program's first connect.
+pub async fn start(cx: Cx) {
+    session(cx);
+}
+
+/// The sandbox's network hooks, over the fd held as "net". A connect carries the name its address
+/// was resolved from (`cx.name_of`), so the proxy decides by name.
+pub fn hooks() -> (OnConnect, OnResolve) {
+    let connect = OnConnect::new(move |cx: Cx, pid, addr| {
+        let s = session(cx);
+        let name = cx.name_of(addr.ip()).unwrap_or_default();
         async move {
             let SocketAddr::V4(a) = addr else { return Err(NetError::Unsupported) };
             let mut p = pid.to_le_bytes().to_vec();
             p.extend_from_slice(&a.ip().octets());
             p.extend_from_slice(&a.port().to_be_bytes());
+            p.extend_from_slice(name.as_bytes());
             match request(&s, CONNECT, &p).await {
                 (id, CONNECTED, _) => Ok(Proxied { id, s, closed: false }),
                 (id, _, e) => {
@@ -259,7 +275,7 @@ pub fn hooks(fd: HeldFd) -> (OnConnect, OnResolve) {
         }
     });
     let resolve = OnResolve::new(move |cx, pid, name: String| {
-        let s = start2(cx);
+        let s = session(cx);
         async move {
             let mut p = pid.to_le_bytes().to_vec();
             p.extend_from_slice(name.as_bytes());
@@ -274,10 +290,12 @@ pub fn hooks(fd: HeldFd) -> (OnConnect, OnResolve) {
 
 // ---- in the proxy ----------------------------------------------------------------------------
 
-/// What the proxy allows. `pid` is the guest's (as the sandbox reports it: for logs, not trust).
+/// What the proxy allows. `pid` is the guest's, and a connect's `name` the one its address was
+/// resolved from, as the sandbox reports them: the program could lie about both, so they are for
+/// logs and for picking a target, never for trust. What the proxy grants is the policy.
 pub trait Policy {
     fn resolve(&mut self, pid: i32, name: &str) -> Result<Vec<Ipv4Addr>, NetError>;
-    fn connect(&mut self, pid: i32, addr: SocketAddrV4) -> Result<TcpStream, NetError>;
+    fn connect(&mut self, pid: i32, addr: SocketAddrV4, name: &str) -> Result<TcpStream, NetError>;
 }
 
 /// Serves one sandbox's session on `sock` until it closes.
@@ -298,7 +316,7 @@ pub fn serve(mut sock: UnixStream, mut policy: impl Policy) {
                 },
                 CONNECT => {
                     let addr = SocketAddrV4::new(Ipv4Addr::new(p[4], p[5], p[6], p[7]), u16::from_be_bytes([p[8], p[9]]));
-                    match policy.connect(pid(), addr) {
+                    match policy.connect(pid(), addr, &String::from_utf8_lossy(&p[10..])) {
                         Ok(t) => {
                             let (mut r, w) = (t.try_clone().unwrap(), w.clone());
                             conns.insert(id, t);

@@ -19,7 +19,7 @@ Status: preview, being built (November 2026). The pieces below exist and are tes
 exobox run -- /nix/store/…-hello/bin/hello            # a Nix program: its closure is mounted read-only
 exobox run --mode threaded -- $(which python3) -c 'print(6 * 7)'
 exobox run --image store=./app.erofs:/app -- /app/bin/server
-exobox run --deny=errno --allow 'getppid' -- ./probe  # one more host syscall, on top of the mode's
+exobox run --allow-path ./fixtures -- ./fixtures/probe # a host directory shown read-only, as is
 ```
 
 A program sees a Linux machine of its own: `/proc`, `/dev`, a writable `/tmp`, its stdio, and the
@@ -27,86 +27,120 @@ filesystems it was given (Nix store paths, erofs images). Its exit status is exo
 
 ## The library
 
-The CLI is a thin layer over a Rust library with three layers, each built only from the one
-below:
+The CLI is a thin layer over a Rust library. A sandbox is built (the guest kernel booted in this
+process), given host data, set up in the guest, and run:
 
 ```rust
-// 1. Guest: the in-process kernel, and a program routed into it. No security policy.
-let mut guest = exobox::Guest::boot(config)?;          // host work: reserve memory, boot the kernel
-let store = guest.map_image("store.erofs")?;           // host mmap now, a read-only guest disk
+let mut sb = exobox::Sandbox::builder()
+    .mode(Mode::Coroutine)                             // or Threaded (fork mode: not yet)
+    .on_connect(OnConnect::new(|cx, pid, addr| provider.connect(cx, pid, addr)))
+    .on_resolve(OnResolve::new(|cx, pid, name| provider.resolve(cx, pid, name)))
+    .restrict(my_seccomp_program)                      // optional, repeatable: can only take away
+    .build()?;                                         // boots the guest kernel
+let store = sb.map_closure(&program, &[])?;            // host work: a Nix closure's images mapped
+sb.pass_fd(channel, 1000)?;                            // a host fd as the guest's fd 1000
+sb.hold_fd_as("net", provider_socket)?;                // a provider's connection, for the hooks
 let manifest = std::fs::read("manifest.json")?;        // still the host's syscalls
-let setup = PreExec::new(move || {                    // from here on, syscalls go to the guest:
-    exobox::setup::mount_erofs(&store, "/nix/store")?; //   ordinary Rust, in the guest:
-    std::fs::write("/etc/app/manifest.json", &manifest)//   mounts, files, whatever the program needs
-});
-guest.run(Hooks { pre_exec: setup, ..Default::default() }, &argv, &env)
-                                                       // then the program is exec'd; never returns
-
-// 2. Security is a closure on top of that: install the host filter before the program starts.
-// 3. Sandbox: Guest plus the default profiles (modes, deny action, extra rules).
-let mut sb = exobox::Sandbox::boot(Mode::Threaded, config)?;
-let store = sb.map_image(fd)?;
-let channel = sb.hold_fd(provider_socket)?;            // a provider's connection, made before run
-sb.run(Hooks {
-    pre_exec: PreExec::new(move || exobox::setup::mount_erofs(&store, "/nix/store")),
-    on_connect: OnConnect::new(move |cx, pid, addr| provider.connect(cx, channel, pid, addr)),
-    on_resolve: OnResolve::new(move |cx, pid, name| provider.resolve(cx, channel, pid, name)),
-    ..Default::default()                               // on_listen: none, so listens stay the guest's
-}, &argv, &env)
+{
+    let _g = sb.intercept()?;                          // this thread's syscalls are the guest's:
+    exobox::setup::mount_closure(&store)?;             //   ordinary Rust, as the guest's init:
+    std::fs::write("/etc/app/manifest.json", &manifest)?; // mounts, files, ids, the hostname
+}                                                      // dropped: the host's again
+sb.run(&argv, &env)                                    // lockdown, then exec; never returns
 ```
 
-- **`Guest::boot`** reserves the program's memory and the kernel's, boots the kernel, and sets up
-  the guest's basics (`/proc`, `/dev`, `/tmp`, stdio). Everything up to `run` is ordinary host
-  code.
+- **`Sandbox::builder()…build()`** reserves the program's memory and the kernel's, boots the
+  kernel, and sets up the guest's basics (`/proc`, `/dev`, `/tmp`, stdio). The mode, the network
+  hooks and the restrictions are the builder's.
 - **`map_image`** is the one way to give the guest host data that it maps: the image is mapped
-  before lockdown and becomes a read-only block device, `/dev/exobox/<name>`. exobox owns the
-  mapping, which it later maps code from in place and shares across forks.
-- **`run(hooks, argv, env)`** installs the routing filter, runs `hooks.pre_exec` as the guest's
-  init (PID 1, the process the program becomes), then execs the program inside the guest. Inside
-  `pre_exec` every syscall is the guest's: host data has to be read before `run` and moved in.
-  Files and fds it leaves open are the program's.
+  (a host `mmap`) and becomes a read-only block device, `/dev/exobox/<name>` (`map_image_as` names
+  it). exobox owns the mapping, which it later maps code from in place and shares across forks.
+  `map_closure(program, allow_paths)` maps a Nix program's closure from the image cache (built
+  where missing; `map_store` for a `store::Store` of one's own), each with where it mounts.
+- **`intercept()`** returns a guard: while it lives, every syscall of the calling thread is served
+  by the guest kernel, as its init (PID 1, root): anything the guest kernel can do, a guard can
+  (mounts, files, `setresuid`, `sethostname`). Memory calls stay the host's, so what is allocated
+  inside is ordinary host memory. Guards come and go, interleaved with host work: the first
+  installs the routing filter (seccomp's: it can't be removed), and after a guard's drop the
+  runtime re-issues each trapped syscall on the host (**passthrough**, below), so host code behaves
+  as before, with one exception: a host program can't be exec'd any more (the filters would follow
+  it into the exec), so helpers are started before the first guard. Only the calling thread is
+  routed; other threads' syscalls stay the host's.
+- **`run(argv, env)`** is the lockdown and the exec: the routing filter if no guard installed it,
+  the network hooks, the security filter (the mode's, with the restrictions stacked), then the
+  program exec'd inside the guest with init's credentials as setup left them. Files and fds
+  setup left open are the program's. The process's status is the program's; `run` returns only if
+  the program couldn't be started. The sandbox's process must have no host threads of the
+  caller's left (they would be unfiltered).
+- **`pass_fd(fd, n)`** gives the guest host fd `fd` as its fd `n`, now, and `hold_fd(fd)` keeps
+  one for the hooks; each widens the filter by `read` and `write` on exactly that fd. They are the
+  only ways to widen it: `restrict(prog)` stacks a seccomp program of the caller's (seccompiler's,
+  libseccomp's) that can only take away.
+- **Templates.** `fork()` (or `spawn(|sb| { setup; sb.run(..) })`) forks the sandbox's process:
+  the child is a sandbox of its own, a copy of this one as it is (the booted kernel, its mounts and
+  files, shared copy-on-write), to set up further (its own images, fds, guards) and run; the parent
+  goes on forking more and waits for them (`exobox::wait`, `waitpid`). exobox makes each child its
+  own: its guest RNG reseeded with fresh host entropy, and in threaded mode the kernel copied at
+  rest and the child's host threads and CPU token made again. A child starts to READY in about a
+  millisecond and costs under 2 MB (`./test --perf`). Fork mode: not yet.
 - **The network hooks** (`exobox::net`): the program's sockets are its own for loopback; a
   `connect` anywhere else is `on_connect(cx, pid, addr)`, whose stream exobox copies to and from
   the program's socket (half-closes and resets carried both ways); a `listen` not bound to loopback
   is offered to `on_listen`, whose inbound streams the program accepts; name lookups (the guest's
-  libc asking the nameserver in its `/etc/resolv.conf`) are `on_resolve(cx, pid, name)`. Errors
-  are `NetError`s, which become errnos (`Refused` ECONNREFUSED, `Denied` EACCES, ...). With no
-  hook, everything but loopback is unreachable. The hooks are async: they run after lockdown, on a
-  small executor inside the sandbox (`Cx`: `spawn`, `now`, `sleep_until`, `readable`/`writable`
-  on held fds), so one long-lived task can own a provider's multiplexed connection, a host fd held
-  for it before `run` (`hold_fd`: the filter allows `read` and `write` on exactly it). futures-io's
-  `AsyncRead`/`AsyncWrite` by default, tokio's with the `tokio` feature; `OnConnect::drive` hands a
-  provider the program's end (`GuestSocket`) to drive itself.
+  libc asking the nameserver in its `/etc/resolv.conf`) are `on_resolve(cx, pid, name)` (A queries
+  only: AAAA is answered with no data). Without `on_resolve`, names resolve to addresses of
+  exobox's own, and `cx.name_of(addr)` tells `on_connect` the name: policy by name with no resolver.
+  Errors are `NetError`s, which become errnos (`Refused` ECONNREFUSED, `Denied` EACCES, ...). With
+  no hook, everything but loopback is unreachable. The hooks are async: they run after lockdown,
+  on a small executor inside the sandbox (`Cx`: `spawn`, `now`, `sleep_until`,
+  `readable`/`writable` and `held(name)` for held fds), so one long-lived task, started at
+  lockdown by `on_start`, can own a provider's multiplexed connection. A template's hooks are given
+  once, at build; each child holds its own provider's fd under a name the hooks look up.
+  futures-io's `AsyncRead`/`AsyncWrite` by default, tokio's with the `tokio` feature;
+  `OnConnect::drive` hands a provider the program's end (`GuestSocket`) to drive itself.
 - **The authority rule.** The hooks run in the program's address space: a compromised program
   can read and write their memory and drive the provider's connection itself. So that connection
   must carry no more authority than the program's own channel: policy (which addresses, which
   names) lives behind it, at its other end, never in the hook.
-- **`Sandbox`** is `Guest` whose `pre_exec` runs the caller's setup and then stacks the security
-  filter for the mode.
-- **`exobox::setup`** holds small helpers for setup closures, written as ordinary Rust
-  (`mount_erofs`, `mount_closure` for a Nix closure). The CLI's `exobox run` is
-  `Sandbox::boot`, the closure's images mapped, `run` with `mount_closure`.
+- **Layers.** `Sandbox` is built on `Guest` (`Guest::boot`, `map_image`, `intercept`, `run`: the
+  kernel and routing, no security filter); the CLI's `exobox run` is `exobox::run(Config)`: the
+  builder, the closure's images mapped, `mount_closure` in a guard, `run`.
+- **Embedding.** exobox sets the process's global allocator (the hooks allocate after lockdown,
+  from a region reserved at build). A binary that embeds it links at a fixed address as the CLI
+  does with one call in its `build.rs`, `exobox_build::link_fixed_address()` (`native/build`): a
+  PIE's relocations would cost each sandbox ~400 KB.
 
-Anything setup needs beyond that is code: in the closure, or in the guest itself (a first program
-that mounts `/dev/exobox/<name>` with `mount(2)` and execs the next one).
+Anything setup needs beyond that is code: in a guard, or in the guest itself (a first program that
+mounts `/dev/exobox/<name>` with `mount(2)` and execs the next one).
 
 **Examples.** `examples/` has small, runnable programs that use the library this way
 ([examples/README.md](examples/README.md)): a Nix program with its closure and its startup and
-memory measured (`nix-program`), composing the guest in `pre_exec` (`setup`), a host channel at
+memory measured (`nix-program`), composing the guest in guards (`setup`), a host channel at
 fd 1000 (`channel`), networking through a proxy that holds the policy (`net-policy`), coroutine
 against threaded mode (`threads`), and the host filter refusing a hostile program (`escape`).
 `cargo run -p exobox-examples --release --bin <name>`, from the devshell.
 
 ## How it works
 
-- **Routing and security are two stacked seccomp filters.** The first (installed by `run`) traps
+- **Routing and security are two stacked seccomp filters.** The first (installed by the first
+  intercept guard, or by `run`; on the calling thread, which the threads it makes inherit) traps
   every syscall the program makes (`SECCOMP_RET_TRAP`: a SIGSYS into exobox, which serves it) and
   allows everything from exobox's own syscall instruction, the gate. The second (the security
   filter, installed before the program starts) allows from the gate only the mode's list, with
   each argument pinned (exact fds, the program's memory, one `clone` flag set). With two filters
   the kernel takes the strictest answer, so the program's syscalls trap, and the gate gets exactly
   the list. The gate's address check is routing, not security: a compromised program can jump to
-  the gate, and then only the list applies.
+  the gate, and then only the list applies. A caller's restrictions are more filters on the same
+  stack: the strictest answer still wins.
+- **Passthrough.** Between guards (and for other threads during one) a trapped syscall is the
+  host's: the SIGSYS handler re-issues it from the gate, which the routing filter allows, and
+  returns its result as the call's. What can't be re-issued as is is handled deliberately
+  (`exobox_rt::passthrough`): `rt_sigreturn` (a host signal handler's return) is made again at
+  the trapped stack; `rt_sigprocmask`, `sigaltstack` and `arch_prctl(ARCH_SET_FS)` apply to the
+  state the handler's own return restores (SIGSYS can't be blocked); a `clone` with a new stack
+  (a thread, `posix_spawn`'s child) starts its child from the trapped context; a vfork is a fork
+  that waits (the child would run over the handler's frames); `clone3` is ENOSYS (libc falls back
+  to `clone`); `execve` is EPERM.
 - **The trap.** The SIGSYS frame is moved off the program's stack (Go makes syscalls with ~128
   bytes to spare), the FS register switched to exobox's and back, and the call dispatched: to the
   guest kernel (x86-64 numbers translated to the generic table, structs translated), rewritten
@@ -153,7 +187,8 @@ against threaded mode (`threads`), and the host filter refusing a hostile progra
 3. Threaded mode: a host thread per program thread, made through the gate; the CPU passed between
    them through eventfds.
 4. Fork mode: a guest fork is a host fork, sharing one guest kernel.
-5. Templates: a booted kernel forked per sandbox (`Template::start`, `spawn`), the kernel's pages
+5. Templates (done, coroutine and threaded): a booted kernel forked per sandbox
+   (`Sandbox::fork`, `spawn`), the kernel's pages
    shared copy-on-write.
 6. Within the performance budgets (`./test --perf`): startup, memory per sandbox, parallel builds.
 7. Code mapped in place from the store images (done, in release-mode arenas: coroutine and fork).
@@ -170,7 +205,7 @@ against threaded mode (`threads`), and the host filter refusing a hostile progra
    ext4); FUSE in the store's kernel (a config fragment); a closure shown from the host's store
    with no copy (item 7's extents and `synthesize`).
 9. Pluggable networking (done in coroutine mode): the guest's `connect`, `listen`/`accept` and name
-   lookups go to the hooks the sandbox is given (`Hooks { on_connect, on_listen, on_resolve }`,
+   lookups go to the hooks the sandbox is built with (`on_connect`, `on_listen`, `on_resolve`,
    each `async` with the guest pid; `NetError`s map to errnos and resolver codes). The kernel's
    socket impersonation (`lkl/README.md`, items 15-16) keeps loopback the guest's and makes the
    program's socket a kernel socketpair end, so poll, epoll and nonblocking sockets work unchanged;
@@ -254,9 +289,10 @@ the unit tests of exobox and exobox-erofs.
 `rt_sigreturn` from the gate (the SIGSYS handler's return) is allowed in every mode, and in
 coroutine and threaded mode `kill` of the sandbox's own pid (a guest process that dies of a signal
 makes the sandbox die of the same); the program's own `rt_sigreturn` traps, as it returns from a
-handler the runtime ran. `--deny=kill` (the default)
-kills the sandbox on anything else from the gate; `--deny=errno` returns `EPERM`, for probing.
-`--allow RULE` adds one syscall, with conditions on its arguments.
+handler the runtime ran. Anything else from the gate kills the sandbox (the CLI's hidden
+`--deny=errno` returns `EPERM` instead, for the escape tests' probes). The list is only widened by
+the typed calls (`pass_fd`, `hold_fd`: `read` and `write` on exactly that fd), and narrowed by
+restrictions (`Builder::restrict`).
 
 ## License
 
