@@ -1,7 +1,7 @@
 # The kernel: what exobox needs from LKL
 
 exobox's kernel is stock LKL (`github.com/lkl/linux` master, `d0f76a77e`, Linux 6.12) plus a short
-series on `github.com/ryanrasti/linux`, branch `exobox/native`. This file is that series' plan,
+series on `github.com/ryanrasti/linux`, branch `exobox-native`. This file is that series' plan,
 written from first principles: what an in-process kernel hosting unmodified programs behind
 seccomp needs that stock LKL doesn't do. Each item names the earlier work it learns from:
 linux-workers' `lkl/wasi-main` (a cooperative WASI host, the same scheduling problem) and capnix's
@@ -72,8 +72,8 @@ sees it through the flake's `inputs.self.submodules`). `EXOBOX_LKL_SRC` names an
 `EXOBOX_LKL_CONFIG` adds a config fragment over `lkl/defconfig`. For `nix build` the kernel is its
 own derivation (`lib.exoboxKernel`), linked through lkl-sys's `EXOBOX_LKL_PREBUILT`.
 
-The series is a branch of the kernel's repository (`exobox/native`; the submodule's URL, today the
-local `/home/ryan/src/lkl-linux`). Work on it happens in the submodule; a commit of it reaches
+The series is a branch of the kernel's repository (`exobox-native` on
+`github.com/ryanrasti/linux`, the submodule's URL). Work on it happens in the submodule; a commit of it reaches
 exobox as the submodule's new commit together with exobox's side of the change (the
 host-operations table in `native/rt`, when the host interface moved), in one exobox commit.
 `native/lkl-sys` runs the make from its build.rs and links the kernel object alone

@@ -786,9 +786,11 @@ mod tests {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
-    /// The kernel tree the tables are checked against (stock LKL, read-only).
+    /// The kernel tree the tables are checked against: `EXOBOX_LKL_SRC`, else the submodule
+    /// (read-only; the syscall tables are stock LKL's).
     fn kernel() -> Option<PathBuf> {
-        let p = PathBuf::from(std::env::var_os("EXOBOX_LKL_SRC").unwrap_or("/home/ryan/src/lkl-stock".into()));
+        let submodule = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lkl/linux");
+        let p = std::env::var_os("EXOBOX_LKL_SRC").map_or(submodule, PathBuf::from);
         if p.join("include/uapi/asm-generic/unistd.h").exists() {
             Some(p)
         } else {
