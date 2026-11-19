@@ -24,7 +24,8 @@ let
         ${pkgs.lib.concatMapStrings (args: ''
           i=$((i + 1))
           echo "cargo kani ${pkgs.lib.escapeShellArgs args}" | tee kani-$i.log
-          cargo kani ${pkgs.lib.escapeShellArgs args} 2>&1 | tee -a kani-$i.log
+          # cargo-kani itself: the build has no cargo of its own on PATH for `cargo kani`
+          cargo-kani ${pkgs.lib.escapeShellArgs args} 2>&1 | tee -a kani-$i.log
         '') runs}
         runHook postBuild
       '';
@@ -32,7 +33,7 @@ let
         mkdir -p $out
         cp kani-*.log $out/
         grep -h -e '^cargo kani' -e '^Checking harness' -e '^VERIFICATION' -e '^Verification Time' \
-          -e '^Complete' kani-*.log > $out/summary
+          -e '^Complete' -e 'harnesses' kani-*.log > $out/summary
       '';
     };
 in
