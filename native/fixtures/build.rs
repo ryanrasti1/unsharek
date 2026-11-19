@@ -43,7 +43,16 @@ fn main() {
     ];
     run_all(&cc, &src, &common, loader);
 
-    let special = ["evil_interp", "ctor_escape", "plug", "static_start"];
+    // A glibc program linked -static-pie, with the devshell's static glibc (glibc.static's lib/,
+    // as EXOBOX_GLIBC_STATIC; the suite's static_glibc cases). Skipped without it: the package's
+    // build (nix/lib.nix) builds the fixtures but runs none of the suite.
+    println!("cargo:rerun-if-env-changed=EXOBOX_GLIBC_STATIC");
+    if let Some(lib) = env::var_os("EXOBOX_GLIBC_STATIC") {
+        let l = format!("-L{}", Path::new(&lib).display());
+        run_all(&cc, &src, &common, vec![("static_glibc".into(), bin.join("static_glibc"), args(&["-static-pie", "-fPIE", &l]))]);
+    }
+
+    let special = ["evil_interp", "ctor_escape", "plug", "static_start", "static_glibc"];
     let programs = fs::read_dir(&src)
         .unwrap()
         .filter_map(|e| {

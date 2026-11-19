@@ -1,9 +1,11 @@
 # Sourced by ./test: enter the devshell without `nix develop`, which copies the tree into the store
-# on every change. The environment depends only on flake.nix and flake.lock, so `nix print-dev-env`
-# is cached in .cache/, keyed on those two files. Delete .cache/ to refresh by hand.
+# on every change. The environment depends only on flake.nix, flake.lock and the test programs it
+# builds (nix/test-programs.nix, nix/goprobe), so `nix print-dev-env` is cached in .cache/, keyed
+# on those files. Delete .cache/ to refresh by hand.
 if [[ -z "${EXOBOX_DEVSHELL:-}" ]]; then
   _exobox_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  _exobox_key="$(cat "$_exobox_root/flake.nix" "$_exobox_root/flake.lock" 2>/dev/null | sha256sum | cut -c1-16)"
+  _exobox_key="$(cat "$_exobox_root/flake.nix" "$_exobox_root/flake.lock" "$_exobox_root/nix/test-programs.nix" \
+  "$_exobox_root"/nix/goprobe/* 2>/dev/null | sha256sum | cut -c1-16)"
   _exobox_env="$_exobox_root/.cache/devshell-$_exobox_key.sh"
   if [[ ! -s "$_exobox_env" ]]; then
     mkdir -p "$_exobox_root/.cache"

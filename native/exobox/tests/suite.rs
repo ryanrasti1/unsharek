@@ -402,9 +402,72 @@ fn cases() -> Vec<Case> {
             Arg::Lit("echo $((6 * 7)) | { read x; echo $x; }; s=$(echo ok); echo sub=$s; (exit 3); echo st=$?; { sleep 0.05; echo bg=done; } & wait"),
         ]),
     ];
+    c.extend(static_programs());
     c.sort_by_key(|c| c.name);
     c
 }
+
+/// Static programs from three toolchains (nix/test-programs.nix): no interpreter, nothing but the
+/// program's own startup code between exobox's loader and its main.
+fn static_programs() -> Vec<Case> {
+    let bb = |name, modes, args: &[&'static str], expect| {
+        case(name, Prog::External("EXOBOX_TEST_BUSYBOX"), modes, expect).args(args.iter().map(|a| Arg::Lit(a)).collect())
+    };
+    vec![
+        // Go's runtime (goprobe, CGO off): goroutines, timers, parallel work and GC, an HTTP
+        // server and its clients on loopback through the netpoller. With "preempt", a spinning
+        // goroutine preempted at its calls while GOMAXPROCS is 1 (not coroutine mode: one of its
+        // threads in user code keeps the others from running); with "exec", os.StartProcess and
+        // its status (fork mode). Not tested, a known limit: Go's asynchronous preemption, of a
+        // loop with no calls, by SIGURG, which the runtime delivers only at the thread's next call.
+        Case { timeout: Duration::from_secs(10), ..case("go", Prog::External("EXOBOX_TEST_GOPROBE"), ALL, ok("GOPROBE_OK")) },
+        Case {
+            timeout: Duration::from_secs(10),
+            ..case("go_preempt", Prog::External("EXOBOX_TEST_GOPROBE"), THREADED_FORK, ok("preemption ok"))
+                .args(vec![Arg::Lit("preempt")])
+        },
+        Case {
+            timeout: Duration::from_secs(10),
+            ..case("go_exec", Prog::External("EXOBOX_TEST_GOPROBE"), FORK, Expect { stdout: vec!["exec ok", "GOPROBE_OK"], ..status(Status::Code(0)) })
+                .args(vec![Arg::Lit("exec")])
+        },
+        // A real Go server from nixpkgs (go-httpbin, static), busybox's wget its client: a
+        // response, a timed one (/delay), a streamed one, and its end by SIGTERM.
+        Case {
+            timeout: Duration::from_secs(10),
+            ..bb("go_httpbin", FORK, &["sh", "-c", HTTPBIN], Expect { stdout: vec!["get=1", "delay=ok", "stream=5", "HTTPBIN_OK"], ..status(Status::Code(0)) })
+                .uses(&["EXOBOX_TEST_HTTPBIN", "EXOBOX_TEST_BUSYBOX"])
+        },
+        // musl's (busybox): applets alone in every mode, and a shell's forks in fork mode.
+        bb("busybox_ls", ALL, &["ls", "/"], ok("proc\n")),
+        Case { stdin: Some("b\nc\na\n"), ..bb("busybox_sort", ALL, &["sort"], ok("a\nb\nc\n")) },
+        Case { stdin: Some("one two\nthree\n"), ..bb("busybox_wc", ALL, &["wc", "-lw"], ok("2         3")) },
+        Case { stdin: Some("through cat\n"), ..bb("busybox_cat", ALL, &["cat"], ok("through cat")) },
+        bb("busybox_sh", ALL, &["sh", "-c", "x=$((6*7)); read -r y </proc/self/comm; echo $x $y; case $x in 4*) echo SH_OK;; esac"], ok("42 busybox\nSH_OK")),
+        bb(
+            "busybox_pipeline",
+            FORK,
+            &["sh", "-c", "b=$EXOBOX_TEST_BUSYBOX; n=$($b ls / | $b sort -r | $b grep -c .) && echo n=$n; printf '3\\n1\\n2\\n' | $b sort | $b tr '\\n' ' ' | $b wc -w; $b sh -c 'exit 5'; echo st=$?"],
+            Expect { stdout: vec!["n=", "\n3\n", "st=5"], ..status(Status::Code(0)) },
+        )
+        .uses(&["EXOBOX_TEST_BUSYBOX"]),
+        // glibc's, -static-pie (native/fixtures/c/static_glibc.c): self-relocation, IFUNCs, TLS
+        // and threads without ld.so; a fork in fork mode.
+        fixture("static_glibc", ALL),
+        fixture("static_glibc", FORK).renamed("static_glibc_fork").args(vec![Arg::Lit("fork")]),
+    ]
+}
+
+/// go_httpbin's script (busybox sh): the server in the background on a port of its own (natively
+/// the host's loopback is shared), polled until it answers.
+const HTTPBIN: &str = r#"b=$EXOBOX_TEST_BUSYBOX; p=$((20000 + $$ % 20000)); u=http://127.0.0.1:$p
+$EXOBOX_TEST_HTTPBIN -host 127.0.0.1 -port $p >/dev/null 2>&1 &
+pid=$!
+i=0; until $b wget -q -O /dev/null $u/status/200 2>/dev/null; do i=$((i+1)); [ $i -gt 250 ] && { echo NO_SERVER; exit 1; }; $b usleep 20000; done
+echo get=$($b wget -q -O - "$u/get?x=42" | $b grep -c '"42"')
+$b wget -q -O - $u/delay/0.2 | $b grep -q '"url"' && echo delay=ok
+echo stream=$($b wget -q -O - $u/stream/5 | $b wc -l)
+kill $pid; wait $pid; echo HTTPBIN_OK"#;
 
 /// sysaudit's outcome for every number, against docs/syscalls.md's classes (as capnix's tier A
 /// measured them): these two lists, and everything else not skipped served (neither ENOSYS nor
