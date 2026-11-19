@@ -146,7 +146,8 @@ openat
   getppid(), trapped: the guest's        -> 0
   => killed by SIGSYS (the host filter)
 
-stale-fd
+socket
   getppid(), trapped: the guest's        -> 0
+  read(an fd from before) via the gate   -> Bad file descriptor (os error 9)
   => killed by SIGSYS (the host filter)
 ```

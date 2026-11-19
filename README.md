@@ -45,7 +45,7 @@ g.run(|| -> std::io::Result<()> {                      // this thread's syscalls
     std::fs::write("/etc/app/manifest.json", &manifest) //  mounts, files, ids, the hostname
 })??;                                                  // and the host's again
 let locked = g.lockdown(|s| {                          // exobox-tcb's lockdown, with the grants
-    s.grant(0, Access::Read).grant(1, Access::Write).grant(2, Access::Write);
+    s.grant(0).grant(1).grant(2);
     Ok(())
 })?;
 locked.exec(&argv, &env)                               // the program; never returns
@@ -68,9 +68,9 @@ locked.exec(&argv, &env)                               // the program; never ret
   fork, and exec of host programs all work natively). Only the calling thread is routed.
 - **`g.lockdown(|s| grants)`** makes the guest's own host fds (threaded mode's CPU-token
   eventfds, fork mode's pidfd), installs the hooks and calls exobox-tcb's lockdown (below, "Where
-  isolation is") with the caller's grants: `s.grant(fd, Access::{Read, Write, ReadWrite})`, read
-  only meaning `read` only. Nothing is granted by default, stdio included (`exobox::stdio` grants
-  0-2 as the CLI does); passed and held fds are granted read and write. Every fd neither granted
+  isolation is") with the caller's grants: `s.grant(fd)` keeps an fd open, for `read` and `write` as
+  its own mode allows (an `O_RDONLY` file can't be written). Nothing is granted by default, stdio
+  included (`exobox::stdio` grants 0-2 as the CLI does); passed and held fds are granted. Every fd neither granted
   nor the guest's is closed. Then threaded mode's kernel thread starts, under the filter. The
   process must be single-threaded by then.
 - **`locked.exec(argv, env)`** is the guest's exec of the program, with init's credentials as

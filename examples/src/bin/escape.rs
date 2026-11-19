@@ -7,9 +7,10 @@
 //!
 //! The attempts: `getppid` made from exobox's own syscall instruction, the "gate", which the
 //! closure finds by scanning the binary's code for it (it shares the address space: nothing in it
-//! is hidden from the program); a host file opened through the gate; and a host fd the process had
-//! open before lockdown (closed at lockdown: it wasn't granted). The gate's address check only
-//! routes; what the gate may do is the filter's short list, each argument pinned.
+//! is hidden from the program); a host file opened through the gate; and a host socket made
+//! through it. The gate's address check only routes; what the gate may do is the filter's short
+//! list, each argument pinned. (A host fd the process had open before lockdown is closed then:
+//! `read` on it from the gate is EBADF, not a kill.)
 
 use std::os::fd::AsRawFd;
 
@@ -76,14 +77,17 @@ fn hostile(attempt: &str, secret_fd: i32) -> i32 {
             let path = c"/etc/passwd";
             show("openat(\"/etc/passwd\") via the gate", via_gate(gate, libc::SYS_openat, libc::AT_FDCWD as usize, path.as_ptr() as usize, 0))
         }
-        // An fd the process had before lockdown: closed then, and not one the filter allows.
-        _ => show("read(an fd from before) via the gate", via_gate(gate, libc::SYS_read, secret_fd as usize, b.as_mut_ptr() as usize, b.len())),
+        _ => {
+            // An fd the process had before lockdown: closed then (EBADF, the process lives on).
+            show("read(an fd from before) via the gate", via_gate(gate, libc::SYS_read, secret_fd as usize, b.as_mut_ptr() as usize, b.len()));
+            show("socket() via the gate", via_gate(gate, libc::SYS_socket, libc::AF_INET as usize, libc::SOCK_STREAM as usize, 0))
+        }
     }
     println!("  survived");
     0
 }
 
-const ATTEMPTS: [&str; 3] = ["getppid", "openat", "stale-fd"];
+const ATTEMPTS: [&str; 3] = ["getppid", "openat", "socket"];
 
 fn sandbox(attempt: &str) -> ! {
     let run = || -> Result<std::convert::Infallible, exobox::Error> {

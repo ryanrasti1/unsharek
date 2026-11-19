@@ -4,7 +4,7 @@
 //! ```no_run
 //! # fn main() -> Result<(), exobox::Error> {
 //! # let (program, argv, env): (std::path::PathBuf, Vec<std::ffi::OsString>, Vec<std::ffi::OsString>) = Default::default();
-//! use exobox::{Access, Guest, GuestConfig, Mode};
+//! use exobox::{Guest, GuestConfig, Mode};
 //! let mut g = Guest::boot(GuestConfig { mode: Mode::Coroutine, ..Default::default() })?; // the kernel
 //! let mounts = g.map_closure(&program, &[])?;          // host work: images mapped
 //! g.run(|| -> std::io::Result<()> {                    // this thread's syscalls are the guest's
@@ -12,7 +12,7 @@
 //!     std::fs::write("/etc/motd", "hi\n")
 //! })??;                                                // and the host's again
 //! let g = g.lockdown(|s| {                             // the TCB's lockdown, the caller's grants
-//!     s.grant(0, Access::Read).grant(1, Access::Write).grant(2, Access::Write);
+//!     s.grant(0).grant(1).grant(2);
 //!     Ok(())
 //! })?;
 //! let Err(e) = g.exec(&argv, &env);                    // the program; never returns on success
@@ -47,8 +47,6 @@ pub mod store;
 pub use exobox_tcb as tcb;
 pub use image::Image;
 pub use net::{Cx, GuestSocket, HeldFd, NetError, OnConnect, OnListen, OnResolve};
-/// What may be done on a granted fd ([`tcb::Config::grant`]).
-pub use tcb::Access;
 /// How the sandbox runs the program's threads and processes. Each mode's host allowlist is a
 /// superset of the one before.
 pub use tcb::Mode;
@@ -690,7 +688,7 @@ impl Guest {
             |s| {
                 s.mode = mode;
                 for &fd in passed.iter().chain(&held) {
-                    s.grant(fd, Access::ReadWrite);
+                    s.grant(fd);
                 }
                 grants(s)
             },
@@ -866,16 +864,16 @@ pub fn store(config: &Config) -> Result<store::Store, Error> {
     Ok(cache.store(Path::new(program), &config.allow_paths)?)
 }
 
-/// The program's stdio granted, as the CLI does ([`run`]): stdin read, stdout and stderr write.
+/// The program's stdio granted, as the CLI does ([`run`]): fds 0-2.
 /// For [`Guest::lockdown`]'s grants (`g.lockdown(exobox::stdio)`, or called inside one's own).
 pub fn stdio(s: &mut tcb::Config) -> tcb::Result<()> {
-    s.grant(0, Access::Read).grant(1, Access::Write).grant(2, Access::Write);
+    s.grant(0).grant(1).grant(2);
     Ok(())
 }
 
 /// Become the sandbox: [`Guest::boot`] for the mode, the closure's images (and `config.images`)
 /// mapped and mounted in a [`Guest::run`] closure, [`Guest::lockdown`] with the program's stdio
-/// granted (stdin read, stdout and stderr write), [`Locked::exec`]. Returns only on failure before
+/// granted (fds 0-2), [`Locked::exec`]. Returns only on failure before
 /// the program starts; the process ends with the program's status.
 pub fn run(config: Config) -> Result<Infallible, Error> {
     let store = store(&config)?;

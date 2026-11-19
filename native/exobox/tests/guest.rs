@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use exobox::{Access, Guest, GuestConfig, Mode};
+use exobox::{Guest, GuestConfig, Mode};
 use exobox_fixtures as fx;
 use libtest_mimic::{Arguments, Failed, Trial};
 
@@ -63,9 +63,9 @@ fn boot(m: Mode) -> Guest {
     Guest::boot(GuestConfig { mode: m, ..Default::default() }).unwrap()
 }
 
-/// The program's stdio granted: stdin read, stdout and stderr write.
+/// The program's stdio granted: fds 0-2.
 fn stdio(s: &mut exobox::tcb::Config) -> exobox::tcb::Result<()> {
-    s.grant(0, Access::Read).grant(1, Access::Write).grant(2, Access::Write);
+    s.grant(0).grant(1).grant(2);
     Ok(())
 }
 

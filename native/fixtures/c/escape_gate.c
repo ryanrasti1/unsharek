@@ -36,10 +36,8 @@ int main(int argc, char **argv)
 		{"openat", SYS_openat, AT_FDCWD, (long)"/etc/passwd", O_RDONLY},
 		{"socket", SYS_socket, AF_INET, SOCK_STREAM, 0},
 		{"getppid", SYS_getppid, 0, 0, 0},
-		/* Fds nobody was given: 4000 is open nowhere (the guest's token eventfds are 3 and up);
-		 * stdout is granted for write only. */
-		{"write_4000", SYS_write, 4000, (long)"x", 1},
-		{"read_stdout", SYS_read, 1, (long)buf, 1},
+		/* Only read and write move data, on whatever fds are open (escape.c: an fd nobody was
+		 * given is closed); writev isn't either. */
 		{"writev_stderr", SYS_writev, 2, 0, 0},
 		/* Signals to another process; the sandbox's own pid only, and kill only. */
 		{"kill_other", SYS_kill, target, 0, 0},

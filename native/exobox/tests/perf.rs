@@ -264,7 +264,7 @@ fn template_process(mode: &str) -> ! {
         let child = g
             .spawn(|g| {
                 g.lockdown(|s| {
-                    s.grant(0, exobox::Access::Read).grant(1, exobox::Access::Write).grant(2, exobox::Access::Write);
+                    s.grant(0).grant(1).grant(2);
                     Ok(())
                 })?
                 .exec(&argv, &[])

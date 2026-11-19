@@ -415,8 +415,6 @@ fn escape_gate() -> Vec<Case> {
         ("escape_gate_openat", "openat", ALL),
         ("escape_gate_socket", "socket", ALL),
         ("escape_gate_getppid", "getppid", ALL),
-        ("escape_gate_write_4000", "write_4000", ALL),
-        ("escape_gate_read_stdout", "read_stdout", ALL),
         ("escape_gate_writev_stderr", "writev_stderr", ALL),
         ("escape_gate_kill_other", "kill_other", ALL),
         ("escape_gate_tgkill_other", "tgkill_other", ALL),
