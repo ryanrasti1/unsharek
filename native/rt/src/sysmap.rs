@@ -159,6 +159,13 @@ pub enum Rewrite {
     /// there); the runtime keeps each signal's restorer for delivery and for `old`
     /// (`xabi::sigaction_to_lkl`, `xabi::sigaction_to_x86`).
     SigAction,
+    /// `statx(dfd, path, flags, mask, buf)` → LKL's, with `&tmp` for `buf` (copied out after, or
+    /// `EFAULT`), once `path` is checked to be the program's string (`EFAULT`; NULL only in the
+    /// form the kernel takes without reading it: an fd, `AT_EMPTY_PATH`). LKL reads a bad pointer
+    /// with no MMU to fault in, so the program's NULL was the sandbox's SIGSEGV, and Rust's std
+    /// probes statx with `statx(0, NULL, 0, STATX_ALL, NULL)` expecting `EFAULT` (cargo, at its
+    /// first missing config file).
+    Statx,
     /// `fork()`, `vfork()`: the runtime's `clone` (`Emulate::Clone`) with `(SIGCHLD, 0, 0, 0, 0)`.
     /// vfork is a fork: its child can't share the parent's memory across host processes, and
     /// POSIX allows it (the parent just doesn't wait for the exec).
@@ -238,6 +245,7 @@ pub mod lkl {
     pub const UNLINKAT: u16 = 35;
     pub const UTIMENSAT: u16 = 88;
     pub const CLOCK_GETTIME: u16 = 113;
+    pub const STATX: u16 = 291;
 }
 
 /// Constants the rewrites pass (the same values on x86-64 and asm-generic).
@@ -246,6 +254,8 @@ pub mod k {
     pub const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
     pub const AT_REMOVEDIR: i32 = 0x200;
     pub const AT_EMPTY_PATH: i32 = 0x1000;
+    pub const AT_NO_AUTOMOUNT: i32 = 0x800;
+    pub const AT_STATX_SYNC_TYPE: i32 = 0x6000;
     /// `creat`'s flags: `O_CREAT | O_WRONLY | O_TRUNC`.
     pub const CREAT_FLAGS: i32 = 0o100 | 0o1 | 0o1000;
     pub const SIGCHLD: i32 = 17;
@@ -477,7 +487,6 @@ table! {
     326 copy_file_range Lkl(285);
     327 preadv2 Lkl(286);
     328 pwritev2 Lkl(287);
-    332 statx Lkl(291);
     424 pidfd_send_signal Lkl(424);
     434 pidfd_open Lkl(434);
     436 close_range Lkl(436);
@@ -522,6 +531,7 @@ table! {
     235 utimes Rw(R::Utimes);
     261 futimesat Rw(R::Futimesat);
     262 newfstatat Rw(R::Stat(StatForm::At));
+    332 statx Rw(R::Statx);
     284 eventfd Rw(R::Args(&EVENTFD));
 
     // ---- Emulated in the runtime -----------------------------------------------------------
@@ -878,6 +888,7 @@ mod tests {
             ("unlinkat", lkl::UNLINKAT),
             ("utimensat", lkl::UTIMENSAT),
             ("clock_gettime", lkl::CLOCK_GETTIME),
+            ("statx", lkl::STATX),
         ];
         for (x, l) in named {
             assert_eq!(g.get(x), Some(&l), "lkl::{x}");
@@ -932,6 +943,8 @@ mod tests {
         assert_eq!(k::AT_SYMLINK_NOFOLLOW, libc::AT_SYMLINK_NOFOLLOW);
         assert_eq!(k::AT_REMOVEDIR, libc::AT_REMOVEDIR);
         assert_eq!(k::AT_EMPTY_PATH, libc::AT_EMPTY_PATH);
+        assert_eq!(k::AT_NO_AUTOMOUNT, libc::AT_NO_AUTOMOUNT);
+        assert_eq!(k::AT_STATX_SYNC_TYPE, libc::AT_STATX_SYNC_TYPE);
         assert_eq!(k::SIGCHLD, libc::SIGCHLD);
         assert_eq!(k::F_GETFD, libc::F_GETFD);
         assert_eq!(k::CLOCK_REALTIME, libc::CLOCK_REALTIME);

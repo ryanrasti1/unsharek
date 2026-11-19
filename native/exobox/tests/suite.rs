@@ -1,7 +1,10 @@
-//! The regression suite: one table of cases (`cases()`), each run natively (which checks the test
-//! itself) and under `exobox run` in every mode it names. A run is a trial named
+//! The host-side regression suite: one table of cases (`cases()`), each a program run natively
+//! (which checks the test itself) and under `exobox run` in every mode it names, and checked from
+//! the host: its exit status or signal, its stdio (input given, output read late), its CPU time,
+//! files on the host, the CLI's flags, programs from nixpkgs. A run is a trial named
 //! `<case>::<native|coroutine|threaded|fork>`, with a timeout and an optional CPU budget, so
-//! `cargo nextest run -E 'test(/::fork$/)'` runs one mode and a hang fails in seconds.
+//! `cargo nextest run -E 'test(/::fork$/)'` runs one mode and a hang fails in seconds. What a
+//! program observes inside the guest is native/guest-tests' (Rust #[test]s, a sandbox each).
 
 use std::io::Write;
 use std::os::unix::process::ExitStatusExt;
@@ -38,7 +41,7 @@ impl Mode {
 
 const ALL: &[Mode] = &[Mode::Coroutine, Mode::Threaded, Mode::Fork];
 const FORK: &[Mode] = &[Mode::Fork];
-const PARALLEL: &[Mode] = &[Mode::Threaded, Mode::Fork];
+const THREADED_FORK: &[Mode] = &[Mode::Threaded, Mode::Fork];
 const SIGSYS: i32 = 31;
 
 enum Prog {
@@ -169,22 +172,8 @@ fn group_exit(name: &'static str, waiters: &'static str, how: &'static str, st: 
 
 fn cases() -> Vec<Case> {
     let mut c = vec![
-        // Basics, in every mode.
-        fixture("hello", ALL),
-        fixture("shmap", ALL),
-        case("sleepy", Prog::Fixture("sleepy"), ALL, ok("SLEEP_OK")),
-        fixture("threadpoll", ALL),
-        fixture("thread_fds", ALL),
-        fixture("futex_wake", ALL),
-        fixture("small_stack", ALL),
-        fixture("stdio_meminfo", ALL),
-        fixture("sigsys", ALL),
-        // Handlers run as the program (item 8); its fork steps only where there are processes.
-        fixture("signals", ALL),
-        fixture("gsbase", ALL),
+        // An idle sandbox's host CPU (the guest's own accounting doesn't see the host's spin).
         Case { cpu_budget: Some(Duration::from_millis(100)), ..fixture("idle", ALL) },
-        // JITs work with no flag: W^X would be hardening of the program, not the sandbox's.
-        fixture("rwx", ALL),
         // How a run ends.
         case("exit_code", Prog::Fixture("exit_status"), ALL, status(Status::Code(42)))
             .args(vec![Arg::Lit("exit42")]),
@@ -248,7 +237,6 @@ fn cases() -> Vec<Case> {
             .args(vec![Arg::Fixture("libplug.so"), Arg::Denied("libplug.so")])
             .native(Some(ok("DENIED_LOADED"))),
         // Fork mode.
-        fixture("fork", FORK),
         // Init's end is the sandbox's: a child waiting in pause() doesn't outlive it on the host.
         fixture("fork_ends", FORK).args(vec![Arg::Lit("init_exit")]).native(None),
         // A child's death on the host (the filter's kill) is the sandbox's, by the same signal.
@@ -260,11 +248,11 @@ fn cases() -> Vec<Case> {
         )
         .args(vec![Arg::Lit("child_killed")])
         .native(None),
-
-        fixture("forkthreads", FORK),
-        // Exec's kernel half: close-on-exec fds, handlers reset, the other threads ended.
-        fixture("exec_reset", ALL),
-        fixture("exec_reset", ALL).renamed("exec_reset_threads").args(vec![Arg::Lit("threads")]),
+        // Exec's kernel half: close-on-exec fds, handlers reset, the other threads ended. In-guest
+        // checks, guest-tests' exec::exec_reset's; here only in the modes where that one is
+        // ignored (an exec from libtest's thread panics the runtime there), until it runs there.
+        fixture("exec_reset", THREADED_FORK),
+        fixture("exec_reset", THREADED_FORK).renamed("exec_reset_threads").args(vec![Arg::Lit("threads")]),
         // A process ends though its other threads wait where the runtime has them, not the kernel:
         // an emulated futex, a host fd (stdin; a passed fd is tests/guest.rs's). By exit, by a
         // signal's default action, and by an itimer's while every thread waits so.
@@ -321,9 +309,7 @@ fn cases() -> Vec<Case> {
                 .renamed("stdout_full_child_block")
                 .args(vec![Arg::Lit("child"), Arg::Lit("block")])
         },
-        fixture("fork_rng", FORK),
-        fixture("settid", FORK),
-        // The pipeline that found settid's bug: a C++ program on a pipeline's left side, in a
+        // The pipeline that found guest-tests' process::settid's bug: a C++ program on a pipeline's left side, in a
         // bash exec'd in the guest (it failed ~5 runs in 6 in capnix tier A).
         case(
             "pipeline_cpp",
@@ -351,8 +337,20 @@ fn cases() -> Vec<Case> {
         },
         // The CPUs a program is told: the host's where its threads run in parallel, one in
         // coroutine mode (rustc sized its codegen from it).
-        Case { check: Some(nproc_is_hosts), ..case("nproc", Prog::Fixture("nproc"), PARALLEL, ok("NPROC ")) },
+        Case { check: Some(nproc_is_hosts), ..case("nproc", Prog::Fixture("nproc"), THREADED_FORK, ok("NPROC ")) },
         case("nproc_one", Prog::Fixture("nproc"), &[Mode::Coroutine], ok("NPROC 1")).native(None),
+        // cargo, rustup-less: Rust's std probes statx with NULLs (statx_probe), which crashed every
+        // cargo at startup. Its build in fork mode: cargo, rustc and cc, each a process of its own.
+        case("cargo_version", Prog::External("EXOBOX_TEST_CARGO"), ALL, ok("cargo ")).args(vec![Arg::Lit("--version")]),
+        Case {
+            timeout: Duration::from_secs(20),
+            ..case("cargo_build", Prog::External("EXOBOX_TEST_BASH"), FORK, ok("CARGO_BUILD_OK"))
+                .args(vec![
+                    Arg::Lit("-c"),
+                    Arg::Lit("export PATH=$EXOBOX_TEST_COREUTILS/bin:${EXOBOX_TEST_RUSTC%/*}:${EXOBOX_TEST_GCC%/*}:$PATH; d=$(mktemp -d -p /tmp) && cd $d && export CARGO_HOME=$d/home && mkdir src && printf '[package]\\nname = \"t\"\\nversion = \"0.1.0\"\\nedition = \"2021\"\\n' > Cargo.toml && printf 'fn main() { std::process::exit(7) }\\n' > src/main.rs && $EXOBOX_TEST_CARGO build --offline -q && ./target/debug/t; [ $? = 7 ] && echo CARGO_BUILD_OK; rm -rf $d"),
+                ])
+                .uses(&["EXOBOX_TEST_CARGO", "EXOBOX_TEST_RUSTC", "EXOBOX_TEST_GCC", "EXOBOX_TEST_COREUTILS"])
+        },
         fixture("forkbomb", FORK).flags(&["--max-procs=16"]).env(&[("EXOBOX_TEST_MAX_PROCS", "16")]).native(None),
         Case {
             timeout: Duration::from_secs(15),

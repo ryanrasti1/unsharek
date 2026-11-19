@@ -20,7 +20,8 @@
 //! `sysmap` describes, with `xabi`'s translations; `Emulate`: memory in the arena, threads as
 //! coroutines, futexes on the scheduler (`futex`), the thread pointer in the trap frame; `Errno`
 //! its errno. Pointers the emulations dereference are checked against the arena first (EFAULT);
-//! those passed to LKL are LKL's to read (it has no MMU: a bad one is a fault in the sandbox).
+//! those passed to LKL are LKL's to read (it has no MMU: a bad one is a fault in the sandbox),
+//! except where programs pass bad ones on purpose (`statx`: Rust's probe, `Rewrite::Statx`).
 //!
 //! **Ends.** A task's end comes back from the kernel as the `task_exit` host op (item 6), on the
 //! task's own coroutine: init's (pid 1, after its exit ran in the guest) ends the sandbox with
@@ -1578,10 +1579,21 @@ fn serve(uc: &mut Ucontext, nr: usize, a: [usize; 6]) -> isize {
     if let Some(r) = exe {
         return r;
     }
-    // Setup names the machine (sethostname, setdomainname: the kernel's 161, 162); the program
-    // gets sysmap's EPERM for them, as a machine's administration.
-    if matches!(nr, 170 | 171) && S.phase.get() == Phase::Setup {
-        return lkl_call(nr as c_long - 9, a);
+    // A guard is the guest's init, the machine's administrator: it names the machine
+    // (sethostname, setdomainname: the kernel's 161, 162) and sets its clock (settimeofday,
+    // clock_settime: 170, 112; their structs are x86-64's). The program gets sysmap's EPERM for
+    // them, as a machine's administration.
+    if S.phase.get() == Phase::Setup {
+        let admin = match nr {
+            170 => 161,
+            171 => 162,
+            164 => 170,
+            227 => 112,
+            _ => 0,
+        };
+        if admin != 0 {
+            return lkl_call(admin, a);
+        }
     }
     match sysmap::route(nr) {
         Route::Lkl(n) if sends_signal(nr) => {
@@ -1720,9 +1732,33 @@ fn rewrite(rw: Rewrite, a: [usize; 6]) -> isize {
             r
         }
         Rewrite::SigAction => sigaction(a),
+        Rewrite::Statx => statx(a),
         // Fork mode's are `serve`'s; the other modes have no processes.
         Rewrite::Fork => -(Errno::NOSYS.raw_os_error() as isize),
     }
+}
+
+/// `Rewrite::Statx`: the program's pointers checked before LKL reads or writes them. The errors
+/// are Linux's, in its order: the path's (`EFAULT`, `ENAMETOOLONG`), the lookup's, the buffer's.
+fn statx(a: [usize; 6]) -> isize {
+    let (dfd, path, flags) = (a[0] as i32, a[1], a[2] as i32);
+    // `sys_statx`'s short cut, which never reads a NULL path (`vfs_empty_path`).
+    let empty_form = flags & !(k::AT_NO_AUTOMOUNT | k::AT_STATX_SYNC_TYPE) == k::AT_EMPTY_PATH && dfd >= 0;
+    if path == 0 && !empty_form {
+        return -(Errno::FAULT.raw_os_error() as isize);
+    }
+    if path != 0
+        && let Err(e) = user_cstr(path, exec::PATH_MAX)
+    {
+        return -(e.raw_os_error() as isize);
+    }
+    // `struct statx` is 256 bytes, the same on both (`xabi`); LKL fills all of it.
+    let mut tmp = [0u64; 32];
+    let r = lkl_call(lkl::STATX as c_long, [a[0], path, a[2], a[3], tmp.as_mut_ptr() as usize, 0]);
+    if r < 0 {
+        return r;
+    }
+    ret(write_user(a[4], tmp).map(|_| 0))
 }
 
 fn sigaction(a: [usize; 6]) -> isize {
