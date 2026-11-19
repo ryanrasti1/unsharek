@@ -624,5 +624,23 @@ fn main() {
         }
         Ok(())
     }));
+    // capnix's repro: edge-triggered epoll on a passed fd, three rounds (tokio's use).
+    trials.push(Trial::test("passfd_epoll_et::coroutine", || {
+        let argv = vec![fx::bin("fd_epoll_et").display().to_string()];
+        let (code, out, err) = run("passfd", &argv, |mut sock| {
+            for _ in 0..3 {
+                let mut b = [0u8; 5];
+                if sock.read_exact(&mut b).is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(50));
+                let _ = sock.write_all(b"ping");
+            }
+        })?;
+        if code != 0 || !out.contains("FD_EPOLL_ET_OK") {
+            return Err(format!("exit {code}\n--- stdout:\n{out}\n--- stderr:\n{err}").into());
+        }
+        Ok(())
+    }));
     libtest_mimic::run(&args, trials).exit();
 }
