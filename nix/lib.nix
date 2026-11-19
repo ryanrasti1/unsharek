@@ -98,13 +98,14 @@ let
 
       # The hermetic tests only, with nextest (lkl-sys's boot test needs a process per test, as
       # in ./test): lkl-sys's (the given kernel boots, answers syscalls and halts; lkl.o has no
-      # relaxable relocations; the shim), and exobox's and exobox-erofs's unit tests. Not the
+      # relaxable relocations; the shim), and exobox's (the security filter's among them), exobox-kit's
+      # and exobox-erofs's unit tests. Not the
       # suite, the store test, erofs's image tests or exobox-rt's: they need the devshell's
       # programs (EXOBOX_TEST_*, fsck.erofs), the host's nix-store, or a kernel checkout.
       useNextest = true;
       # No spaces in an argument: the hook splits the flags on whitespace.
       cargoTestFlags = [
-        "-p" "lkl-sys" "-p" "exobox" "-p" "exobox-erofs"
+        "-p" "lkl-sys" "-p" "exobox" "-p" "exobox-kit" "-p" "exobox-erofs"
         "-E" "package(lkl-sys)|kind(lib)"
       ];
 
