@@ -84,6 +84,9 @@ let
           ../Cargo.toml
           ../Cargo.lock
           (fs.difference ../native (fs.fileFilter (f: f.hasExt "md") ../native))
+          # A workspace member: cargo loads every member's manifest, built or not (the
+          # package failed to build without it).
+          (fs.difference ../examples (fs.fileFilter (f: f.hasExt "md") ../examples))
           ../.config
         ];
       };
