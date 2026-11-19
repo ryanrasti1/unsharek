@@ -293,9 +293,24 @@ pub fn phase() -> Phase {
     S.phase.get()
 }
 
-/// A guest syscall from runtime code (generic number), as the current coroutine's task.
+/// A guest syscall from runtime code (generic number), as the current coroutine's task. In
+/// threaded mode with the CPU token held for it, as a trap's dispatch holds it: setup code calls
+/// this directly, not through a trap (without the token, the kernel ran on two host threads at
+/// once: the kernel idler's timer and setup's call, and LKL's CPU owner came out wrong).
 pub fn syscall(nr: c_long, a: [usize; 6]) -> isize {
-    lkl_call(nr, a)
+    with_token(|| lkl_call(nr, a))
+}
+
+/// `f` holding threaded mode's CPU token, for runtime code that isn't a trap's dispatch (which
+/// takes it itself). Nothing extra in coroutine mode.
+fn with_token<R>(f: impl FnOnce() -> R) -> R {
+    if !par::enabled() {
+        return f();
+    }
+    let id = par::enter();
+    let r = f();
+    par::leave(id);
+    r
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -316,7 +331,9 @@ pub struct Aux {
 /// `execve` would give. From the setup phase (after [`route`]), on the root.
 pub fn exec(path: &[u8], argv: &[&[u8]], envp: &[&[u8]], aux: Aux) -> Errno {
     S.aux.set(aux);
-    match load(path, argv, envp, false) {
+    // The loader's calls are the kernel's: in threaded mode with the CPU token (not a trap's
+    // dispatch, which takes it itself), given up as the program starts.
+    match with_token(|| load(path, argv, envp, false)) {
         Ok(regs) => {
             // Everything this function's callers have on the root's stack is dead from here: the
             // root's trap frames go below this point (`target`).
