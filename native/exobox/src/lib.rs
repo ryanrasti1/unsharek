@@ -862,7 +862,17 @@ impl Sandbox {
     pub fn run(mut self, argv: &[OsString], env: &[OsString]) -> Result<Infallible, Error> {
         self.guest.own(None)?;
         let expected = if self.mode == Mode::Coroutine { 1 } else { 2 };
-        let threads = std::fs::read_dir("/proc/self/task").map_err(Error::io("/proc/self/task"))?.count();
+        // A thread just joined (the image cache's builders: `std::thread::scope`) is still listed
+        // while it finishes exiting (a join returns when its tid word is cleared, before the
+        // kernel has reaped it): a few milliseconds' grace.
+        let mut threads = 0;
+        for _ in 0..100 {
+            threads = std::fs::read_dir("/proc/self/task").map_err(Error::io("/proc/self/task"))?.count();
+            if threads <= expected {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         if threads != expected {
             return Err(Error::Threads(threads, expected));
         }
