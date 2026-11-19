@@ -10,6 +10,7 @@ small versions here were checked to show the same ratios (PERF.md, "The vs-nativ
   ./test --vs-native                       every workload, threaded and fork mode
   ./test --vs-native --modes fork --work make,micro
   ./test --vs-native --exobox PATH         another exobox binary (an experiment's)
+  ./test --vs-native --modes fork,fork:old --variant old=PATH   before and after, interleaved
 
 Workloads: rustc (a generated crate, -C codegen-units=16 --emit=obj: rustc's threads),
 rustmake (4 generated crates and a binary by rustc under make -j4: processes and threads), make
@@ -160,6 +161,8 @@ def main():
     ap.add_argument('--reps', type=int, default=3)
     ap.add_argument('--cpus', default=os.environ.get('BENCH_CPUS', '0-7'))
     ap.add_argument('--exobox', default=os.path.join(bb.ROOT, 'target', 'release', 'exobox'))
+    ap.add_argument('--variant', action='append', default=[], metavar='NAME=PATH',
+                    help='another exobox binary; a mode MODE:NAME runs it (before/after in one run)')
     ap.add_argument('--timeout', type=float, default=60)
     ap.add_argument('--no-fail', action='store_true', help='report only: exit 0 whatever the ratios')
     ap.add_argument('--tmp', default=os.path.join(bb.ROOT, 'target', 'vs-native'))
@@ -167,6 +170,14 @@ def main():
     os.makedirs(a.tmp, exist_ok=True)
     works = [w for w in a.work.split(',') if w]
     modes = [m for m in a.modes.split(',') if m]
+    variants = dict(v.split('=', 1) for v in a.variant)
+
+    def mode_of(m):
+        return m.partition(':')[0]
+
+    def exe_of(m):
+        var = m.partition(':')[2]
+        return variants[var] if var else a.exobox
     fx = fixtures()
     setups = setup(a.tmp, fx)
     cpus = a.cpus or None
@@ -189,9 +200,9 @@ def main():
                 sb, eb, allow = setups[w]
                 for m in ['native'] + modes:
                     for cmd, ops in ((sb, ('getppid', 'futex', 'pingpong')), (eb, ('forkexec',))):
-                        if cmd is eb and m not in ('native', 'fork'):
+                        if cmd is eb and mode_of(m) not in ('native', 'fork'):
                             continue
-                        c = cmd if m == 'native' else bb.sandboxed(a.exobox, m, allow, cmd)
+                        c = cmd if m == 'native' else bb.sandboxed(exe_of(m), mode_of(m), allow, cmd)
                         _, out = go(c, None, f'micro {m}')
                         for op, v in parse_micro(out).items():
                             if op in ops:
@@ -202,9 +213,9 @@ def main():
             if wall:
                 walls.setdefault((w, 'native'), []).append(wall)
             for m in modes:
-                if w not in SINGLE and m != 'fork':
+                if w not in SINGLE and mode_of(m) != 'fork':
                     continue
-                wall, _ = go(bb.sandboxed(a.exobox, m, allow, sb(), max_procs=32 if m == 'fork' else None),
+                wall, _ = go(bb.sandboxed(exe_of(m), mode_of(m), allow, sb(), max_procs=32 if mode_of(m) == 'fork' else None),
                              sandboxed_env(env), f'{w} {m}')
                 if wall:
                     walls.setdefault((w, m), []).append(wall)

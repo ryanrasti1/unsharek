@@ -2,3 +2,4 @@
 /.cache/
 /result*
 /.claude/
+__pycache__/
