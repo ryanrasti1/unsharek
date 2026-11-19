@@ -853,6 +853,10 @@ fn clone(uc: &Ucontext, a: [usize; 6]) -> Result<usize, Errno> {
     }
     let coroutine_slot = if par::enabled() { 0 } else { S.threads.iter().position(|t| !t.used.get()).ok_or(Errno::AGAIN)? };
     let tid = res(lkl_quiet(l::__lkl__NR_new_thread, [0; 6]))?;
+    #[cfg(debug_assertions)]
+    if TEST_PANIC_CLONE.swap(false, core::sync::atomic::Ordering::Relaxed) {
+        panic!("runtime_panic.c's test hook, in a clone");
+    }
     let m = &uc.mcontext;
     let regs = Registers {
         rax: 0,
@@ -1002,6 +1006,11 @@ unsafe extern "C" fn task_exit(pid: core::ffi::c_int, status: core::ffi::c_int) 
 const NR_READLINK: usize = 89;
 const NR_READLINKAT: usize = 267;
 const NR_RT_SIGRETURN: u64 = 15;
+/// The test hook's call ([`serve`]; debug builds): out of the x86-64 table, so ENOSYS natively.
+#[cfg(debug_assertions)]
+const TEST_PANIC: usize = 0x4558;
+#[cfg(debug_assertions)]
+static TEST_PANIC_CLONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Calls that send a signal: after one, the threads parked in the runtime's own waits are woken
 /// to take it (`SCHED.interrupt_waits`). kill, tkill, tgkill, rt_sigqueueinfo,
@@ -1052,6 +1061,7 @@ fn sends_signal(nr: usize) -> bool {
 const SA_ONSTACK: u64 = 0x0800_0000;
 const SA_RESTART: u64 = 0x1000_0000;
 const SS_DISABLE: i32 = 2;
+const SIGABRT: i32 = 6;
 const SIGSEGV: i32 = 11;
 const SIGPIPE: i32 = 13;
 const SIGSYS: i32 = 31;
@@ -1341,6 +1351,47 @@ fn die(sig: i32) -> ! {
     finish(128 + sig)
 }
 
+/// Whether the program runs: a panic now is the runtime's (the program is a foreign binary, so
+/// the only Rust code running is the runtime's), and [`runtime_panic`] is how it ends.
+pub fn program_runs() -> bool {
+    S.phase.get() == Phase::Program
+}
+
+/// A panic in the runtime while the program runs (the binary's panic hook, `exobox`'s
+/// `launch`): the sandbox dies of SIGABRT now, through the host alone, the message on the host's
+/// stderr. std's own way out went through the guest: its message a guest `write`, its `abort`
+/// a guest `tgkill`, served by the very runtime that had panicked, mid-call (in threaded mode
+/// holding the CPU token). A panic that left the guest mid-change (in a clone, after the new
+/// thread's guest task was made) hung every mode: the guest's SIGABRT ended the panicking
+/// thread's task but never its process, whose new task would never run to end, and the sandbox
+/// waited for good (runtime_panic.c's `clone`; exec_thread_main.c's panic found it).
+pub fn runtime_panic(info: &dyn core::fmt::Display) -> ! {
+    struct Buf {
+        b: [u8; 1024],
+        n: usize,
+    }
+    impl core::fmt::Write for Buf {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let k = s.len().min(self.b.len() - self.n);
+            self.b[self.n..self.n + k].copy_from_slice(&s.as_bytes()[..k]);
+            self.n += k;
+            Ok(())
+        }
+    }
+    let mut m = Buf { b: [0; 1024], n: 0 };
+    let _ = core::fmt::write(&mut m, format_args!("exobox: the runtime panicked: {info}\n"));
+    let _ = trap::write(2, &m.b[..m.n]);
+    // Init's process (fork mode: a fork's child kills it, whose end is the sandbox's: the other
+    // processes see its pidfd), with the default action (as `die`). Then the exit, if the signal
+    // didn't end it (every thread blocking it, or the filter's `--deny=errno`).
+    // SAFETY: a signal to the sandbox's process; nothing after it needs the runtime's state.
+    unsafe { trap::gate(filter::NR_KILL as usize, S.host_pid.get() as usize, SIGABRT as usize, 0, 0, 0, 0) };
+    if !par::forked() {
+        let _ = trap::ppoll(None, Some(&xabi::Timespec { tv_sec: 1, tv_nsec: 0 }));
+    }
+    trap::exit_group(128 + SIGABRT)
+}
+
 // ------------------------------------------------------------------------------------------------
 // The guest's own execve.
 
@@ -1559,6 +1610,18 @@ fn served(uc: &mut Ucontext, nr: usize, a: [usize; 6]) {
 }
 
 fn serve(uc: &mut Ucontext, nr: usize, a: [usize; 6]) -> isize {
+    // A test hook, in debug builds only: a runtime panic on demand, inside a served call (in
+    // threaded mode, holding the CPU token), which must end the sandbox (runtime_panic.c). With
+    // 1, armed for the next thread's clone instead, after its guest task is made: the guest is
+    // left mid-change, as the panic that found the hang left it.
+    #[cfg(debug_assertions)]
+    if nr == TEST_PANIC {
+        if a[0] == 1 {
+            TEST_PANIC_CLONE.store(true, core::sync::atomic::Ordering::Relaxed);
+            return 0;
+        }
+        panic!("runtime_panic.c's test hook");
+    }
     // STOPGAP(item 10): readlink, readlinkat(AT_FDCWD) of /proc/self/exe.
     let exe = match nr {
         NR_READLINK => readlink_exe(a[0], a[1], a[2]),

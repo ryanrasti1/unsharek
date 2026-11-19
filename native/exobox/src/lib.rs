@@ -528,6 +528,16 @@ impl Guest {
         let args: Vec<&[u8]> = argv.iter().map(|a| a.as_bytes()).collect();
         let envs: Vec<&[u8]> = env.iter().map(|a| a.as_bytes()).collect();
         let on_start = hooks.install();
+        // Once the program runs, a panic is the runtime's: it ends the sandbox through the host
+        // (`guest::runtime_panic`), not through the guest it was serving. Set now: setting a hook
+        // allocates, which lockdown ends.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if guest::program_runs() {
+                guest::runtime_panic(info);
+            }
+            prev(info)
+        }));
         guest::route()?;
         guest::intercept_begin()?;
         lockdown()?;

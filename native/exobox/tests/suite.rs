@@ -161,6 +161,20 @@ impl Case {
     }
 }
 
+fn runtime_panic(from: &'static str) -> Case {
+    let name = Box::leak(format!("runtime_panic_{from}").into_boxed_str());
+    let expect = Expect {
+        stderr: vec!["the runtime panicked: "],
+        not_stdout: vec!["RUNTIME_PANIC_OK"],
+        ..status(Status::Signal(6))
+    };
+    Case {
+        native: Some(ok("RUNTIME_PANIC_OK")),
+        timeout: Duration::from_secs(3),
+        ..case(name, Prog::Fixture("runtime_panic"), ALL, expect).args(vec![Arg::Lit(from)])
+    }
+}
+
 fn group_exit(name: &'static str, waiters: &'static str, how: &'static str, st: Status) -> Case {
     let expect = Expect { stdout: vec!["GROUP_EXIT_READY"], not_stdout: vec!["GROUP_EXIT_SURVIVED"], ..status(st) };
     Case { hold_stdin: true, ..case(name, Prog::Fixture("group_exit"), ALL, expect).args(vec![Arg::Lit(waiters), Arg::Lit(how)]) }
@@ -270,6 +284,18 @@ fn cases() -> Vec<Case> {
         // Exec's kernel half: close-on-exec fds, handlers reset, the other threads ended.
         fixture("exec_reset", ALL),
         fixture("exec_reset", ALL).renamed("exec_reset_threads").args(vec![Arg::Lit("threads")]),
+        // An exec from a thread while the main thread waits, then a new image that makes threads
+        // (threaded and fork mode freed the scheduler's stackless root at the main thread's end,
+        // and the runtime panicked at the new image's first thread, then hung). The main thread
+        // in libtest's timed futex wait, and in exec_reset's pause.
+        fixture("exec_thread_main", ALL).renamed("exec_thread_main_timed").args(vec![Arg::Lit("timed")]),
+        fixture("exec_thread_main", ALL).renamed("exec_thread_main_pause").args(vec![Arg::Lit("pause")]),
+        // A panic in the runtime ends the sandbox at once, by SIGABRT (it hung in threaded and
+        // fork mode): the debug build's test hook, from the main thread, from another, and in a
+        // thread's clone (the guest left mid-change).
+        runtime_panic("main"),
+        runtime_panic("thread"),
+        runtime_panic("clone"),
         // A process ends though its other threads wait where the runtime has them, not the kernel:
         // an emulated futex, a host fd (stdin; a passed fd is tests/guest.rs's). By exit, by a
         // signal's default action, and by an itimer's while every thread waits so.
