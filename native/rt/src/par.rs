@@ -119,6 +119,12 @@ pub struct HostSlot {
     wnext: Cell<u16>,
     /// Fork mode: the process (`proc_id`) whose host thread this is; 0 is init's.
     proc: AtomicU32,
+    /// Handed the token as an invitation ([`hand`]): the token is free, and this thread may take
+    /// it when it wakes, unless another took it first.
+    invited: AtomicBool,
+    /// Its last invitation was lost to another thread (under `spin`): the next hand-off assigns
+    /// the token to it outright, so a thread can't be passed over for good.
+    lost: Cell<bool>,
 }
 
 impl HostSlot {
@@ -139,6 +145,8 @@ impl HostSlot {
             attach: Cell::new(0),
             clear_tid: Cell::new(0),
             wnext: Cell::new(u16::MAX),
+            invited: AtomicBool::new(false),
+            lost: Cell::new(false),
         }
     }
     fn set_running(&self, t: Tid) {
@@ -295,13 +303,76 @@ fn poke(id: u16) {
     let _ = trap::eventfd_write(slot(id).efd, 1);
 }
 
-/// Block until this host thread holds the token (its eventfd read returns on each hand-off).
+/// Block until this host thread holds the token: assigned to it, or offered ([`hand`]) and free
+/// when it wakes. An offer another thread took first puts it back at the queue's head, and the
+/// next hand-off assigns the token to it.
 ///
 /// In a forked process, the wait also watches init's pidfd: when init's process is gone (its end
 /// is the sandbox's, or it crashed on the host), nothing would hand this thread the token again,
 /// and the process ends here instead of waiting for good (holding the sandbox's stdout open).
 fn wait_token(id: u16) {
+    wait_token_inner(id);
+    // Held: not in the queue any more (a thread put back in line after a lost offer can be
+    // assigned the token by a directed hand-off instead of from the queue).
+    if slot(id).lost.get() || PAR.whead.get() != u16::MAX {
+        lock();
+        unqueue(id);
+        slot(id).lost.set(false);
+        unlock();
+    }
+}
+
+/// Take `id` out of the acquire-waiter queue, if it is in it (under the lock).
+fn unqueue(id: u16) {
+    let mut prev = u16::MAX;
+    let mut i = PAR.whead.get();
+    while i != u16::MAX {
+        let next = slot(i).wnext.get();
+        if i == id {
+            if prev == u16::MAX {
+                PAR.whead.set(next);
+            } else {
+                slot(prev).wnext.set(next);
+            }
+            if PAR.wtail.get() == id {
+                PAR.wtail.set(prev);
+            }
+            slot(id).wnext.set(u16::MAX);
+            return;
+        }
+        prev = i;
+        i = next;
+    }
+}
+
+fn wait_token_inner(id: u16) {
+    let h = slot(id);
     while PAR.owner.load(Ordering::Acquire) != id as u32 {
+        if h.invited.swap(false, Ordering::AcqRel) {
+            lock();
+            let o = PAR.owner.load(Ordering::Relaxed);
+            if o == NONE_SLOT || o == id as u32 {
+                PAR.owner.store(id as u32, Ordering::Release);
+                unlock();
+                return;
+            }
+            // Taken meanwhile: first in line (out of wherever it was: a thread queued in acquire
+            // can be offered the token by a directed hand-off), and the next hand-off is ours
+            // outright.
+            h.lost.set(true);
+            unqueue(id);
+            h.wnext.set(PAR.whead.get());
+            if PAR.whead.get() == u16::MAX {
+                PAR.wtail.set(id);
+            }
+            PAR.whead.set(id);
+            unlock();
+            // As acquire does: the holder may be the idler, asleep to its next timer with the
+            // token; it hands the token on when poked. (Without this, an offer lost to the idler
+            // left the thread waiting until the idler's timer, or for good: guest_fork time::clock.)
+            poke(o as u16);
+            continue;
+        }
         if forked() {
             let mut fds = [
                 PollFd { fd: slot(id).efd as i32, events: POLLIN, revents: 0 },
@@ -347,6 +418,21 @@ pub fn acquire(id: u16) {
     wait_token(id);
 }
 
+/// Pass the token to `t` (under the lock; the caller pokes `t` after unlocking). An offer: the
+/// token is left free and `t` is invited to take it when it wakes, so a thread already running
+/// that wants it meanwhile takes it at once, instead of the token sitting with a sleeping thread
+/// for the host's wake-up latency (18-66 µs: 4.1 s of the token's 5.6 s held in make -j4, nearly
+/// all of rustc's and cargo's, PERF.md). A thread that lost its last offer is assigned it outright.
+fn hand(t: u16) {
+    let h = slot(t);
+    if h.lost.replace(false) {
+        PAR.owner.store(t as u32, Ordering::Release);
+    } else {
+        PAR.owner.store(NONE_SLOT, Ordering::Release);
+        h.invited.store(true, Ordering::Release);
+    }
+}
+
 fn pop_waiter() -> Option<u16> {
     let h = PAR.whead.get();
     if h == u16::MAX {
@@ -383,7 +469,11 @@ fn give(id: u16, allow_none: bool) -> u32 {
     } else {
         NONE_SLOT
     };
-    PAR.owner.store(target, Ordering::Release);
+    if target == NONE_SLOT || target == id as u32 {
+        PAR.owner.store(target, Ordering::Release);
+    } else {
+        hand(target as u16);
+    }
     unlock();
     if target != NONE_SLOT && target != id as u32 {
         poke(target as u16);
@@ -446,7 +536,7 @@ fn sched_loop(arg: usize) -> usize {
         lock();
         let target = s.par_bound_elsewhere(id).map(|h| h as u32).or_else(|| pop_waiter().map(|w| w as u32));
         if let Some(t) = target {
-            PAR.owner.store(t, Ordering::Release);
+            hand(t as u16);
             unlock();
             poke(t as u16);
             wait_token(id);
@@ -1056,6 +1146,8 @@ pub fn after_fork(s: &'static Sched) -> Result<(), rustix::io::Errno> {
     PAR.wtail.set(u16::MAX);
     for i in 0..N_SLOTS {
         PAR.slots[i].wnext.set(u16::MAX);
+        PAR.slots[i].invited.store(false, Ordering::Relaxed);
+        PAR.slots[i].lost.set(false);
         // eventfd2(0, 0) then dup2 onto the slot's fd, through the gate (the routing filter may
         // be in: rustix's would trap).
         // SAFETY: a new eventfd, moved to the fd the filter pins; the inherited one is closed.
