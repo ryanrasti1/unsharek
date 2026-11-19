@@ -145,7 +145,7 @@ pub struct PollFd {
     pub revents: i16,
 }
 
-/// `ppoll` on at most one fd, no signal mask (the filter pins both): the runtime's one wait.
+/// `ppoll` on at most one fd, no signal mask (the filter pins both; [`ppoll_fds`] for more).
 /// `timeout` `None` waits forever. Returns how many fds are ready (0 on timeout).
 pub fn ppoll(fd: Option<&mut PollFd>, timeout: Option<&Timespec>) -> Result<usize, Errno> {
     let (fds, n) = match fd {
@@ -156,6 +156,17 @@ pub fn ppoll(fd: Option<&mut PollFd>, timeout: Option<&Timespec>) -> Result<usiz
     // SAFETY: the kernel reads the timespec and reads/writes the one pollfd, both borrowed.
     // sigsetsize 8 is the kernel's sigset_t, though with no mask it isn't read.
     check(unsafe { gate(NR_PPOLL as usize, fds, n, ts, 0, 8, 0) })
+}
+
+/// `ppoll` on up to [`crate::filter::PPOLL_FDS`] fds at once, no signal mask (the filter pins
+/// both): the idle wait over the fds coroutines and the hooks' executor wait on. `timeout` `None`
+/// waits forever. Returns how many are ready, each one's `revents` set.
+pub fn ppoll_fds(fds: &mut [PollFd], timeout: Option<&Timespec>) -> Result<usize, Errno> {
+    let n = fds.len().min(crate::filter::PPOLL_FDS as usize);
+    let p = if n == 0 { 0 } else { fds.as_mut_ptr() as usize };
+    let ts = timeout.map_or(0, |t| t as *const Timespec as usize);
+    // SAFETY: the kernel reads the timespec and reads/writes the n pollfds, all borrowed.
+    check(unsafe { gate(NR_PPOLL as usize, p, n, ts, 0, 8, 0) })
 }
 
 /// `madvise(addr, len, MADV_DONTNEED)`: freed arena pages back to the host. The filter allows it

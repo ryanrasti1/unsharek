@@ -188,14 +188,17 @@ fn stdio_and_tokens() {
 #[test]
 fn ppoll() {
     for mode in MODES {
-        edges(mode, NR_PPOLL, [0; 6], 1, &[(0, 1)]);
+        // Up to eight pollfds (the idle wait over several held fds), never nine.
+        edges(mode, NR_PPOLL, [0; 6], 1, &[(0, PPOLL_FDS)]);
         edges(mode, NR_PPOLL, [0, 1, 0, 0, 0, 0], 3, &[(0, 0)]);
         // The pollfd pointer, the timeout and sigsetsize are anything.
         for arg in [0, 2, 4, 5] {
             edges(mode, NR_PPOLL, [0, 1, 0, 0, 0, 0], arg, &[(0, u64::MAX)]);
         }
         let prog = build(mode, Deny::Errno, &[]);
-        assert_eq!(check(&prog, gate(NR_PPOLL, [0, 2, 0, 0, 0, 0])), DENY);
+        assert_eq!(check(&prog, gate(NR_PPOLL, [0, 8, 0, 0, 0, 0])), ALLOW);
+        assert_eq!(check(&prog, gate(NR_PPOLL, [0, 9, 0, 0, 0, 0])), DENY);
+        assert_eq!(check(&prog, gate(NR_PPOLL, [0, 8, 0, 1, 0, 0])), DENY);
         assert_eq!(check(&prog, gate(NR_PPOLL, [0, 1, 0, 1, 0, 0])), DENY);
         assert_eq!(check(&prog, gate(NR_PPOLL, [0, 1, 0, 1 << 32, 0, 0])), DENY);
     }

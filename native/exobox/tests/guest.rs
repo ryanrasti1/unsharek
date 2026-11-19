@@ -26,6 +26,11 @@ const CHILD: &str = "EXOBOX_GUEST_TEST_CHILD";
 const CHILD_MODE: &str = "EXOBOX_GUEST_TEST_MODE";
 const CHILD_ARGS: &str = "EXOBOX_GUEST_TEST_ARGS";
 
+/// The hooks: only the closure's images mounted, before the exec.
+fn setup(mounts: Vec<(exobox::Image, PathBuf)>) -> exobox::Hooks {
+    exobox::Hooks { pre_exec: exobox::PreExec::new(move || exobox::setup::mount_closure(&mounts)), ..Default::default() }
+}
+
 /// The child: boot `layer`, mount the fixtures' closure, run fixture `name`.
 fn child(layer: &str, name: &str) -> ! {
     let program = fx::bin(name);
@@ -44,7 +49,7 @@ fn child(layer: &str, name: &str) -> ! {
         "guest" => {
             let mut g = exobox::Guest::boot(exobox::GuestConfig::default()).unwrap();
             let mounts: Vec<_> = store.mounts.iter().map(|m| (g.map_image(&m.image).unwrap(), m.guest.clone())).collect();
-            g.run(&argv, &env, move || exobox::setup::mount_closure(&mounts)).unwrap_err()
+            g.run(setup(mounts), &argv, &env).unwrap_err()
         }
         _ => {
             let m = if mode == "threaded" { exobox::Mode::Threaded } else { exobox::Mode::Coroutine };
@@ -56,7 +61,7 @@ fn child(layer: &str, name: &str) -> ! {
                 sb.pass_fd(unsafe { std::os::fd::OwnedFd::from_raw_fd(3) }, 1000);
             }
             let mounts: Vec<_> = store.mounts.iter().map(|m| (sb.map_image(&m.image).unwrap(), m.guest.clone())).collect();
-            sb.run(&argv, &env, move || exobox::setup::mount_closure(&mounts)).unwrap_err()
+            sb.run(setup(mounts), &argv, &env).unwrap_err()
         }
     };
     eprintln!("exobox: {e}");

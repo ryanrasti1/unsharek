@@ -163,7 +163,9 @@ fn bindings(manifest: &Path, include: &[PathBuf], out_dir: &Path) {
         .rust_edition(bindgen::RustEdition::Edition2024)
         // What lkl.o defines and the host-operations table, nothing of the uapi beyond them.
         .allowlist_function(
-            "lkl_(init|start_kernel|cleanup|is_running|syscall|sys_halt|printf|bug)",
+            // lkl_net_*: the host's calls for networking (tsi.c); lkl_hostfd_ready: a host fd's
+            // readiness for its guest file's pollers (hostfd.c)
+            "lkl_(init|start_kernel|cleanup|is_running|syscall|sys_halt|printf|bug|net_.*|hostfd_ready)",
         )
         .allowlist_type("lkl_host_operations|lkl_jmp_buf|lkl_thread_t")
         .allowlist_var("__lkl__NR_.*")

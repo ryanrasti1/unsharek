@@ -35,16 +35,24 @@ below:
 let mut guest = exobox::Guest::boot(config)?;          // host work: reserve memory, boot the kernel
 let store = guest.map_image("store.erofs")?;           // host mmap now, a read-only guest disk
 let manifest = std::fs::read("manifest.json")?;        // still the host's syscalls
-guest.run(&argv, &env, move || {                       // from here on, syscalls go to the guest
+let setup = PreExec::new(move || {                    // from here on, syscalls go to the guest:
     exobox::setup::mount_erofs(&store, "/nix/store")?; //   ordinary Rust, in the guest:
     std::fs::write("/etc/app/manifest.json", &manifest)//   mounts, files, whatever the program needs
-})                                                     // then the program is exec'd; never returns
+});
+guest.run(Hooks { pre_exec: setup, ..Default::default() }, &argv, &env)
+                                                       // then the program is exec'd; never returns
 
 // 2. Security is a closure on top of that: install the host filter before the program starts.
 // 3. Sandbox: Guest plus the default profiles (modes, deny action, extra rules).
 let mut sb = exobox::Sandbox::boot(Mode::Threaded, config)?;
 let store = sb.map_image(fd)?;
-sb.run(&argv, &env, move || exobox::setup::mount_erofs(&store, "/nix/store"))
+let channel = sb.hold_fd(provider_socket)?;            // a provider's connection, made before run
+sb.run(Hooks {
+    pre_exec: PreExec::new(move || exobox::setup::mount_erofs(&store, "/nix/store")),
+    on_connect: OnConnect::new(move |cx, pid, addr| provider.connect(cx, channel, pid, addr)),
+    on_resolve: OnResolve::new(move |cx, pid, name| provider.resolve(cx, channel, pid, name)),
+    ..Default::default()                               // on_listen: none, so listens stay the guest's
+}, &argv, &env)
 ```
 
 - **`Guest::boot`** reserves the program's memory and the kernel's, boots the kernel, and sets up
@@ -53,12 +61,28 @@ sb.run(&argv, &env, move || exobox::setup::mount_erofs(&store, "/nix/store"))
 - **`map_image`** is the one way to give the guest host data that it maps: the image is mapped
   before lockdown and becomes a read-only block device, `/dev/exobox/<name>`. exobox owns the
   mapping, which it later maps code from in place and shares across forks.
-- **`run(argv, env, before_exec)`** installs the routing filter, runs `before_exec` as the guest's
+- **`run(hooks, argv, env)`** installs the routing filter, runs `hooks.pre_exec` as the guest's
   init (PID 1, the process the program becomes), then execs the program inside the guest. Inside
-  the closure every syscall is the guest's: host data has to be read before `run` and moved in.
-  Files and fds the closure leaves open are the program's.
-- **`Sandbox`** is `Guest` whose `before_exec` runs the caller's setup and then stacks the
-  security filter for the mode.
+  `pre_exec` every syscall is the guest's: host data has to be read before `run` and moved in.
+  Files and fds it leaves open are the program's.
+- **The network hooks** (`exobox::net`): the program's sockets are its own for loopback; a
+  `connect` anywhere else is `on_connect(cx, pid, addr)`, whose stream exobox copies to and from
+  the program's socket (half-closes and resets carried both ways); a `listen` not bound to loopback
+  is offered to `on_listen`, whose inbound streams the program accepts; name lookups (the guest's
+  libc asking the nameserver in its `/etc/resolv.conf`) are `on_resolve(cx, pid, name)`. Errors
+  are `NetError`s, which become errnos (`Refused` ECONNREFUSED, `Denied` EACCES, ...). With no
+  hook, everything but loopback is unreachable. The hooks are async: they run after lockdown, on a
+  small executor inside the sandbox (`Cx`: `spawn`, `now`, `sleep_until`, `readable`/`writable`
+  on held fds), so one long-lived task can own a provider's multiplexed connection, a host fd held
+  for it before `run` (`hold_fd`: the filter allows `read` and `write` on exactly it). futures-io's
+  `AsyncRead`/`AsyncWrite` by default, tokio's with the `tokio` feature; `OnConnect::drive` hands a
+  provider the program's end (`GuestSocket`) to drive itself.
+- **The authority rule.** The hooks run in the program's address space: a compromised program
+  can read and write their memory and drive the provider's connection itself. So that connection
+  must carry no more authority than the program's own channel: policy (which addresses, which
+  names) lives behind it, at its other end, never in the hook.
+- **`Sandbox`** is `Guest` whose `pre_exec` runs the caller's setup and then stacks the security
+  filter for the mode.
 - **`exobox::setup`** holds small helpers for setup closures, written as ordinary Rust
   (`mount_erofs`, `mount_closure` for a Nix closure). The CLI's `exobox run` is
   `Sandbox::boot`, the closure's images mapped, `run` with `mount_closure`.
@@ -98,6 +122,15 @@ that mounts `/dev/exobox/<name>` with `mount(2)` and execs the next one).
   lockdown, read-only for the guest's block device and privately into the arena's top, and the
   program's mappings of its files are answered with where their bytes already are there, shared by
   every sandbox through the host's page cache (what it writes is copy-on-write, its own).
+- **The network.** The kernel impersonates the program's AF_INET sockets (its `tsi.c`, after
+  libkrunfw's Transparent Socket Impersonation, with direct calls to the host instead of vsock):
+  loopback, binds and listens are an inner socket of the guest's own; any other connect is a host
+  op, answered when the hook is, and then the socket's bytes go through a kernel socketpair whose
+  other end the runtime reads and writes, woken by the kernel when it can. So poll, epoll,
+  nonblocking connects and `SO_ERROR` work as on Linux, and the runtime knows no protocol. A
+  datagram to port 53 is a resolver query, answered from `on_resolve`. The runtime's executor waits
+  on the hooks' host fds in the scheduler's idle wait (one `ppoll` over up to eight fds); passed
+  fds (`pass_fd`) poll as their host fd does, the same way.
 - **The kernel.** Stock LKL plus a short series (`lkl/README.md`): idle that waits instead of
   spinning, the program as PID 1, threads that join their process, a block device over host memory,
   and the rest of what a cooperative in-process host needs.
@@ -124,16 +157,21 @@ that mounts `/dev/exobox/<name>` with `mount(2)` and execs the next one).
    a read-write block device served over a channel (a new kernel driver: Nix's `/nix/var` on
    ext4); FUSE in the store's kernel (a config fragment); the streaming image builder (item 7) to
    the API in capnix's `spikes/storefs/README.md`.
-9. Pluggable networking: the guest's `connect`, `listen`/`accept` and name lookups go to a provider
-   the sandbox is given (`sb.net(impl Net)`: `async fn connect(addr, guest: SocketEnd)`,
-   `resolve(name)`, `listen(addr, incoming)`, with the guest pid; errors map to errno). It runs on a
-   small async executor in the runtime, over its coroutines (`spawn`, `readable(fd)`/`writable(fd)`
-   on held host fds and guest socket ends, `sleep_until`, real wakers), so one long-lived task can
-   own a multiplexed connection: a no_std, alloc-using async protocol core runs on it unchanged.
-   exobox makes a socketpair end the program's fd, so poll, epoll, nonblocking sockets and fork work
-   unchanged; it knows no protocol. capnix plugs in its Cap'n Web session this way. Needs `ppoll`
-   on a few host fds at once (the filter allows one today). Since the program shares the address
-   space, the provider's connection must carry no more authority than the program's own.
+9. Pluggable networking (done in coroutine mode): the guest's `connect`, `listen`/`accept` and name
+   lookups go to the hooks the sandbox is given (`Hooks { on_connect, on_listen, on_resolve }`,
+   each `async` with the guest pid; `NetError`s map to errnos and resolver codes). The kernel's
+   socket impersonation (`lkl/README.md`, items 15-16) keeps loopback the guest's and makes the
+   program's socket a kernel socketpair end, so poll, epoll and nonblocking sockets work unchanged;
+   exobox knows no protocol. The hooks run on a small async executor in the runtime, over its
+   coroutines (`Cx`: `spawn`, `readable`/`writable` on held host fds, `sleep_until`, `now`, real
+   wakers), so one long-lived task owns a multiplexed connection: a no_std, alloc-using async
+   protocol core (capnweb's, with its `Runtime { spawn, now, sleep_until }` over `Cx`) runs on it
+   unchanged, its allocations served after lockdown by exobox's allocator (talc over a region
+   reserved before). capnix plugs in its Cap'n Web session this way. The idle `ppoll` takes up to
+   eight fds; passed fds (`pass_fd`) poll as their host fd. Since the program shares the address
+   space, the provider's connection must carry no more authority than the program's own. Left:
+   threaded mode (the CPU token around the executor's kernel calls, a lock on its queues) and fork
+   mode (the hooks run in init's process; a child's host ops forward to it).
 10. Custom kernels, at build time: the kernel as its own Nix build (`lib.exoboxKernel { src, config }`:
    a source and a config fragment over `lkl/defconfig`, for more drivers or filesystems; LKL has
    no loadable modules), and `lib.mkExobox { kernel }` for an exobox built with it. In development,
@@ -197,7 +235,7 @@ the unit tests of exobox and exobox-erofs.
 
 | Mode | Threads | Processes | Host syscalls allowed from the gate |
 |---|---|---|---|
-| `coroutine` (default) | the program's and the kernel's, as coroutines on one host thread | one | `write` (fds 1, 2), `read` (fd 0), `ppoll` (one fd, no signal mask), `madvise` (inside the arena, one chunk, `MADV_DONTNEED`), `exit_group` |
+| `coroutine` (default) | the program's and the kernel's, as coroutines on one host thread | one | `write` (fds 1, 2), `read` (fd 0), `ppoll` (up to eight fds, no signal mask), `madvise` (inside the arena, one chunk, `MADV_DONTNEED`), `exit_group`; `read` and `write` on each held and passed fd (`hold_fd`, `pass_fd`) |
 | `threaded` | a host thread per program thread, made lazily; one guest CPU passed between them | one | coroutine's, without `madvise`, plus `read`/`write` on the CPU-token eventfds, `clone` with exactly the thread flag set, `exit(0)` |
 | `fork` | as threaded | a guest fork is a host fork; the processes share one guest kernel | threaded's, plus `clone(SIGCHLD)` with no stack |
 

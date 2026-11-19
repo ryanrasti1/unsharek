@@ -98,6 +98,20 @@ fn close(fd: usize) {
     let _ = sys(l::__lkl__NR_close, [fd, 0, 0, 0, 0, 0]);
 }
 
+/// The nameserver the guest's libc asks: an address of no one, as the kernel sends every datagram
+/// to a non-loopback address to the runtime, which answers DNS on port 53 from the `on_resolve`
+/// hook (`net`). 10.0.2.3, slirp's (QEMU's user network) resolver.
+pub const NAMESERVER: &str = "10.0.2.3";
+
+/// The guest's `/etc/resolv.conf` (naming [`NAMESERVER`]) and `/etc/hosts` (localhost: no query
+/// for it). Called by `run` when there is an `on_resolve` hook, as init, before `pre_exec`.
+pub fn resolver() -> io::Result<()> {
+    std::fs::create_dir_all("/etc")?;
+    // One attempt, two seconds: the answer is local, a lost one isn't coming.
+    std::fs::write("/etc/resolv.conf", format!("nameserver {NAMESERVER}\noptions timeout:2 attempts:1\n"))?;
+    std::fs::write("/etc/hosts", "127.0.0.1 localhost\n::1 localhost\n")
+}
+
 /// Host fd `host` as guest fd `guest`: a guest file whose reads and writes the runtime does on
 /// the host's fd (`host_fd`, the kernel series' item 11), as fds 0-2 are. For a setup closure;
 /// under a [`Sandbox`](crate::Sandbox), [`Sandbox::pass_fd`](crate::Sandbox::pass_fd) does this and
