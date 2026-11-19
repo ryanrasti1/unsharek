@@ -15,7 +15,9 @@
 //! ```text
 //! v<FORMAT>/store/<hash>-<name>.erofs    one per store path; a store path is immutable, so its
 //! v<FORMAT>/store/<hash>-<name>.layout   name is the key
-//! v<FORMAT>/host/<dirname>-<key>.erofs   one per allowed host directory; <key> hashes the tree's
+//! v<FORMAT>/entry/<hash>-<name>.erofs    one per store path that is a file or a symlink: its
+//! v<FORMAT>/entry/<hash>-<name>.layout   root directory holds it, by its name (`Kind::Entry`)
+//! v<FORMAT>/host/<dirname>-<key>.erofs  one per allowed host directory; <key> hashes the tree's
 //! v<FORMAT>/host/<dirname>-<key>.layout  metadata, so an edit makes a new key and a rebuild
 //! v<FORMAT>/host/<dirname>-<key>.refs    the store paths the tree mentions (its scan), same key
 //! v<FORMAT>/requisites/<key>             the closure of a set of store paths; <key> hashes their
@@ -323,6 +325,20 @@ pub struct Mount {
     pub image: PathBuf,
     /// Its layout, as [`exobox_erofs::Layout::to_text`] writes it: each file's offset in the image.
     pub layout: PathBuf,
+    /// What the image's root is.
+    pub kind: Kind,
+}
+
+/// What a [`Mount`]'s image holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// The image's root is the directory: mounted at `guest`.
+    Dir,
+    /// A store path that is a file or a symlink (a setup hook's script, a source tarball): the
+    /// image's root directory holds it under its own name (`<hash>-<name>`), and
+    /// [`setup::mount_closure`](crate::setup::mount_closure) shows it at `guest` as it is, the
+    /// file bind-mounted from the image (no copy), the symlink made.
+    Entry,
 }
 
 /// Everything the runtime mounts: store paths first (sorted), then host directories.
@@ -445,9 +461,9 @@ impl Cache {
         let mut missing = Vec::new();
         for (i, &(path, store)) in jobs.iter().enumerate() {
             let mount = if store {
-                self.mount(path, "store", path.file_name().ok_or_else(|| Error::NotDir(path.to_owned()))?)
+                self.store_mount(path)?
             } else {
-                self.mount(path, "host", &host_name(path, tree_key(path)?))
+                self.mount(path, "host", Kind::Dir, &host_name(path, tree_key(path)?))
             };
             if exists(&mount.image)? {
                 found.push((i, Ok(mount)));
@@ -477,12 +493,20 @@ impl Cache {
 
     /// The image of store path `path` (`/nix/store/<hash>-<name>`).
     pub fn store_image(&self, path: &Path) -> Result<Mount> {
-        let name = path.file_name().ok_or_else(|| Error::NotDir(path.to_owned()))?;
-        let mount = self.mount(path, "store", name);
+        let mount = self.store_mount(path)?;
         if !exists(&mount.image)? {
             self.build(path, &mount, || Ok(()))?;
         }
         Ok(mount)
+    }
+
+    /// Store path `path`'s mount: a directory's image, or a file's or symlink's ([`Kind::Entry`]),
+    /// which are cached apart (`entry/`, the module's comment), so a symlink to a directory imaged
+    /// before as the directory isn't taken for one.
+    fn store_mount(&self, path: &Path) -> Result<Mount> {
+        let name = path.file_name().ok_or_else(|| Error::NotDir(path.to_owned()))?;
+        let dir = fs::symlink_metadata(path).map_err(io_err(path))?.is_dir();
+        Ok(if dir { self.mount(path, "store", Kind::Dir, name) } else { self.mount(path, "entry", Kind::Entry, name) })
     }
 
     /// The image of host directory `dir` (canonical), current as of now.
@@ -492,7 +516,7 @@ impl Cache {
         // resolution), and the build is retried a few times before giving up.
         for _ in 0..3 {
             let key = tree_key(dir)?;
-            let mount = self.mount(dir, "host", &host_name(dir, key));
+            let mount = self.mount(dir, "host", Kind::Dir, &host_name(dir, key));
             if exists(&mount.image)? {
                 return Ok(mount);
             }
@@ -506,13 +530,10 @@ impl Cache {
         Err(Error::Unstable(dir.to_owned()))
     }
 
-    fn mount(&self, guest: &Path, kind: &str, name: &OsStr) -> Mount {
-        let base = self.root.join(kind).join(name);
-        Mount {
-            guest: guest.to_owned(),
-            image: with_suffix(&base, ".erofs"),
-            layout: with_suffix(&base, ".layout"),
-        }
+    /// `guest`'s mount, its image `<dir>/<name>` in the cache.
+    fn mount(&self, guest: &Path, dir: &str, kind: Kind, name: &OsStr) -> Mount {
+        let base = self.root.join(dir).join(name);
+        Mount { guest: guest.to_owned(), image: with_suffix(&base, ".erofs"), layout: with_suffix(&base, ".layout"), kind }
     }
 
     /// Builds `src`'s image into temporary files beside `mount`'s, and renames them into place
@@ -524,8 +545,17 @@ impl Cache {
         let tmp = |p: &Path| with_suffix(p, &format!(".{}-{seq}.tmp", process::id()));
         let (image, layout) = (tmp(&mount.image), tmp(&mount.layout));
         let built = (|| {
-            let lay = exobox_erofs::build(src, &image)
-                .map_err(|source| Error::Image { path: src.to_owned(), source })?;
+            let err = |source| Error::Image { path: src.to_owned(), source };
+            let lay = match mount.kind {
+                Kind::Dir => exobox_erofs::build(src, &image).map_err(err)?,
+                // A file or a symlink, under its own name in the image's root.
+                Kind::Entry => {
+                    let at = Path::new("/").join(src.file_name().unwrap());
+                    let img = exobox_erofs::Image::scan_roots(&[(src.to_owned(), at)]).map_err(err)?;
+                    img.write(&image).map_err(err)?;
+                    img.layout().clone()
+                }
+            };
             fs::write(&layout, lay.to_text()).map_err(io_err(&layout))?;
             // On disk before the renames: after a crash, a cached image is whole or absent, never
             // a renamed file whose data never made it.

@@ -13,6 +13,8 @@
 //!   handler, the signal mask, a fork, a refused exec), several guards in a row.
 //! - `Builder::restrict`: a restriction makes a call the mode allows fail (write to fd 2, from
 //!   the gate: killed, or EPERM), and leaves the mode's own probes as they were (escape_gate).
+//! - `Cache::images` and `setup::mount_closure` with store paths that are a file and a symlink
+//!   (`store_entries`): each shown at its store path as it is.
 //! - Templates (`Sandbox::spawn`): children of one setup, each running its own fixture and its
 //!   own setup, with random bytes of their own.
 
@@ -85,6 +87,7 @@ fn child(layer: &str, name: &str) -> ! {
             g.run(&argv(name), &env()).unwrap_err()
         }
         "intercept" => intercept(m, name),
+        "entries" => entries(m),
         "template" => template(m),
         _ => {
             let mut b = Sandbox::builder().mode(m).deny(Deny::Errno);
@@ -204,6 +207,32 @@ fn intercept(m: Mode, name: &str) -> exobox::Error {
     }
     check("after 2: getpid is the host's", getpid() == pid);
     sb.run(&argv(name), &env()).unwrap_err()
+}
+
+/// Store-like paths (`ENTRIES`, in a temporary directory: the suite can't count on a store path
+/// that is a file being on the host) given as store paths, as capnix gives a build's inputs from
+/// its real store directory: their images from the cache, each shown at `/nix/store/<name>`; then
+/// `paths` run on them.
+const ENTRIES: [&str; 3] =
+    ["0000000000000000000000000000000f-entry-file", "0000000000000000000000000000000l-entry-link", "0000000000000000000000000000000d-entry-dir"];
+
+fn entries(m: Mode) -> exobox::Error {
+    let dir = PathBuf::from(std::env::var("EXOBOX_GUEST_TEST_FILE").unwrap());
+    let closure = exobox::store::Closure { store: ENTRIES.iter().map(|n| dir.join(n)).collect(), host: Default::default() };
+    let mut store = exobox::store::Cache::open_default().unwrap().images(&closure).unwrap();
+    for m in &mut store.mounts {
+        m.guest = std::path::Path::new("/nix/store").join(m.guest.file_name().unwrap());
+    }
+    let mut sb = Sandbox::builder().mode(m).build().unwrap();
+    let mut mounts = sb.map_store(&store).unwrap();
+    mounts.extend(sb.map_closure(&fx::bin("paths"), &[fx::bin_dir()]).unwrap());
+    {
+        let _g = sb.intercept().unwrap();
+        exobox::setup::mount_closure(&mounts).unwrap();
+    }
+    let mut argv = argv("paths");
+    argv.extend(ENTRIES.iter().map(|n| format!("/nix/store/{n}").into()));
+    sb.run(&argv, &env()).unwrap_err()
 }
 
 /// A template: one setup, then four children in turn, each with setup of its own and its own
@@ -360,6 +389,27 @@ fn main() {
             // The program's ids, and its auxiliary vector's, are init's at exec: 1000.
             if !out.contains("CREDS 1000 1000 1000 1000 1000 1000 1000 1000\n") || !out.contains("HOST box\n") {
                 return fail(st, &out, &err, "wanted the program as uid/gid 1000 on host box");
+            }
+            Ok(())
+        }));
+        trials.push(Trial::test(format!("store_entries::{mode}"), move || {
+            // A closure with store paths that are a file and a symlink (to the file), and a
+            // directory: each shown at its store path as it is.
+            let dir = tempfile::tempdir()?;
+            let [file, link, sub] = ENTRIES.map(|n| dir.path().join(n));
+            std::fs::write(&file, "a single-file store path\n")?;
+            std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o444))?;
+            std::os::unix::fs::symlink(ENTRIES[0], &link)?;
+            std::fs::create_dir(&sub)?;
+            std::fs::write(sub.join("x"), "")?;
+            let (st, out, err) = run("entries", "paths", mode, &[("EXOBOX_GUEST_TEST_FILE", dir.path().to_str().unwrap())])?;
+            let want = [
+                format!("PATH /nix/store/{} file a single-file store path_ 444 ro\n", ENTRIES[0]),
+                format!("PATH /nix/store/{} link {} a single-file store path_\n", ENTRIES[1], ENTRIES[0]),
+                format!("PATH /nix/store/{} dir\n", ENTRIES[2]),
+            ];
+            if st.code() != Some(0) || !out.contains("PATHS_OK") || want.iter().any(|w| !out.contains(w.as_str())) {
+                return fail(st, &out, &err, &format!("wanted {want:?}"));
             }
             Ok(())
         }));

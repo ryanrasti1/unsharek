@@ -434,14 +434,14 @@ impl Guest {
     /// `program`'s Nix closure (plus `allow_paths`, each a store path with its closure or a
     /// host directory, read-only) as images from the default cache ([`store::Cache::open_default`],
     /// built where missing), mapped, each with where [`setup::mount_closure`] mounts it.
-    pub fn map_closure(&mut self, program: &Path, allow_paths: &[PathBuf]) -> Result<Vec<(Image, PathBuf)>, Error> {
+    pub fn map_closure(&mut self, program: &Path, allow_paths: &[PathBuf]) -> Result<Vec<setup::Mount>, Error> {
         let store = store::Cache::open_default()?.store(program, allow_paths)?;
         self.map_store(&store)
     }
 
     /// Each of `store`'s images mapped, with where [`setup::mount_closure`] mounts it.
-    pub fn map_store(&mut self, store: &store::Store) -> Result<Vec<(Image, PathBuf)>, Error> {
-        store.mounts.iter().map(|m| Ok((self.map_image(&m.image)?, m.guest.clone()))).collect()
+    pub fn map_store(&mut self, store: &store::Store) -> Result<Vec<setup::Mount>, Error> {
+        store.mounts.iter().map(|m| Ok(setup::Mount { image: self.map_image(&m.image)?, at: m.guest.clone(), kind: m.kind })).collect()
     }
 
     /// Hold host fd `fd` for the hooks (a provider's connection, made before `run`): made
@@ -781,12 +781,12 @@ impl Sandbox {
     }
 
     /// [`Guest::map_closure`].
-    pub fn map_closure(&mut self, program: &Path, allow_paths: &[PathBuf]) -> Result<Vec<(Image, PathBuf)>, Error> {
+    pub fn map_closure(&mut self, program: &Path, allow_paths: &[PathBuf]) -> Result<Vec<setup::Mount>, Error> {
         self.guest.map_closure(program, allow_paths)
     }
 
     /// [`Guest::map_store`].
-    pub fn map_store(&mut self, store: &store::Store) -> Result<Vec<(Image, PathBuf)>, Error> {
+    pub fn map_store(&mut self, store: &store::Store) -> Result<Vec<setup::Mount>, Error> {
         self.guest.map_store(store)
     }
 
@@ -1063,7 +1063,7 @@ pub fn run(config: Config) -> Result<Infallible, Error> {
     for i in &config.images {
         let img = sb.map_image_as(&i.path, &i.name)?;
         if let Some(at) = &i.mount {
-            mounts.push((img, at.clone()));
+            mounts.push(setup::Mount { image: img, at: at.clone(), kind: store::Kind::Dir });
         }
     }
     // The program's path as the host resolves it: the guest's working directory is `/`.

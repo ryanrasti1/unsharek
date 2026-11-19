@@ -44,13 +44,66 @@ pub(crate) fn block_device(image: &Image, in_zone: Option<usize>) -> io::Result<
     sys(l::__lkl__NR_mknodat, [AT_FDCWD, p(&node), libc::S_IFBLK as usize | 0o400, dev, 0, 0]).map(|_| ())
 }
 
+/// An image mapped for [`mount_closure`] ([`crate::Guest::map_store`]): where the guest sees it,
+/// and what its root is.
+#[derive(Clone, Debug)]
+pub struct Mount {
+    pub image: Image,
+    /// A store path, or an allowed host directory, or an image's mount point.
+    pub at: PathBuf,
+    pub kind: crate::store::Kind,
+}
+
 /// A Nix closure: each image mounted at its store path (or allowed host directory), as
-/// `store.rs` lists them.
-pub fn mount_closure(images: &[(Image, PathBuf)]) -> Result<(), Error> {
-    for (image, at) in images {
-        mount_erofs(image, at)?;
+/// `store.rs` lists them. A store path that is a file or a symlink ([`Kind::Entry`]) is shown as
+/// it is: its image is mounted at a mount point of its own (`/dev/exobox/<name>.d`), the file
+/// bind-mounted from there onto the store path (a file onto a file: nothing is copied) or the
+/// symlink made, and the image's own mount detached again. Inside a guard.
+///
+/// [`Kind::Entry`]: crate::store::Kind::Entry
+pub fn mount_closure(images: &[Mount]) -> Result<(), Error> {
+    for m in images {
+        match m.kind {
+            crate::store::Kind::Dir => mount_erofs(&m.image, &m.at)?,
+            crate::store::Kind::Entry => mount_entry(&m.image, &m.at)?,
+        }
     }
     Ok(())
+}
+
+/// [`mount_closure`]'s store path that is a file or a symlink, `at`.
+fn mount_entry(image: &Image, at: &Path) -> Result<(), Error> {
+    let what = || format!("showing {} at {}", image.device().display(), at.display());
+    let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+    let (Some(name), Some(parent)) = (at.file_name(), at.parent()) else {
+        return Err(Error::io(what())(io::Error::from(io::ErrorKind::InvalidInput)));
+    };
+    let dir = PathBuf::from(format!("{}.d", image.device().display()));
+    mount_erofs(image, &dir)?;
+    let shown = (|| {
+        let inner = dir.join(name);
+        std::fs::create_dir_all(parent)?;
+        let md = std::fs::symlink_metadata(&inner)?;
+        if md.is_symlink() {
+            return std::os::unix::fs::symlink(std::fs::read_link(&inner)?, at);
+        }
+        // The bind mount's point: an empty file, the bind's file over it.
+        drop(std::fs::OpenOptions::new().write(true).create_new(true).open(at)?);
+        let (from, to) = (c(&inner), c(at));
+        // SAFETY: NUL-terminated strings, live for the call.
+        if unsafe { libc::mount(from.as_ptr(), to.as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    })();
+    // The image's own mount goes (a bind of its file holds the image's filesystem on its own).
+    let d = c(&dir);
+    // SAFETY: as above.
+    unsafe {
+        libc::umount2(d.as_ptr(), libc::MNT_DETACH);
+        libc::rmdir(d.as_ptr());
+    }
+    shown.map_err(Error::io(what()))
 }
 
 /// A guest syscall from host code outside a guard (generic numbers, made on the guest directly: a

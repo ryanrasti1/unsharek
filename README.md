@@ -158,7 +158,9 @@ against threaded mode (`threads`), and the host filter refusing a hostile progra
   files into the arena, with its interpreter, and builds its stack. Nothing the program brings (its
   `PT_INTERP`, its libraries' constructors) runs before the filter is in place.
 - **The store.** A Nix program's closure is shown as erofs images, one per store path, built once
-  and cached (the closure itself too: a store path's never changes). Their layout pads each ELF
+  and cached (the closure itself too: a store path's never changes). A store path that is a file
+  or a symlink (a setup hook, a source tarball) gets an image whose root holds it: the file is
+  bind-mounted from it onto its store path (nothing copied), the symlink made. Their layout pads each ELF
   file to its memory image, so code is mapped in place: each image is mapped twice before
   lockdown, read-only for the guest's block device and privately into the arena's top, and the
   program's mappings of its files are answered with where their bytes already are there, shared by
