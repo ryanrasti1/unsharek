@@ -200,6 +200,7 @@ pub unsafe fn boot(b: Boot) -> Result<(), Error> {
     unsafe {
         SCHED.init(Config { stacks: b.stacks, switch_fs: true, host: &SYS }).map_err(err("coroutine stacks"))?;
         host::install(&SCHED, b.heap.0, b.heap.1);
+        crate::executor::install(&SCHED);
         let table: &'static mut [Extent] = &mut ARENA_TABLE.get()[..];
         let mut a = Arena::new(b.arena.0, b.arena.1, arena::Mode::Release, table).map_err(err("arena"))?;
         if b.image_zone != 0 {
@@ -868,6 +869,8 @@ fn dispatch(uc: &mut Ucontext) {
     let n = S.served.get().wrapping_add(1);
     S.served.set(n);
     if n.is_multiple_of(32) && S.phase.get() == Phase::Program {
+        // (and the hooks' fds looked at: the idle wait that watches them doesn't run meanwhile)
+        crate::executor::busy_poll();
         SCHED.yield_now();
     }
 }

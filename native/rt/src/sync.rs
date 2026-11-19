@@ -36,8 +36,14 @@ impl Semaphore {
         if self.try_down() {
             return;
         }
-        // Woken through the queue = handed a unit by `up`. Interrupted: not handed one; wait again.
-        while s.wait(&self.q, WaitTag::default(), None) != Wake::Woken {}
+        // Woken through the queue = handed a unit by `up`. Interrupted: not handed one; take one
+        // if an `up` came while it was off the queue (it found no waiter and counted it), else
+        // wait again.
+        while s.wait(&self.q, WaitTag::default(), None) != Wake::Woken {
+            if self.try_down() {
+                return;
+            }
+        }
     }
 
     pub fn try_down(&self) -> bool {
