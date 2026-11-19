@@ -10,8 +10,9 @@ guest kernel, or by exobox itself. What the host sees after lockdown is a short 
 pinned down to the argument. The guest kernel provides compatibility (files, sockets on loopback,
 processes, signals, ttys). The security boundary is the host filter, not the guest kernel.
 
-Status: preview, being built (November 2026). The pieces below exist and are tested separately
-(`./test`); the sandbox runs its first programs as they are joined (see "Plan").
+Status: preview (November 2026). All three modes run real programs: bash, Python, gcc under
+`make -j4`, rustc and cargo, xz, a nixpkgs package built from source (by capnix, as Nix's builder,
+with Nix's own output hash). "Status" below lists what isn't done yet.
 
 ## Using it
 
@@ -32,7 +33,7 @@ process), given host data, set up in the guest, and run:
 
 ```rust
 let mut sb = exobox::Sandbox::builder()
-    .mode(Mode::Coroutine)                             // or Threaded (fork mode: not yet)
+    .mode(Mode::Coroutine)                             // or Threaded, or Fork
     .on_connect(OnConnect::new(|cx, pid, addr| provider.connect(cx, pid, addr)))
     .on_resolve(OnResolve::new(|cx, pid, name| provider.resolve(cx, pid, name)))
     .restrict(my_seccomp_program)                      // optional, repeatable: can only take away
@@ -82,7 +83,8 @@ sb.run(&argv, &env)                                    // lockdown, then exec; n
   goes on forking more and waits for them (`exobox::wait`, `waitpid`). exobox makes each child its
   own: its guest RNG reseeded with fresh host entropy, and in threaded mode the kernel copied at
   rest and the child's host threads and CPU token made again. A child starts to READY in about a
-  millisecond and costs under 2 MB (`./test --perf`). Fork mode: not yet.
+  millisecond and costs under 2 MB (`./test --perf`). Coroutine and threaded mode (a fork-mode
+  template: not yet).
 - **The network hooks** (`exobox::net`): the program's sockets are its own for loopback; a
   `connect` anywhere else is `on_connect(cx, pid, addr)`, whose stream exobox copies to and from
   the program's socket (half-closes and resets carried both ways); a `listen` not bound to loopback
@@ -145,7 +147,7 @@ against threaded mode (`threads`), and the host filter refusing a hostile progra
   bytes to spare), the FS register switched to exobox's and back, and the call dispatched: to the
   guest kernel (x86-64 numbers translated to the generic table, structs translated), rewritten
   (`open` to `openat`, `fork` to `clone`, ...), emulated (memory, threads, futexes, the thread
-  pointer), or refused. About 0.8 µs a call.
+  pointer), or refused. About 1 µs a call.
 - **Signals** are the guest kernel's: actions, masks, delivery, default actions. At a call's
   return it hands a caught signal to the runtime, which builds Linux's frame on the program's stack
   (or its alternate stack) and runs the handler as the program; the handler's `rt_sigreturn` traps
@@ -187,80 +189,75 @@ against threaded mode (`threads`), and the host filter refusing a hostile progra
   sandbox's (the others see its pidfd and exit), and a process that dies on the host (a crash, the
   filter's kill) ends the sandbox too, seen by init's SIGCHLD (every process is init's host child).
   `--max-procs` bounds the processes alive at once (a fork past it is EAGAIN). exec is the guest's,
-  in the process's own arena (high-water: an exec reuses the old image's pages). Not yet: a forked
-  process's network beyond loopback (the hooks run in init's process), and `MAP_SHARED` memory
-  shared across a fork.
+  in the process's own arena (high-water: an exec reuses the old image's pages).
+- **The guest's machine.** Booting sets its realtime clock to the host's (the kernel's clock is
+  the host's monotonic one), makes `/proc`, `/dev` (its nodes 0666, devpts), `/tmp` and
+  `/dev/shm`, seeds its RNG from the host, brings loopback up and makes fds 0-2 the host's stdio.
+  With a network hook, `/etc/resolv.conf` and `/etc/hosts` are written then too, before any guard.
 - **The kernel.** Stock LKL plus a short series (`lkl/README.md`): idle that waits instead of
   spinning, the program as PID 1, threads that join their process, a block device over host memory,
-  and the rest of what a cooperative in-process host needs.
+  host fds as guest files, fork and exec's kernel halves, socket impersonation, and the rest of what
+  a cooperative in-process host needs.
 
-## Plan
+## Status
 
-1. A program runs in coroutine mode: `Guest`, `Sandbox`, the routing and security filters stacked,
-   the dispatcher, exec inside the guest, the store mounted (`./test`'s `hello::coroutine`, then
-   the rest of the coroutine cases: exit status, stdio, the escape probes, the hostile loader,
-   Python).
-2. The kernel series' remaining items: exit reporting, host stdio as guest files, the store's block
-   device, the memory size, signals, fork, exec's kernel half.
-3. Threaded mode: a host thread per program thread, made through the gate; the CPU passed between
-   them through eventfds.
-4. Fork mode: a guest fork is a host fork, sharing one guest kernel (done: "How it works"; the
-   suite's fork cases, bash, a gcc build under make -j4 within its budget).
-5. Templates (done, coroutine and threaded): a booted kernel forked per sandbox
-   (`Sandbox::fork`, `spawn`), the kernel's pages
-   shared copy-on-write.
-6. Within the performance budgets (`./test --perf`): startup, memory per sandbox, parallel builds.
-7. Code mapped in place from the store images (done: release-mode arenas, coroutine mode, map a
-   range in place again once it is given back; high-water ones, threaded and fork mode, while it
-   was never written).
-   Images from extents: a guest disk assembled from an ordered list of {metadata bytes | a range of
-   a host file, mapped before lockdown | zeros}, and `exobox_erofs::synthesize(paths)`, which lays
-   out an erofs image over a closure's files as they are in the host store (metadata made in
-   memory, no file's data read or copied: one copy of every byte, the page cache shared with the
-   host). Done: memblk disks of extents, `synthesize`. Next: `map_image` from extents, in-place
-   mapping over the per-file mappings, `exobox::store` without image copies (the per-path image
-   cache stays for very large closures: one host mapping per file costs every fork and exit).
-8. For capnix (`~/src/capnix-proper`, "What exobox needs to provide"): a host fd passed to the guest
-   at a given fd (its Cap'n Web channel at 1000), with the filter widened to exactly that fd; the
-   program run as a given uid (setup is the guest's init, as root, and can drop to it before exec);
-   a read-write block device served over a channel (a new kernel driver: Nix's `/nix/var` on
-   ext4); FUSE in the store's kernel (a config fragment); a closure shown from the host's store
-   with no copy (item 7's extents and `synthesize`).
-9. Pluggable networking (done in coroutine mode): the guest's `connect`, `listen`/`accept` and name
-   lookups go to the hooks the sandbox is built with (`on_connect`, `on_listen`, `on_resolve`,
-   each `async` with the guest pid; `NetError`s map to errnos and resolver codes). The kernel's
-   socket impersonation (`lkl/README.md`, items 15-16) keeps loopback the guest's and makes the
-   program's socket a kernel socketpair end, so poll, epoll and nonblocking sockets work unchanged;
-   exobox knows no protocol. The hooks run on a small async executor in the runtime, over its
-   coroutines (`Cx`: `spawn`, `readable`/`writable` on held host fds, `sleep_until`, `now`, real
-   wakers), so one long-lived task owns a multiplexed connection: a no_std, alloc-using async
-   protocol core (capnweb's, with its `Runtime { spawn, now, sleep_until }` over `Cx`) runs on it
-   unchanged, its allocations served after lockdown by exobox's allocator (talc over a region
-   reserved before). capnix plugs in its Cap'n Web session this way. The idle `ppoll` takes up to
-   eight fds; passed fds (`pass_fd`) poll as their host fd. Since the program shares the address
-   space, the provider's connection must carry no more authority than the program's own. Left:
-   threaded mode (the CPU token around the executor's kernel calls, a lock on its queues, the hooks'
-   fds in the token holder's idle wait) and fork mode (the hooks run in init's process, the
-   executor's coroutine bound to init's kernel thread; a child's host ops must forward to it: they
-   are refused for now, ENETUNREACH, rather than run on its stale copy of init's state).
-10. Custom kernels, at build time: the kernel as its own Nix build (`lib.exoboxKernel { src, config }`:
-   a source and a config fragment over `lkl/defconfig`, for more drivers or filesystems; LKL has
-   no loadable modules), and `lib.mkExobox { kernel }` for an exobox built with it. In development,
-   `EXOBOX_LKL_SRC` (another checkout) and `EXOBOX_LKL_CONFIG` (a fragment) select them. (Done:
-   see "Building and testing".)
-11. After v0: closures from pre-built images. A closure shown per file costs a host mapping per
-   file (python's: 7,741), which every fork copies and every exit tears down (~4 ms per exit,
-   against ~0.3 ms with one image per store path). A mount source that takes an image per store
-   path, built by Nix in the caller's own derivation (capnix: an `<app>-images` derivation over the
-   app's closure), with per-file `synthesize` for any path without one. `build` stays
-   deterministic (a tested property), so Nix's store optimisation hard-links identical images
-   across apps.
+Works, in every mode unless noted: the escape and hostile-loader probes, exec inside the guest,
+the store mounted from images, signals, ttys, pipes and host fds, threads, fork mode's processes,
+templates (coroutine and threaded), the network hooks (coroutine and threaded; fork mode in
+init's process), custom kernels. `./test` runs about 400 cases in a few seconds.
+
+Not yet, or known limits:
+
+- **Fork mode:** a forked process's network beyond loopback (the hooks run in init's process; a
+  child's connect is ENETUNREACH for now), `MAP_SHARED` memory shared across a fork, and templates.
+- **Credentials:** after a guard drops root, exobox's own later setup calls run with what it left:
+  a template's `fork`/`spawn` (the child's RNG reseed needs CAP_SYS_ADMIN) and `map_image` (mknod
+  needs CAP_MKNOD) fail. Drop root in the last guard, after any `map_image`.
+- **Bad pointers:** LKL has no MMU, so a bad pointer passed to a call the guest kernel serves is
+  read by it as is, and is the sandbox's SIGSEGV rather than the program's EFAULT. It ends the
+  sandbox, not more. Calls programs make with bad pointers on purpose (`statx`'s probe) are
+  checked first.
+- **GS:** exobox doesn't use it, so a program may; the program's FS is switched on every trap.
+- **Performance:** see below.
+
+## Performance
+
+| | native | sandbox |
+|---|---|---|
+| startup to READY (coroutine) | - | ~5 ms, ~4.2 MB PSS |
+| a template's child | - | ~1 ms, under 2 MB |
+| a syscall (`getppid`) | 0.08 µs | ~1.3 µs |
+| `xz -T4`, 16 MB (threaded) | 0.13 s | 1.12x |
+| `rustc`, 16 codegen units (fork) | 1.57 s | 2.82x |
+| `make -j4`, 32 C files (fork) | 1.21 s | 3.19x |
+
+The goal is parallel builds within 5% of native. Where the time goes (`native/PERF.md`, measured
+with the counters in `native/bench`): the sandbox reports one CPU, so rustc compiles serially;
+the guest's one CPU token is taken for work that needs no kernel (futexes, `mprotect`), and handed
+to threads that are still asleep; and exec copies every program and library into the process's
+memory in threaded and fork mode, under the token. The kernel's own work is a small share (~0.3 s
+of make's gap). Those fixes come first; an SMP guest kernel (guest CPUs as a pool of tokens) for
+what remains.
+
+## Next
+
+1. The performance fixes above, in `native/PERF.md`'s order, remeasured after each.
+2. Fork mode's network: a forked process's hook calls forwarded to init's executor.
+3. Images from extents: `map_image` over an ordered list of {metadata | a range of a host file |
+   zeros} (the kernel side and `exobox_erofs::synthesize` exist), so a closure's files are shown
+   as they are in the host store, nothing copied.
+4. An SMP guest kernel, if the numbers still call for it.
+5. Closures from pre-built images: a mount source of one erofs image per store path, built by the
+   caller's own Nix derivation (a closure shown per file costs a host mapping per file, which every
+   fork copies and every exit tears down). `build` stays deterministic (a tested property), so
+   Nix's store optimisation hard-links identical images.
 
 ## Building and testing
 
 ```sh
 ./test            # everything, incremental, seconds warm (cargo-nextest)
 ./test --perf     # the performance budgets against native
+native/bench/run --work rustc,make --modes native,fork   # build workloads, with counters
 ```
 
 `./test` enters the devshell (`flake.nix`, cached by `devshell.sh`) and builds the kernel out of

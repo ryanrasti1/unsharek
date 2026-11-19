@@ -250,9 +250,9 @@ fn set_clock() -> io::Result<()> {
 }
 
 /// The guest's basics, as init's: its realtime clock the host's (`set_clock`), `/proc`, `/dev`
-/// (null, zero, full, random, urandom, tty, devpts, the fd links), `/tmp`, `/dev/shm`, the RNG seeded with `entropy` from the host (else the
-/// guest's `getrandom` would wait for entropy a cooperative kernel can't gather), loopback up,
-/// and fds 0-2.
+/// (null, zero, full, random, urandom, tty, devpts, the fd links), `/tmp`, `/dev/shm`, the RNG
+/// seeded with `entropy` from the host (else the guest's `getrandom` would wait for entropy a
+/// cooperative kernel can't gather), loopback up, and fds 0-2.
 ///
 /// fds 0-2 are the host's (`host_fd`, the kernel series' item 11): guest files whose reads and
 /// writes the runtime does on the host's 0-2 (`exobox_rt::host`'s `hostfd_rw`), so `dup2`, pipes
