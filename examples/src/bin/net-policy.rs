@@ -1,11 +1,15 @@
 //! Pluggable networking with a policy. Three processes:
 //!
-//! - this one: starts a local HTTP server, then the other two, joined by a socketpair;
-//! - the proxy (this example re-run): holds the real network and the policy, an allowlist of
-//!   names and ports, and logs every attempt with the guest pid that made it;
+//! - this one: starts a local HTTP server and the proxy, builds the sandbox and forks it off
+//!   (`Sandbox::spawn`), the proxy and the sandbox joined by a socketpair;
+//! - the proxy (this example re-run, started before the sandbox's first guard: after it, the
+//!   process can't exec): holds the real network and the policy, an allowlist of names and
+//!   ports, and logs every attempt with the guest pid that made it;
 //! - the sandbox: Python's `urllib` fetching an allowed URL and some refused ones. Its network
 //!   hooks (`OnConnect`, `OnResolve`) send every connect and lookup over its one held fd
-//!   (`Sandbox::hold_fd`) to the proxy (`exobox_examples::mux`: a tiny framing).
+//!   (`Sandbox::hold_fd_as`, found by the hooks with `cx.held`) to the proxy
+//!   (`exobox_examples::mux`: a tiny framing), a session started at lockdown (`on_start`). A
+//!   connect carries the name its address was resolved from (`cx.name_of`).
 //!
 //! Run it:
 //!
@@ -23,7 +27,7 @@ use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
-use exobox::{GuestConfig, Hooks, Mode, NetError, PreExec, Sandbox, setup};
+use exobox::{Mode, NetError, Sandbox, setup};
 use exobox_examples::{self as ex, mux};
 
 const CLIENT: &str = r#"
@@ -38,7 +42,8 @@ for url in sys.argv[1:]:
 
 /// The allowlist: a name, the one port allowed on it, and where the proxy really connects. Each
 /// name resolves to an address of no one (10.0.0.N): a loopback answer would be the guest's own
-/// loopback, which never reaches the hooks.
+/// loopback, which never reaches the hooks. (Without an `on_resolve` at all, exobox would give
+/// each name an address of its own, and the connect would still carry the name.)
 struct Allow {
     name: String,
     port: u16,
@@ -53,7 +58,6 @@ impl mux::Policy for Proxy {
             Some(i) => Ok(vec![Ipv4Addr::new(10, 0, 0, i as u8 + 1)]),
             None => Err(NetError::NoName),
         };
-        // (Called for each query a lookup makes: glibc asks for A and AAAA records.)
         match &r {
             Ok(ips) => eprintln!("[proxy] guest pid {pid}: resolve {name} -> {}", ips[0]),
             Err(e) => eprintln!("[proxy] guest pid {pid}: resolve {name} -> refused ({e})"),
@@ -61,9 +65,9 @@ impl mux::Policy for Proxy {
         r
     }
 
-    fn connect(&mut self, pid: i32, addr: SocketAddrV4) -> Result<TcpStream, NetError> {
-        let [10, 0, 0, n] = addr.ip().octets() else { return refuse(pid, addr, "not a name we gave out") };
-        let Some(a) = self.0.get((n as usize).wrapping_sub(1)) else { return refuse(pid, addr, "not a name we gave out") };
+    fn connect(&mut self, pid: i32, addr: SocketAddrV4, name: &str) -> Result<TcpStream, NetError> {
+        // By name: the target is the allowlist's, whatever address the sandbox says.
+        let Some(a) = self.0.iter().find(|a| a.name == name) else { return refuse(pid, addr, "not a name we gave out") };
         if a.port != addr.port() {
             return refuse(pid, addr, &format!("{} allows port {} only", a.name, a.port));
         }
@@ -78,41 +82,40 @@ fn refuse(pid: i32, addr: SocketAddrV4, why: &str) -> Result<TcpStream, NetError
     Err(NetError::Refused)
 }
 
-/// The sandbox: fd 3 is its end of the socketpair, held for the hooks.
-fn sandbox(urls: Vec<String>) -> ! {
+/// The sandbox, built here and forked off: `sock` is its end of the socketpair, held for the hooks.
+fn sandbox(sock: UnixStream, urls: Vec<String>) -> Result<exobox::Child, exobox::Error> {
     let python = ex::nix_program("EXOBOX_TEST_PYTHON");
-    let run = || -> Result<std::convert::Infallible, exobox::Error> {
-        let mut sb = Sandbox::boot(Mode::Coroutine, GuestConfig::default())?;
-        // SAFETY: fd 3 is ours, from the parent (`give_fd`), and nothing else owns it.
-        let held = sb.hold_fd(unsafe { OwnedFd::from_raw_fd(3) })?;
-        let (on_connect, on_resolve) = mux::hooks(held);
-        let store = ex::mount_closure(&mut sb, &python, &[])?;
-        let pre_exec = PreExec::new(move || setup::mount_closure(&store));
-        let mut argv = vec![python.display().to_string(), "-c".into(), CLIENT.into()];
-        argv.extend(urls);
-        let argv: Vec<_> = argv.into_iter().map(Into::into).collect();
-        let env = ex::os(&["PYTHONUNBUFFERED=1"]); // its lines in order with the proxy's
-        sb.run(Hooks { pre_exec, on_connect, on_resolve, ..Default::default() }, &argv, &env)
-    };
-    let Err(e) = run();
-    ex::fail(e)
+    let (on_connect, on_resolve) = mux::hooks();
+    let mut sb = Sandbox::builder()
+        .mode(Mode::Coroutine)
+        .on_connect(on_connect)
+        .on_resolve(on_resolve)
+        .on_start(mux::start)
+        .build()?;
+    sb.hold_fd_as("net", sock.into())?;
+    let store = sb.map_closure(&python, &[])?;
+    {
+        let _g = sb.intercept()?;
+        setup::mount_closure(&store)?;
+    }
+    let mut argv = vec![python.display().to_string(), "-c".into(), CLIENT.into()];
+    argv.extend(urls);
+    let argv: Vec<_> = argv.into_iter().map(Into::into).collect();
+    let env = ex::os(&["PYTHONUNBUFFERED=1"]); // its lines in order with the proxy's
+    sb.spawn(move |sb| sb.run(&argv, &env))
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match ex::role().as_deref() {
-        Some("sandbox") => sandbox(args),
-        Some("proxy") => {
-            let port: u16 = args[0].parse().unwrap();
-            let mut allow = vec![Allow { name: "web.local".into(), port, target: format!("127.0.0.1:{port}") }];
-            if args.iter().any(|a| a == "--internet") {
-                allow.push(Allow { name: "example.com".into(), port: 80, target: "example.com:80".into() });
-            }
-            // SAFETY: as the sandbox's fd 3.
-            mux::serve(UnixStream::from(unsafe { OwnedFd::from_raw_fd(3) }), Proxy(allow));
-            return;
+    if ex::role().as_deref() == Some("proxy") {
+        let port: u16 = args[0].parse().unwrap();
+        let mut allow = vec![Allow { name: "web.local".into(), port, target: format!("127.0.0.1:{port}") }];
+        if args.iter().any(|a| a == "--internet") {
+            allow.push(Allow { name: "example.com".into(), port: 80, target: "example.com:80".into() });
         }
-        _ => {}
+        // SAFETY: fd 3 is the proxy's end, from the parent (`give_fd`), and nothing else owns it.
+        mux::serve(UnixStream::from(unsafe { OwnedFd::from_raw_fd(3) }), Proxy(allow));
+        return;
     }
     let _ = ex::nix_program("EXOBOX_TEST_PYTHON"); // skip before starting anything
     let port = http_server();
@@ -131,12 +134,12 @@ fn main() {
     proxy.arg(port.to_string()).args(internet.then_some("--internet"));
     ex::give_fd(&mut proxy, &a, 3);
     let mut proxy = proxy.spawn().expect("spawn the proxy");
-    let mut sandbox = ex::self_command("sandbox");
-    sandbox.args(&urls);
-    ex::give_fd(&mut sandbox, &b, 3);
-    let mut sandbox = sandbox.spawn().expect("spawn the sandbox");
-    drop((a, b)); // the children's now: the proxy sees EOF when the sandbox ends
+    drop(a); // the proxy's now
+    let sandbox = sandbox(b, urls).unwrap_or_else(|e| ex::fail(e));
     println!("sandbox: {}", ex::describe(sandbox.wait().unwrap()));
+    // This process (the template) still holds its copy of the sandbox's end, so the proxy would
+    // never see EOF: it is stopped instead.
+    let _ = proxy.kill();
     let _ = proxy.wait();
 }
 

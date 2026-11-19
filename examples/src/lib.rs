@@ -1,9 +1,11 @@
-//! What the examples share. Nothing here hides exobox's API: `nix-program` shows every step that
-//! [`mount_closure`] bundles, and the rest is plain host-process plumbing.
+//! What the examples share: plain host-process plumbing. Nothing here hides exobox's API.
 //!
-//! The one pattern every example has: a sandbox takes its process over (`run` never returns, and
-//! the process ends with the program's status), so an example that wants to watch or talk to a
-//! sandbox re-runs itself as a child in a "role" ([`role`], [`self_command`]) and stays the parent.
+//! A sandbox takes its process over (`run` never returns, and the process ends with the
+//! program's status), so an example that wants to watch or talk to a sandbox forks it off as a
+//! template's child (`Sandbox::spawn`: `channel`, `net-policy`) and stays the parent. One that
+//! wants sandboxes of different configurations (one guest per process: `escape`, `threads`), or
+//! a cold one measured from outside (`nix-program`), re-runs itself as a child in a "role"
+//! ([`role`], [`self_command`]).
 
 pub mod mux;
 
@@ -13,7 +15,6 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use exobox::{Image, Sandbox, store};
 
 const ROLE: &str = "EXOBOX_EXAMPLE_ROLE";
 
@@ -33,9 +34,13 @@ pub fn self_command(role: &str) -> Command {
 /// its close-on-exec and only the child has it).
 pub fn give_fd(cmd: &mut Command, fd: &impl AsRawFd, at: RawFd) {
     let fd = fd.as_raw_fd();
-    // SAFETY: dup2 is async-signal-safe.
+    // SAFETY: dup2 and fcntl are async-signal-safe. (If `fd` is `at` already, dup2 does nothing
+    // and close-on-exec stays: cleared instead.)
     unsafe {
-        cmd.pre_exec(move || if libc::dup2(fd, at) < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) });
+        cmd.pre_exec(move || {
+            let r = if fd == at { libc::fcntl(at, libc::F_SETFD, 0) } else { libc::dup2(fd, at) };
+            if r < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+        });
     }
 }
 
@@ -58,16 +63,6 @@ pub fn c_program(name: &str) -> PathBuf {
 /// Small workloads, for the smoke tests (`tests/smoke.rs` sets it).
 pub fn quick() -> bool {
     std::env::var_os("EXOBOX_EXAMPLE_QUICK").is_some()
-}
-
-/// `program`'s Nix closure (plus `allow`: more host paths, each with its own closure), as images
-/// mapped into `sb`, each paired with where `exobox::setup::mount_closure` mounts it. Host work,
-/// before `run`: the closure and its images come from the image cache, built where missing.
-pub fn mount_closure(sb: &mut Sandbox, program: &Path, allow: &[PathBuf]) -> Result<Vec<(Image, PathBuf)>, exobox::Error> {
-    let cache = store::Cache::new(&store::Cache::default_dir()?);
-    let closure = cache.closure(program, allow)?;
-    let store = cache.images(&closure)?;
-    store.mounts.iter().map(|m| Ok((sb.map_image(&m.image)?, m.guest.clone()))).collect()
 }
 
 /// After `run` failed: before the program started, so the error is ours to report. (The routing
