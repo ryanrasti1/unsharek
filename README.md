@@ -246,6 +246,13 @@ against threaded mode (`threads`), and the host filter refusing a hostile progra
    no loadable modules), and `lib.mkExobox { kernel }` for an exobox built with it. In development,
    `EXOBOX_LKL_SRC` (another checkout) and `EXOBOX_LKL_CONFIG` (a fragment) select them. (Done:
    see "Building and testing".)
+11. After v0: closures from pre-built images. A closure shown per file costs a host mapping per
+   file (python's: 7,741), which every fork copies and every exit tears down (~4 ms per exit,
+   against ~0.3 ms with one image per store path). A mount source that takes an image per store
+   path, built by Nix in the caller's own derivation (capnix: an `<app>-images` derivation over the
+   app's closure), with per-file `synthesize` for any path without one. `build` stays
+   deterministic (a tested property), so Nix's store optimisation hard-links identical images
+   across apps.
 
 ## Building and testing
 
