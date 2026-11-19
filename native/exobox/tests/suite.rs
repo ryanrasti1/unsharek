@@ -178,6 +178,8 @@ fn cases() -> Vec<Case> {
         fixture("small_stack", ALL),
         fixture("stdio_meminfo", ALL),
         fixture("sigsys", ALL),
+        // Bad pointers to a call LKL serves: EFAULT, not a fault in the sandbox (cargo).
+        fixture("statx_probe", ALL),
         // Handlers run as the program (item 8); its fork steps only where there are processes.
         fixture("signals", ALL),
         fixture("gsbase", ALL),
@@ -347,6 +349,18 @@ fn cases() -> Vec<Case> {
                     Arg::Lit("export PATH=$EXOBOX_TEST_COREUTILS/bin:$PATH; d=$(mktemp -d -p /tmp) && cd $d && printf 'int main(void) { return 7; }\\n' > m.c && $EXOBOX_TEST_GCC -o m m.c; ./m; [ $? = 7 ] && echo GCC_OK; rm -rf $d"),
                 ])
                 .uses(&["EXOBOX_TEST_GCC", "EXOBOX_TEST_COREUTILS"])
+        },
+        // cargo, rustup-less: Rust's std probes statx with NULLs (statx_probe), which crashed every
+        // cargo at startup. Its build in fork mode: cargo, rustc and cc, each a process of its own.
+        case("cargo_version", Prog::External("EXOBOX_TEST_CARGO"), ALL, ok("cargo ")).args(vec![Arg::Lit("--version")]),
+        Case {
+            timeout: Duration::from_secs(20),
+            ..case("cargo_build", Prog::External("EXOBOX_TEST_BASH"), FORK, ok("CARGO_BUILD_OK"))
+                .args(vec![
+                    Arg::Lit("-c"),
+                    Arg::Lit("export PATH=$EXOBOX_TEST_COREUTILS/bin:${EXOBOX_TEST_RUSTC%/*}:${EXOBOX_TEST_GCC%/*}:$PATH; d=$(mktemp -d -p /tmp) && cd $d && export CARGO_HOME=$d/home && mkdir src && printf '[package]\\nname = \"t\"\\nversion = \"0.1.0\"\\nedition = \"2021\"\\n' > Cargo.toml && printf 'fn main() { std::process::exit(7) }\\n' > src/main.rs && $EXOBOX_TEST_CARGO build --offline -q && ./target/debug/t; [ $? = 7 ] && echo CARGO_BUILD_OK; rm -rf $d"),
+                ])
+                .uses(&["EXOBOX_TEST_CARGO", "EXOBOX_TEST_RUSTC", "EXOBOX_TEST_GCC", "EXOBOX_TEST_COREUTILS"])
         },
         fixture("forkbomb", FORK).flags(&["--max-procs=16"]).env(&[("EXOBOX_TEST_MAX_PROCS", "16")]).native(None),
         Case {

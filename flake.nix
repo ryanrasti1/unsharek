@@ -65,6 +65,9 @@
         EXOBOX_TEST_XZ = "${pkgs.xz}/bin/xz";
         EXOBOX_TEST_MAKE = "${pkgs.gnumake}/bin/make";
         EXOBOX_TEST_GCC = "${pkgs.gcc}/bin/gcc";
+        # Rust's tools, rustup-less (suite: cargo_version, cargo_build)
+        EXOBOX_TEST_CARGO = "${pkgs.cargo}/bin/cargo";
+        EXOBOX_TEST_RUSTC = "${pkgs.rustc}/bin/rustc";
         # Marks this shell, so ./test runs inside it directly.
         EXOBOX_DEVSHELL = "1";
       };

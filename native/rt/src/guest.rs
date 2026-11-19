@@ -20,7 +20,8 @@
 //! `sysmap` describes, with `xabi`'s translations; `Emulate`: memory in the arena, threads as
 //! coroutines, futexes on the scheduler (`futex`), the thread pointer in the trap frame; `Errno`
 //! its errno. Pointers the emulations dereference are checked against the arena first (EFAULT);
-//! those passed to LKL are LKL's to read (it has no MMU: a bad one is a fault in the sandbox).
+//! those passed to LKL are LKL's to read (it has no MMU: a bad one is a fault in the sandbox),
+//! except where programs pass bad ones on purpose (`statx`: Rust's probe, `Rewrite::Statx`).
 //!
 //! **Ends.** A task's end comes back from the kernel as the `task_exit` host op (item 6), on the
 //! task's own coroutine: init's (pid 1, after its exit ran in the guest) ends the sandbox with
@@ -1709,9 +1710,33 @@ fn rewrite(rw: Rewrite, a: [usize; 6]) -> isize {
             r
         }
         Rewrite::SigAction => sigaction(a),
+        Rewrite::Statx => statx(a),
         // Fork mode's are `serve`'s; the other modes have no processes.
         Rewrite::Fork => -(Errno::NOSYS.raw_os_error() as isize),
     }
+}
+
+/// `Rewrite::Statx`: the program's pointers checked before LKL reads or writes them. The errors
+/// are Linux's, in its order: the path's (`EFAULT`, `ENAMETOOLONG`), the lookup's, the buffer's.
+fn statx(a: [usize; 6]) -> isize {
+    let (dfd, path, flags) = (a[0] as i32, a[1], a[2] as i32);
+    // `sys_statx`'s short cut, which never reads a NULL path (`vfs_empty_path`).
+    let empty_form = flags & !(k::AT_NO_AUTOMOUNT | k::AT_STATX_SYNC_TYPE) == k::AT_EMPTY_PATH && dfd >= 0;
+    if path == 0 && !empty_form {
+        return -(Errno::FAULT.raw_os_error() as isize);
+    }
+    if path != 0
+        && let Err(e) = user_cstr(path, exec::PATH_MAX)
+    {
+        return -(e.raw_os_error() as isize);
+    }
+    // `struct statx` is 256 bytes, the same on both (`xabi`); LKL fills all of it.
+    let mut tmp = [0u64; 32];
+    let r = lkl_call(lkl::STATX as c_long, [a[0], path, a[2], a[3], tmp.as_mut_ptr() as usize, 0]);
+    if r < 0 {
+        return r;
+    }
+    ret(write_user(a[4], tmp).map(|_| 0))
 }
 
 fn sigaction(a: [usize; 6]) -> isize {
