@@ -18,6 +18,10 @@ test = false
 [dependencies]
 libc.workspace = true
 
+# c/longjmp.c (build.rs)
+[build-dependencies]
+cc.workspace = true
+
 [[test]]
 name = "guest_native"
 path = "tests/guest_native.rs"

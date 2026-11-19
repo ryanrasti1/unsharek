@@ -1,4 +1,4 @@
-//! What a program reads about itself and its machine (stdio_meminfo.c's memory part, /proc/self).
+//! What a program reads about itself and its machine: its memory size, /proc/self, uname.
 
 use std::fs;
 
@@ -48,7 +48,7 @@ pub fn proc_self() {
     for fd in ["0", "1", "2"] {
         assert!(fds.iter().any(|f| f == fd), "fd {fd} not in /proc/self/fd: {fds:?}");
     }
-    assert_eq!(fs::read_to_string("/proc/self/comm").unwrap().trim_end().len() <= 15, true);
+    assert!(fs::read_to_string("/proc/self/comm").unwrap().trim_end().len() <= 15, "comm is 15 bytes at most");
 }
 
 pub fn uname() {

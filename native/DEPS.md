@@ -38,7 +38,8 @@ of routes plus its names.
 | rustix 1 (no default features; thread, mm) | raw Linux syscalls, no libc: no_new_privs before the filter's install (seccomp itself is one inline `syscall`: rustix has no wrapper), `mprotect` for the coroutine stacks' guard pages. Not its `runtime` feature (unstable API): `rt_sigaction` and `sigaltstack` go through the gate before lockdown | library | only the calls used are linked; pulls bitflags and linux-raw-sys (constants) |
 | libc 0.2 | x86-64 struct layouts and constants the translations (and the trap's ucontext/siginfo) are checked against; fork/waitpid for the kernel tests (filter, trap) | test | test-only (already in the tree for the suite) |
 
-Tools in the devshell (not linked): cargo-nextest (per-test processes and timeouts), erofs-utils
+Tools in the devshell (not linked): cargo-nextest (per-test processes and timeouts; its
+experimental wrapper scripts run the in-guest tests, `.config/nextest.toml`), erofs-utils
 (store images for programs outside the store; `fsck.erofs`/`dump.erofs` are the test oracle for
 native/erofs).
 
@@ -212,3 +213,8 @@ write their restrictions as BPF by hand).
 | Crate | For | Where | Cost noted |
 |---|---|---|---|
 | exobox-build (workspace) | the binary's fixed-address link (`link_fixed_address`), shared with embedders | exobox's and the examples' build.rs | build only; pulls cc, already in the tree |
+
+## The in-guest tests (2026-11-18): native/guest-tests
+No new crates: libc (the tests' syscalls) and cc (build.rs: c/longjmp.c), both already in the
+tree. Four test binaries of ~3.3 MB each (debug), one library of the tests' bodies: cold ~0.6 s
+with the dependencies built, ~0.25 s after a test's edit.

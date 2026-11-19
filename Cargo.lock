@@ -338,6 +338,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 name = "guest-tests"
 version = "0.0.0"
 dependencies = [
+ "cc",
  "libc",
 ]
 

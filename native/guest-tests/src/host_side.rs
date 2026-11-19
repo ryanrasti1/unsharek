@@ -44,7 +44,7 @@ pub fn should_panic() {
 }
 
 pub fn demo_assert_fails() {
-    let v = vec![1, 2, 3];
+    let v = [1, 2, 3];
     println!("some output before the failure");
     assert_eq!(v.len(), 4, "a failing assert in mode {}", crate::mode());
 }

@@ -1,4 +1,6 @@
-//! Sockets on the guest's own loopback (hello.c's TCP part, net.c's `loopback`).
+//! Sockets on the guest's own loopback (hello.c's TCP part, net.c's `loopback`), and the network
+//! beyond it as a sandbox without network hooks has it (the CLI's: none). What a sandbox's hooks
+//! do with the program's connects is native/exobox/tests/net.rs's (the library's API).
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
@@ -75,4 +77,15 @@ pub fn unix_sockets() {
     t.join().unwrap();
     assert_eq!(got, "from the listener");
     std::fs::remove_file(&p).unwrap();
+}
+
+/// With no hooks, everything but loopback is unreachable: a connect is ENETUNREACH (net.c's
+/// `unreachable`). Natively the host's network is whatever it is: not checked.
+pub fn unreachable() {
+    if crate::mode() == "native" {
+        println!("natively: the host's network, not checked");
+        return;
+    }
+    let e = TcpStream::connect("10.0.0.1:9").expect_err("a connect beyond loopback without hooks");
+    assert_eq!(e.raw_os_error(), Some(libc::ENETUNREACH), "{e}");
 }
