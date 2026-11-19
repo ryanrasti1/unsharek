@@ -16,8 +16,16 @@ clap.workspace = true
 exobox-erofs = { path = "../erofs" }
 # The in-sandbox runtime: boot, the gate, routing, exec; given the inventory's resources
 exobox-rt = { path = "../rt" }
-# The batteries, re-exported: setup, store, net, alloc (none of it the TCB)
-exobox-kit = { path = "../kit" }
+# Errno, the runtime's error type, in the hooks' adapters (src/net.rs)
+rustix.workspace = true
+# The global allocator after lockdown (src/alloc.rs): the hooks' and the executor's allocations,
+# from a region reserved before it
+talc = { version = "5", default-features = false }
+# The hooks' stream traits (futures-io's AsyncRead/AsyncWrite, futures-core's Stream)
+futures-io = "0.3"
+futures-core = "0.3"
+# tokio's AsyncRead/AsyncWrite too, for providers built on them (capnweb-rs's channel)
+tokio = { version = "1", default-features = false, optional = true }
 # The TCB's constants and the API's host calls before lockdown (the auxiliary vector, entropy,
 # setrlimit, fcntl, fork)
 libc.workspace = true
@@ -25,7 +33,7 @@ thiserror.workspace = true
 # The security filter's allowlist, compiled to classic BPF (src/tcb/filter.rs): Firecracker's
 seccompiler = "0.5"
 [features]
-tokio = ["exobox-kit/tokio"]
+tokio = ["dep:tokio"]
 # The runtime's measurement counters, printed at the sandbox's end (exobox-rt's src/stats.rs).
 stats = ["exobox-rt/stats"]
 
@@ -34,9 +42,6 @@ stats = ["exobox-rt/stats"]
 exobox-build = { path = "../build" }
 
 [dev-dependencies]
-# tests/net.rs: the providers' streams
-futures-io = "0.3"
-futures-core = "0.3"
 exobox-fixtures = { path = "../fixtures" }
 # the suite's sysaudit table: syscall names by number
 syscalls.workspace = true

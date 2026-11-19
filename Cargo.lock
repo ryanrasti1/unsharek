@@ -228,16 +228,18 @@ dependencies = [
  "exobox-build",
  "exobox-erofs",
  "exobox-fixtures",
- "exobox-kit",
  "exobox-rt",
  "futures-core",
  "futures-io",
  "libc",
  "libtest-mimic",
+ "rustix",
  "seccompiler",
  "syscalls",
+ "talc",
  "tempfile",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -275,22 +277,6 @@ name = "exobox-fixtures"
 version = "0.0.0"
 dependencies = [
  "cc",
-]
-
-[[package]]
-name = "exobox-kit"
-version = "0.0.0"
-dependencies = [
- "exobox-erofs",
- "exobox-rt",
- "futures-core",
- "futures-io",
- "libc",
- "rustix",
- "talc",
- "tempfile",
- "thiserror",
- "tokio",
 ]
 
 [[package]]

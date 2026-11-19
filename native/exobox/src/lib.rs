@@ -39,10 +39,14 @@
 //! (a `Sandbox` is `!Send`). A template forks it ([`Sandbox::fork`], [`Sandbox::spawn`]): each
 //! child is a sandbox of its own, sharing the template's booted kernel copy-on-write.
 
-pub use exobox_kit::{alloc, net, setup, store};
+pub mod alloc;
+mod image;
+pub mod net;
+pub mod setup;
+pub mod store;
 mod tcb;
 
-pub use exobox_kit::image::Image;
+pub use image::Image;
 pub use net::{Cx, GuestSocket, HeldFd, NetError, OnConnect, OnListen, OnResolve};
 
 /// One classic-BPF instruction (`struct sock_filter`), for [`Builder::restrict`].
@@ -359,7 +363,7 @@ impl Guest {
             None => None,
         };
         let name: &'static str = Box::leak(name.into_boxed_str());
-        exobox_kit::image::register(name, data, in_zone).map_err(Error::io(format!("the guest's /dev/exobox/{name}")))
+        image::register(name, data, in_zone).map_err(Error::io(format!("the guest's /dev/exobox/{name}")))
     }
 
     /// The image mapped again, privately, in the arena's image zone (`exobox_rt::memblk`): what
@@ -385,7 +389,7 @@ impl Guest {
             return Ok(None);
         }
         self.zone.0 = at + size;
-        for (lo, hi) in exobox_kit::image::writable_pages(file, layout) {
+        for (lo, hi) in image::writable_pages(file, layout) {
             let (lo, hi) = (at + lo, (at + hi).min(at + size));
             if lo >= hi {
                 continue;
