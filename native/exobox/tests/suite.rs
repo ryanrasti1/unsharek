@@ -95,6 +95,8 @@ struct Case {
     flags: Vec<&'static str>,
     env: Vec<(&'static str, &'static str)>,
     stdin: Option<&'static str>,
+    /// Stdin a pipe held open and silent for the whole run (a reader blocks on it).
+    hold_stdin: bool,
     timeout: Duration,
     cpu_budget: Option<Duration>,
     /// Checks stdout beyond `Expect` (sysaudit's table).
@@ -112,6 +114,7 @@ fn case(name: &'static str, prog: Prog, modes: &'static [Mode], sandbox: Expect)
         flags: vec![],
         env: vec![],
         stdin: None,
+        hold_stdin: false,
         timeout: Duration::from_secs(5),
         cpu_budget: None,
         check: None,
@@ -230,6 +233,10 @@ fn cases() -> Vec<Case> {
         fixture("fork", FORK),
         fixture("signals", FORK),
         fixture("forkthreads", FORK),
+        // A thread blocked reading a host fd must not keep its process from exiting (capnix).
+        Case { hold_stdin: true, ..fixture("hostfd_thread", ALL).args(vec![Arg::Lit("exit")]) },
+        Case { hold_stdin: true, ..fixture("hostfd_thread", ALL).renamed("hostfd_thread_sleep").args(vec![Arg::Lit("sleep")]) },
+        Case { hold_stdin: true, ..fixture("hostfd_thread", ALL).renamed("hostfd_thread_write").args(vec![Arg::Lit("write")]) },
         fixture("fork_rng", FORK),
         fixture("settid", FORK),
         // The pipeline that found settid's bug: a C++ program on a pipeline's left side, in a
@@ -381,7 +388,7 @@ fn run(c: &Case, mode: Mode, secret: &PathBuf) -> Result<(), Failed> {
         .env("EXOBOX_TEST_SECRET", secret)
         .env("EXOBOX_TEST_TARGET", std::process::id().to_string())
         .envs(c.env.iter().copied())
-        .stdin(if c.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdin(if c.stdin.is_some() || c.hold_stdin { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
