@@ -43,8 +43,17 @@
 - Escape tests probe the filter with `--deny=errno`; the default (`kill`) has its own case.
 
 ## Code
+- The trusted computing base is `native/exobox/src/tcb/` and nothing else
+  (`native/exobox/TCB.md`): the authority inventory, the security filter, lockdown. Keep it
+  small. A change that widens what the host allows (a filter rule, an fd or a shared mapping
+  kept past lockdown) is a TCB change: it goes through the inventory and the filter, with a test
+  in `tcb/filter/tests.rs`, and TCB.md says why. The runtime (`native/rt`), the kernel and the
+  batteries (`native/kit`: setup, store, net, alloc) are not trusted: they are given resources,
+  never produce values the filter trusts, and know nothing of the security filter. A network
+  hook is never a policy point.
 - Comments live in the code, next to what they explain: why it is so, what broke before. The
-  top-level README describes the project and its modes; there is no other docs tree yet.
+  top-level README describes the project and its modes; `native/exobox/TCB.md` how to review
+  isolation; there is no other docs tree yet.
 - Library first: the CLI (`native/exobox/src/main.rs`) only turns arguments into a `Config`.
 - Proven, current crates by default. Record each dependency's cost (binary size, build time) in
   `native/DEPS.md` when adding it.

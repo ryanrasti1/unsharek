@@ -69,15 +69,20 @@ sb.run(&argv, &env)                                    // lockdown, then exec; n
   it into the exec), so helpers are started before the first guard. Only the calling thread is
   routed; other threads' syscalls stay the host's.
 - **`run(argv, env)`** is the lockdown and the exec: the routing filter if no guard installed it,
-  the network hooks, the security filter (the mode's, with the restrictions stacked), then the
-  program exec'd inside the guest with init's credentials as setup left them. Files and fds
-  setup left open are the program's. The process's status is the program's; `run` returns only if
-  the program couldn't be started. The sandbox's process must have no host threads of the
-  caller's left (they would be unfiltered).
+  the network hooks, then lockdown (below, "Where isolation is"), then the program exec'd inside
+  the guest with init's credentials as setup left them. Guest files and fds setup left open are
+  the program's; host fds not given to the sandbox are closed. The process's status is the
+  program's; `run` returns only if the program couldn't be started. The sandbox's process must
+  have no host threads of the caller's left.
+- **`run_fn(|| -> i32)`** is the lockdown, then a closure run as the program: on this thread,
+  after both filters, its syscalls trapped and served by the guest kernel as an exec'd program's
+  are, its return value the exit status. For tests and for programs written in Rust against
+  exobox; single-threaded, and what it captures from the host side is all it has (the escape
+  example is one).
 - **`pass_fd(fd, n)`** gives the guest host fd `fd` as its fd `n`, now, and `hold_fd(fd)` keeps
-  one for the hooks; each widens the filter by `read` and `write` on exactly that fd. They are the
-  only ways to widen it: `restrict(prog)` stacks a seccomp program of the caller's (seccompiler's,
-  libseccomp's) that can only take away.
+  one for the hooks; each is recorded in the authority inventory and widens the filter by `read`
+  and `write` on exactly that fd. They are the only ways to widen it: `restrict(prog)` stacks a
+  seccomp program of the caller's (seccompiler's, libseccomp's) that can only take away.
 - **Templates.** `fork()` (or `spawn(|sb| { setup; sb.run(..) })`) forks the sandbox's process:
   the child is a sandbox of its own, a copy of this one as it is (the booted kernel, its mounts and
   files, shared copy-on-write), to set up further (its own images, fds, guards) and run; the parent
@@ -101,13 +106,32 @@ sb.run(&argv, &env)                                    // lockdown, then exec; n
   once, at build; each child holds its own provider's fd under a name the hooks look up.
   futures-io's `AsyncRead`/`AsyncWrite` by default, tokio's with the `tokio` feature;
   `OnConnect::drive` hands a provider the program's end (`GuestSocket`) to drive itself.
-- **The authority rule.** The hooks run in the program's address space: a compromised program
-  can read and write their memory and drive the provider's connection itself. So that connection
-  must carry no more authority than the program's own channel: policy (which addresses, which
-  names) lives behind it, at its other end, never in the hook.
-- **Layers.** `Sandbox` is built on `Guest` (`Guest::boot`, `map_image`, `intercept`, `run`: the
-  kernel and routing, no security filter); the CLI's `exobox run` is `exobox::run(Config)`: the
-  builder, the closure's images mapped, `mount_closure` in a guard, `run`.
+- **A hook is not a policy point.** The hooks run after lockdown, in the program's address space:
+  a compromised program can read and write their memory, skip any check they make, and drive the
+  provider's connection itself. So that connection must carry no more authority than the
+  program's own channel: policy (which addresses, which names) is enforced at its far end, in the
+  provider's own process, never in a hook. Anything a hook decides, a compromised program can
+  skip. The network's only part of the TCB is the held fds: which ones, and the filter pinning
+  `read` and `write` to exactly them.
+- **Where isolation is.** The crate `exobox` (`native/exobox`) is the trusted computing base and
+  a thin API over the rest. The TCB is its `src/tcb` alone, about 600 lines with comments
+  ([native/exobox/TCB.md](native/exobox/TCB.md): what's in it, what isn't and why, a review
+  checklist): the **authority inventory** (every host fd, mapping and thread the sandbox keeps
+  past lockdown, made and recorded there, and given to the runtime), the **security filter**
+  built from it per mode (seccompiler), and **lockdown**, one function: exactly the inventory's
+  threads, every other fd closed, the caller's restrictions and then the security filter
+  installed with TSYNC (every thread), before anything untrusted runs. Nothing else protects the
+  host: the runtime, the guest kernel, the hooks and the store run in the program's address space
+  after lockdown (or decide only what the guest sees, before it), and a bug in them breaks the
+  guest, never the host.
+- **Layers.** Below the TCB, three crates, none of them trusted: `exobox-rt` (`native/rt`, the
+  runtime: boot, the gate, the routing filter, the dispatcher, scheduler, arena and loader; it
+  knows nothing of the security filter), `lkl-sys` (the kernel, the runtime's alone) and
+  `exobox-kit` (`native/kit`, the batteries exobox re-exports: `setup`, `store`, `net`, `alloc`).
+  In the API, `Sandbox` is built on `Guest` (`Guest::boot`, `map_image`, `intercept`, `run`: the
+  kernel and routing, no security filter, so no isolation: a test layer); the CLI's `exobox run`
+  is `exobox::run(Config)`: the builder, the closure's images mapped, `mount_closure` in a guard,
+  `run`.
 - **Embedding.** exobox sets the process's global allocator (the hooks allocate after lockdown,
   from a region reserved at build). A binary that embeds it links at a fixed address as the CLI
   does with one call in its `build.rs`, `exobox_build::link_fixed_address()` (`native/build`): a
@@ -125,16 +149,23 @@ against threaded mode (`threads`), and the host filter refusing a hostile progra
 
 ## How it works
 
-- **Routing and security are two stacked seccomp filters.** The first (installed by the first
-  intercept guard, or by `run`; on the calling thread, which the threads it makes inherit) traps
-  every syscall the program makes (`SECCOMP_RET_TRAP`: a SIGSYS into exobox, which serves it) and
-  allows everything from exobox's own syscall instruction, the gate. The second (the security
-  filter, installed before the program starts) allows from the gate only the mode's list, with
-  each argument pinned (exact fds, the program's memory, one `clone` flag set). With two filters
-  the kernel takes the strictest answer, so the program's syscalls trap, and the gate gets exactly
-  the list. The gate's address check is routing, not security: a compromised program can jump to
-  the gate, and then only the list applies. A caller's restrictions are more filters on the same
-  stack: the strictest answer still wins.
+- **Routing and security are two stacked seccomp filters.** The first, the routing filter
+  (the runtime's, thirteen instructions; installed by the first intercept guard, or by `run`; on
+  the calling thread, which the threads it makes inherit) traps every syscall the program makes
+  (`SECCOMP_RET_TRAP`: a SIGSYS into exobox, which serves it) and allows everything from exobox's
+  own syscall instruction, the gate. It is not part of the TCB: under the security filter it can
+  only take away. The second, the security filter (the TCB's, installed at lockdown with TSYNC),
+  is seccompiler's allowlist of the mode's calls, each argument pinned (exact fds, one `clone`
+  flag set, the sandbox's own pid), behind a short prologue that kills other ABIs and sends calls
+  not from the gate back as TRAP: an allowlist whose default is KILL would otherwise outrank the
+  routing filter's TRAP and kill every program call not on it. That prologue answers only TRAP or
+  KILL, so the gate's address check stays routing, not security: a compromised program can jump
+  to the gate, and then only the list applies. A caller's restrictions are more filters on the
+  same stack: the strictest answer still wins.
+- **Lockdown.** Before anything the program brings runs (its exec, its interpreter, `run_fn`'s
+  closure, the hooks' first task), the TCB checks that the only host threads are the sandbox's,
+  closes every host fd the inventory doesn't hold (`close_range`), and installs the restrictions
+  and the security filter on every thread (TSYNC; a thread that can't take it fails lockdown).
 - **Passthrough.** Between guards (and for other threads during one) a trapped syscall is the
   host's: the SIGSYS handler re-issues it from the gate, which the routing filter allows, and
   returns its result as the call's. What can't be re-issued as is is handled deliberately

@@ -207,8 +207,8 @@ it as a dev-dependency for the audit's table). A new workspace crate, `exobox-bu
 (`native/build`), holds the fixed-address link that was `native/exobox/build.rs`'s, for any
 embedder's build script: its one dependency is `cc` (already in the tree), and it is a
 build-dependency only, of exobox and of the examples. `Builder::restrict`'s rustdoc shows
-seccompiler, which stays the caller's dependency, not exobox's (nor a dev-dependency: the tests
-write their restrictions as BPF by hand).
+seccompiler, which stayed the caller's dependency, not exobox's (until the TCB split below made
+it exobox's own: the security filter is compiled with it).
 
 | Crate | For | Where | Cost noted |
 |---|---|---|---|
@@ -218,3 +218,18 @@ write their restrictions as BPF by hand).
 No new crates: libc (the tests' syscalls) and cc (build.rs: c/longjmp.c), both already in the
 tree. Four test binaries of ~3.3 MB each (debug), one library of the tests' bodies: cold ~0.6 s
 with the dependencies built, ~0.25 s after a test's edit.
+
+## The TCB split (2026-11-18): seccompiler in exobox; exobox-kit (native/kit)
+exobox is now the trusted computing base (`src/tcb`, `native/exobox/TCB.md`) and a thin API.
+The security filter's allowlist is compiled by seccompiler instead of exobox-rt's hand-written
+compiler (which stays as a test-only oracle). The batteries (setup, store, net, alloc) move to a
+new workspace crate, exobox-kit, which exobox re-exports; exobox no longer depends on lkl-sys,
+talc, futures-io/-core or rustix directly (kit does, but lkl-sys, which only the runtime does).
+The release `exobox` binary: 10,123,384 / 8,863,272 bytes (unstripped / stripped), from
+10,090,800 / 8,838,696 on main just before: +24 KB stripped, seccompiler's compiler (~13.5 KB of
+symbols by `nm --size-sort`, its BTreeMap and Vec code with it) run once per sandbox start.
+
+| Crate | For | Where | Cost noted |
+|---|---|---|---|
+| seccompiler 0.5 (default features: no `json`) | the security filter's allowlist, rules with 64-bit argument conditions, to classic BPF (`tcb/filter.rs`); not its `apply_filter*`, which make libc syscalls the routing filter would trap: lockdown installs through the gate | library (the TCB) | ~24 KB stripped; ~0.3 s cold build (release); depends only on libc, already in the tree |
+| exobox-kit (workspace) | the batteries, re-exported as `exobox::{setup, store, net, alloc}` | library | none: code moved from exobox |

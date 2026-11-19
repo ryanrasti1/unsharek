@@ -12,7 +12,7 @@
 //! init before exec (`exobox::Guest::run`'s closure): its syscalls trap and are served here, by
 //! the guest; its memory (host `mmap` and friends, made by the host's libc) stays the host's, so
 //! the memory calls are passed through the gate to the host, until [`host_memory`]`(false)` says
-//! the mode's filter (which allows none of them) is about to go in. [`Phase::Program`]: after
+//! the security filter (which allows none of them) is about to go in. [`Phase::Program`]: after
 //! [`exec`], the program's memory is the arena's.
 //!
 //! **What the dispatcher does with each route** (`sysmap`): `Lkl` is `lkl_syscall` on the current

@@ -50,13 +50,16 @@
 //!   call fails with ECONNRESET) and the stream is dropped.
 //! - Both directions done: the stream is dropped, the program's socket closed.
 //!
-//! **Where the hooks run, and the authority rule.** The hooks run inside the sandbox, after
-//! lockdown, on its executor ([`Cx`]): in the program's address space, on one of its coroutines.
-//! A compromised program can read and write their memory, and so drive whatever connection a
-//! provider holds (a [`HeldFd`]) as it likes. That connection must therefore carry no more
-//! authority than the program's own channel would: policy (which addresses, which names) lives
-//! behind it, in the process at its other end, never in the hook. The hook is plumbing, not a
-//! guard.
+//! **Where the hooks run, and the authority rule: a hook is not a policy point.** The hooks run
+//! inside the sandbox, after lockdown, on its executor ([`Cx`]): in the program's address space,
+//! on one of its coroutines. A compromised program can read and write their memory, skip any
+//! check they make, and drive whatever connection a provider holds (a [`HeldFd`]) as it likes.
+//! None of this module is exobox's trusted computing base: the network's only part of that is
+//! the held fds themselves (which ones the sandbox holds, and the security filter allowing
+//! `read` and `write` on exactly those). So a held connection must carry no more authority than
+//! the program's own channel would: policy (which addresses, which names) is enforced at its far
+//! end, in the provider's own process, which exobox leaves agnostic, never in a hook. A hook is
+//! plumbing, not a guard: anything it decides, a compromised program can skip.
 //!
 //! What the hooks may do: compute, allocate (exobox's allocator serves the sandbox after
 //! lockdown), spawn tasks ([`Cx::spawn`]), wait on time and on the host fds held for them
@@ -167,6 +170,11 @@ use tsi::{ConnectFn, ListenFn, ResolveFn};
 /// The program's connects to anything but loopback: `async |cx, pid, addr| -> Result<stream,
 /// NetError>`, the stream any `AsyncRead + AsyncWrite` (futures-io's; tokio's with
 /// [`OnConnect::tokio`]).
+///
+/// **Not a policy point.** It runs after lockdown, in the program's address space: anything it
+/// decides (refusing an address, a name), a compromised program can skip, by calling the
+/// provider's held fd itself. Enforce policy at the far end of the held fd, in the provider's
+/// own process.
 #[derive(Default)]
 pub struct OnConnect(pub(crate) Option<ConnectFn>);
 
@@ -222,6 +230,11 @@ impl OnConnect {
 
 /// The program's listens on anything but loopback: `async |cx, pid, addr| -> Result<incoming,
 /// NetError>`, `incoming` a `Stream` of `(peer, stream)`.
+///
+/// **Not a policy point.** It runs after lockdown, in the program's address space: anything it
+/// decides (refusing an address, a name), a compromised program can skip, by calling the
+/// provider's held fd itself. Enforce policy at the far end of the held fd, in the provider's
+/// own process.
 #[derive(Default)]
 pub struct OnListen(pub(crate) Option<ListenFn>);
 
@@ -273,6 +286,11 @@ impl OnListen {
 
 /// The program's name lookups: `async |cx, pid, name| -> Result<Vec<IpAddr>, NetError>`. `name`
 /// is lowercased, without a trailing dot.
+///
+/// **Not a policy point.** It runs after lockdown, in the program's address space: anything it
+/// decides (refusing an address, a name), a compromised program can skip, by calling the
+/// provider's held fd itself. Enforce policy at the far end of the held fd, in the provider's
+/// own process.
 #[derive(Default)]
 pub struct OnResolve(pub(crate) Option<ResolveFn>);
 
@@ -439,6 +457,9 @@ where
 /// token (`Copy`, `Send`, `Sync`: one executor per sandbox), so a no_std protocol core's runtime
 /// is a newtype over it (capnweb's `Runtime { spawn, now, sleep_until }`: `spawn(task)` is
 /// `cx.spawn(task)`, `now()` is `cx.now()`, `sleep_until(d)` is `Box::pin(cx.sleep_until(d))`).
+///
+/// What runs on it is the program's to corrupt (it shares the address space): see the module
+/// comment's authority rule.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Cx;
 

@@ -16,14 +16,24 @@
 //! # Err(e) }
 //! ```
 //!
-//! Three layers (README.md, "The library"), each built only from the one below:
+//! **Where isolation is.** This crate is exobox's trusted computing base plus a thin API. The
+//! TCB is `src/tcb` alone (`TCB.md` beside Cargo.toml: what's in it, what isn't and why, and a
+//! review checklist): the authority inventory (every host fd, mapping and thread the sandbox
+//! keeps past lockdown, made and recorded there), the security filter built from it
+//! (seccompiler), and lockdown (threads checked, every other fd closed, the filters installed
+//! with TSYNC, before anything untrusted runs). Everything else, this file's API included, the
+//! runtime (`exobox-rt`), the guest kernel and the batteries re-exported here from `exobox-kit`
+//! ([`setup`], [`store`](mod@store), [`net`], [`alloc`]), runs in the program's address space after
+//! lockdown and protects nothing.
+//!
+//! Layers (README.md, "The library"), each built only from the one below:
 //! 1. [`Guest`]: the kernel booted in this process ([`Guest::boot`]), host data given to it
 //!    ([`Guest::map_image`]), setup run in it ([`Guest::intercept`]) and a program exec'd in it
-//!    ([`Guest::run`]). Routing only, no security policy.
-//! 2. Security: the mode's filter, stacked on the routing one at lockdown, with the caller's
-//!    restrictions ([`Builder::restrict`]).
-//! 3. [`Sandbox`]: a `Guest` with a mode, its filter, the network's hooks ([`net`]) and
-//!    templates ([`Sandbox::fork`]). [`run`] (the CLI's path) is a `Sandbox` for a [`Config`].
+//!    ([`Guest::run`]). Routing only, no security filter: no isolation (a test layer).
+//! 2. [`Sandbox`]: a `Guest` with a mode, the TCB's lockdown ([`Sandbox::run`],
+//!    [`Sandbox::run_fn`]), the caller's restrictions ([`Builder::restrict`]), the network's
+//!    hooks ([`net`]) and templates ([`Sandbox::fork`]). [`run`] (the CLI's path) is a `Sandbox`
+//!    for a [`Config`].
 //!
 //! The process becomes the sandbox: one guest per process, used from the thread that built it
 //! (a `Sandbox` is `!Send`). A template forks it ([`Sandbox::fork`], [`Sandbox::spawn`]): each
@@ -541,7 +551,7 @@ impl std::fmt::Debug for Intercept<'_> {
 }
 
 // ------------------------------------------------------------------------------------------------
-// Layers 2 and 3: the sandbox.
+// Layer 2: the sandbox, and its lockdown (the TCB, `tcb`).
 
 /// A sandbox's configuration, before boot: [`Sandbox::builder`].
 pub struct Builder {
@@ -567,18 +577,22 @@ impl Builder {
     }
 
     /// The program's connects beyond loopback ([`net`]).
+    /// A hook is not a policy point: it runs in the program's address space after lockdown, and
+    /// a compromised program can skip it. Policy belongs at the far end of the held fds.
     pub fn on_connect(mut self, hook: OnConnect) -> Self {
         self.hooks.on_connect = hook;
         self
     }
 
     /// The program's listens beyond loopback ([`net`]).
+    /// A hook is not a policy point: it runs in the program's address space after lockdown, and
+    /// a compromised program can skip it. Policy belongs at the far end of the held fds.
     pub fn on_listen(mut self, hook: OnListen) -> Self {
         self.hooks.on_listen = hook;
         self
     }
 
-    /// The program's name lookups ([`net`]). Without one, but with an `on_connect`, every name
+    /// The program's name lookups ([`net`]); like every hook, not a policy point. Without one, but with an `on_connect`, every name
     /// resolves to an address of its own (see [`Cx::name_of`]).
     pub fn on_resolve(mut self, hook: OnResolve) -> Self {
         self.hooks.on_resolve = hook;
@@ -596,7 +610,7 @@ impl Builder {
         self
     }
 
-    /// One more seccomp program, stacked at lockdown with the mode's filter: the kernel runs
+    /// One more seccomp program, stacked at lockdown with the security filter: the kernel runs
     /// every filter and takes the strictest answer, so a restriction can only take away (a call
     /// the mode allows fails as the restriction says; one it refuses stays refused), never add.
     /// Repeatable. A classic-BPF program over `struct seccomp_data`, as seccompiler and libseccomp
@@ -604,10 +618,11 @@ impl Builder {
     /// can refuse with any verdict) and the program's too, but those are traps of the routing
     /// filter's, and of the kernel's precedence (KILL > TRAP > ERRNO > ALLOW) only a kill outranks a
     /// trap: an ERRNO leaves the program's call to the guest.
-    /// exobox installs the mode's filter after it, so its `prctl` and `seccomp` from the gate get
-    /// through (the mode's filter refuses both after).
+    /// exobox installs the security filter after it, so its `prctl` and `seccomp` from the gate
+    /// get through (the security filter refuses both after).
     ///
-    /// With seccompiler (a dependency of yours, not exobox's), forbidding `write` to fd 2:
+    /// With seccompiler (which exobox builds its own filter with; a dependency of yours too, for
+    /// this), forbidding `write` to fd 2:
     ///
     /// ```ignore
     /// use seccompiler::{BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule};

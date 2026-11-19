@@ -125,9 +125,11 @@ coroutine: compute  1396.6 ms, whole run  1471.7 ms  (3.7x native)
 
 ## escape: the host filter
 
-A hostile program (`c/gate_probe.c`) calls host syscalls through the runtime's own syscall
-instruction, the "gate", as a compromised program that found it would. As a sandbox is, its
-first forbidden call kills it; with `Deny::Errno` (a hidden debugging knob, the escape tests')
+A hostile program, a closure run as the sandbox's program (`Sandbox::run_fn`), calls host
+syscalls through the runtime's own syscall instruction, the "gate", which it finds by scanning
+the binary's code (it shares the address space: nothing in it is hidden), with a few lines of
+`asm!`. It also tries an fd the process had open before lockdown, which lockdown closed. As a
+sandbox is, its first forbidden call kills it; with `Deny::Errno` (a hidden debugging knob, the escape tests')
 each call gets EPERM; a restriction (`Builder::restrict`, a seccomp program of the caller's)
 that kills `getppid` takes even the program's own, the guest's, away. The filter can only be
 narrowed: the host fds a sandbox may use are its typed calls (`pass_fd`, `hold_fd`).
@@ -141,8 +143,9 @@ a sandbox as it is
 
 .deny(Deny::Errno)
   getppid(), trapped: the guest's        -> 0
-  getppid() via the gate: the host's     -> Operation not permitted
-  openat("/etc/passwd") via the gate     -> Operation not permitted
+  getppid() via the gate: the host's     -> Operation not permitted (os error 1)
+  openat("/etc/passwd") via the gate     -> Operation not permitted (os error 1)
+  read(an fd from before) via the gate   -> Operation not permitted (os error 1)
   survived
   => exit 0
 

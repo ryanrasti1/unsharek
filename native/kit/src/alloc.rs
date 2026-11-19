@@ -94,7 +94,7 @@ pub fn reserve() -> std::io::Result<()> {
     Ok(())
 }
 
-/// From now on, allocations are talc's (just before the mode's filter, which allows no host
+/// From now on, allocations are talc's (just before the security filter, which allows no host
 /// memory call). Idempotent; without [`reserve`], nothing changes.
 pub fn lockdown() {
     if ALLOC.base.load(Ordering::Acquire) != 0 {
