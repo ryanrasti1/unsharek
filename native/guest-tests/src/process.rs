@@ -322,6 +322,46 @@ pub fn forkthreads() {
     }
 }
 
+/// A forked child's exit_group while its other threads run user code, each going on into a futex
+/// wait: the kernel has sent them their kill, but they weren't in a wait the runtime could cut
+/// short (`interrupt_waits`), and a futex wait is the runtime's own, with no call into the kernel
+/// at which a killed task ends. The child's last thread waited for good, and its parent's waitpid
+/// with it (Go's os.StartProcess in fork mode: suite case go_exec; every Go thread futexes). A
+/// futex wait now asks the kernel first when an interrupt came since its thread last asked
+/// (guest.rs's `futex_call`), and the kill ends it there. Twenty children, each with four
+/// threads spinning between short timed waits.
+pub fn exit_busy_threads() {
+    static WORD: AtomicI32 = AtomicI32::new(0);
+    fn spin_and_wait() -> ! {
+        loop {
+            let t0 = Instant::now();
+            while t0.elapsed() < Duration::from_micros(200) {
+                std::hint::spin_loop();
+            }
+            let ts = libc::timespec { tv_sec: 0, tv_nsec: 100_000 };
+            // SAFETY: a futex word of ours, a timeout on the stack.
+            unsafe { libc::syscall(libc::SYS_futex, WORD.as_ptr(), libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG, 0, &ts, 0, 0) };
+        }
+    }
+    for i in 0..20 {
+        // SAFETY: the child runs threads (libtest's waiting main thread holds no lock they need)
+        // and _exits.
+        unsafe {
+            let c = libc::fork();
+            assert!(c >= 0, "fork: {}", crate::errno());
+            if c == 0 {
+                for _ in 0..4 {
+                    thread::spawn(|| spin_and_wait());
+                }
+                libc::usleep(2_000 + 500 * (i % 4));
+                libc::_exit(7);
+            }
+            let st = wait(c);
+            assert!(libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 7, "child {i}: status {st:#x}");
+        }
+    }
+}
+
 /// A forked child's randomness is its own: parent and child each read getrandom after the fork
 /// and must differ. (A fork copies the guest kernel's RNG state; without a reseed per child, every
 /// child of one template sees the same stream.)

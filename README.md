@@ -12,7 +12,8 @@ processes, signals, ttys). The security boundary is the host filter, not the gue
 
 Status: preview (November 2026). All three modes run real programs: bash, Python, gcc under
 `make -j4`, rustc and cargo, xz, a nixpkgs package built from source (by capnix, as Nix's builder,
-with Nix's own output hash). "Status" below lists what isn't done yet.
+with Nix's own output hash), and static binaries from three toolchains (Go with CGO off, musl's
+busybox, a glibc `-static-pie` program). "Status" below lists what isn't done yet.
 
 ## Using it
 
@@ -207,7 +208,7 @@ against threaded mode (`threads`), and the host filter refusing a hostile progra
 Works, in every mode unless noted: the escape and hostile-loader probes, exec inside the guest,
 the store mounted from images, signals, ttys, pipes and host fds, threads, fork mode's processes,
 templates (coroutine and threaded), the network hooks (coroutine and threaded; fork mode in
-init's process), custom kernels. `./test` runs about 400 cases in a few seconds.
+init's process), custom kernels. `./test` runs about 590 cases in a few seconds.
 
 Not yet, or known limits:
 
@@ -221,6 +222,13 @@ Not yet, or known limits:
   sandbox, not more. Calls programs make with bad pointers on purpose (`statx`'s probe) are
   checked first.
 - **GS:** exobox doesn't use it, so a program may; the program's FS is switched on every trap.
+- **Signals to running code:** a signal for a thread running user code is delivered at its next
+  call. Go's asynchronous preemption (SIGURG to a loop with no calls) doesn't land, so such a loop
+  isn't preempted: with `GOMAXPROCS=1`, or at a GC's stop-the-world, the others wait until it makes
+  a call. In coroutine mode a thread in user code keeps every other thread from running.
+- **Closure size:** at most 256 images (store paths, allowed directories) a sandbox; more fails
+  at startup with "No space left on device" (`exobox_rt::memblk::MAX`).
+- **`/proc/self/exe`:** `readlink` of it is answered; exec of it is ENOEXEC.
 - **Performance:** see below.
 
 ## Performance
@@ -287,7 +295,15 @@ The distributed binary is one `nix build`. The kernel is its own derivation, bui
 ```sh
 nix build                # exobox and exobox-erofs, in ./result/bin
 nix build .#kernel       # the kernel alone: its archives, headers and .config
+nix build .#checks.x86_64-linux.smoke   # the release check (nix/smoke.nix)
 ```
+
+The smoke check runs the package's `exobox` in all three modes inside Nix's build sandbox (Nix's
+seccomp filter under exobox's, the sandbox's `/dev` and `/proc`, no `$HOME`), on hello, Python,
+bash, a Go program and busybox, each output checked. The image cache is `$EXOBOX_IMAGE_CACHE`
+(else `$XDG_CACHE_HOME/exobox/images`, else `~/.cache/exobox/images`), and closures come from
+`nix-store --query --requisites`: in a build with no Nix database, the check registers its
+programs' closure in one of its own (`closureInfo`, `nix-store --load-db` under `NIX_STATE_DIR`).
 
 A custom kernel (more drivers or filesystems: LKL has no loadable modules) is a source and a config
 fragment, from the flake's `lib`:

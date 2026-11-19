@@ -121,7 +121,7 @@ macro_rules! all {
     (@processes) => {
         $crate::group!(process:
             fork_pipe_status, fork_children, grandchild, fork_late_read, spawn_self, child_signals,
-            siginfo_from_child, child_killed, forkthreads, fork_rng, settid,
+            siginfo_from_child, child_killed, forkthreads, fork_rng, settid, exit_busy_threads,
             // What spawn_self, child_signals and settid run (by --exact, with GUEST_TESTS_HELPER).
             #[ignore] child_helper,
         );

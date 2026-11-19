@@ -17,6 +17,8 @@
       # exoboxKernel and mkExobox: nix/lib.nix, also importable without flakes (default.nix).
       exobox = import ./nix/lib.nix { inherit pkgs; };
       inherit (exobox) exoboxKernel mkExobox;
+      # Programs the suite and the smoke check run: nix/test-programs.nix.
+      tp = import ./nix/test-programs.nix { inherit pkgs; };
     in
     {
       lib = { inherit exoboxKernel mkExobox; };
@@ -28,6 +30,10 @@
         # together. Only `nix run .#exobox-erofs` differs.
         exobox-erofs = default // { meta = default.meta // { mainProgram = "exobox-erofs"; }; };
       };
+
+      # The release step's check: the package's exobox runs hello, Python, bash, Go and busybox in
+      # all three modes inside Nix's build sandbox (nix/smoke.nix). `nix build .#checks.x86_64-linux.smoke`.
+      checks.${system}.smoke = import ./nix/smoke.nix { inherit pkgs tp; exobox = self.packages.${system}.default; };
 
       devShells.${system}.default = pkgs.mkShell {
         packages = with pkgs; [
@@ -68,6 +74,13 @@
         # Rust's tools, rustup-less (suite: cargo_version, cargo_build)
         EXOBOX_TEST_CARGO = "${pkgs.cargo}/bin/cargo";
         EXOBOX_TEST_RUSTC = "${pkgs.rustc}/bin/rustc";
+        # Static programs, each from a different toolchain (nix/test-programs.nix): Go's runtime
+        # (goprobe, built here; go-httpbin from nixpkgs), musl's (busybox), and glibc's static
+        # archives, for a -static-pie fixture (native/fixtures' build.rs).
+        EXOBOX_TEST_GOPROBE = "${tp.goprobe}/bin/goprobe";
+        EXOBOX_TEST_HTTPBIN = "${tp.httpbin}/bin/go-httpbin";
+        EXOBOX_TEST_BUSYBOX = "${tp.busybox}/bin/busybox";
+        EXOBOX_GLIBC_STATIC = "${pkgs.glibc.static}/lib";
         # Marks this shell, so ./test runs inside it directly.
         EXOBOX_DEVSHELL = "1";
       };
