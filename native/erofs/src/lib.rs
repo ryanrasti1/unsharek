@@ -1,5 +1,6 @@
 //! Builds an erofs image of a directory tree (one Nix store path) in which every ELF file can be
-//! mapped in place by a loader.
+//! mapped in place by a loader, or synthesizes one over host directories without copying any
+//! file's data.
 //!
 //! The guest sees each store path as a read-only erofs image, mapped into the host process before
 //! lockdown. ld.so reserves a library's whole memory image with one mmap, which the runtime
@@ -24,18 +25,26 @@
 //!   only on the tree's names, contents, modes and links. Hard links (an optimised store) share
 //!   one inode.
 //!
+//! So an image is its metadata (blocks 0 to the first file's), then each file's data and its
+//! slot's zeros, in walk order: a list of [`Extent`]s. [`synthesize`] makes that list in memory
+//! from a walk of the trees (stat, readdir, readlink, and each ELF's headers), each file's data
+//! named by the host file it is in, never read: a guest disk is then the metadata bytes, each
+//! file's own host mapping and zeros (memblk's extents), and nothing is copied. [`build`] is the
+//! same list written out to one file. One layout, so the two are byte for byte the same image.
+//!
 //! The prior art is capnix's `runtime/tier-a/src/store.c`, which synthesizes the same metadata
-//! (and is proven to mount in LKL); this adds the ELF slots and writes a whole image file.
+//! over host file mappings (and is proven to mount in LKL); this adds the ELF slots.
 
 mod elf;
 mod format;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use format::{BLOCK, INODE_SIZE, NID_UNIT};
 
@@ -63,6 +72,10 @@ pub enum Error {
     Changed(PathBuf),
     #[error("the image would need {0} blocks; erofs addresses at most 2^32")]
     TooLarge(u64),
+    #[error("{0}: not a place for a root in the image (one under /, without `..`)")]
+    BadRoot(PathBuf),
+    #[error("{0}: two roots of the image there, or one inside another")]
+    RootsOverlap(PathBuf),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -122,6 +135,89 @@ impl Layout {
     }
 }
 
+/// A host file whose data is in the image: opened once by the walk (a hard-linked file once for
+/// all its names), and kept open, so that what is mapped is the file whose ELF headers were read
+/// (no path is looked up again). Empty files have no data and aren't here.
+///
+/// So a closure holds thousands of descriptors open at once (python's 7741) until the caller has
+/// mapped them and drops these. The fd table grows as they're opened, by doubling, and in a
+/// process of several threads each growth waits for an RCU grace period (`expand_fdtable`'s
+/// `synchronize_rcu`): measured, ~0.1 s the first time a process synthesizes such a closure, none
+/// after (the table stays grown). A caller that minds can grow it once beforehand (one `dup2` to
+/// a high descriptor is one grace period).
+#[derive(Debug)]
+pub struct HostFile {
+    /// Where the walk found it (its first name, for a hard-linked file).
+    pub path: PathBuf,
+    pub file: File,
+    /// Its size when it was opened (`fstat`).
+    pub size: u64,
+}
+
+/// A run of the image, in order: their lengths add up to [`Layout::size`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Extent {
+    /// Bytes made in memory: the superblock, inodes, directories, symlinks (whole blocks).
+    Metadata(Vec<u8>),
+    /// `len` bytes (whole blocks) of `files[file]` from its byte `offset` (block-aligned): its
+    /// data, and past the file's end zeros to the block's end, as a mapping of the file has
+    /// (`mmap` of `len` from `offset`, `MAP_PRIVATE`, gives exactly these bytes).
+    File { file: usize, offset: u64, len: u64 },
+    /// `len` zero bytes (whole blocks): an ELF slot's tail.
+    Zeros(u64),
+}
+
+impl Extent {
+    /// Its length in the image: a whole number of blocks.
+    pub fn len(&self) -> u64 {
+        match self {
+            Extent::Metadata(b) => b.len() as u64,
+            Extent::File { len, .. } | Extent::Zeros(len) => *len,
+        }
+    }
+
+    /// Never: an extent has at least one block.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// An image as extents over host files ([`synthesize`]).
+#[derive(Debug)]
+pub struct Synthesized {
+    pub extents: Vec<Extent>,
+    pub layout: Layout,
+    /// What [`Extent::File`] refers to, in the image's order.
+    pub files: Vec<HostFile>,
+}
+
+impl Synthesized {
+    /// Writes the image to `image`, reading each file's data. Zeros are holes (the file is
+    /// extended, not written), so they cost no disk. [`Error::Changed`]: a file isn't the size it
+    /// was when the image was laid out.
+    pub fn write(&self, image: &Path) -> Result<()> {
+        write_extents(&self.extents, &self.files, self.layout.size, image)
+    }
+}
+
+/// Lays out an image of the directories `roots` (`(host dir, its path in the image)`): each host
+/// tree at its own place (`/` for the image's root itself, then the only root; directories that
+/// lead to the places, 0755, are made). Say a closure's store paths, each at `/<hash>-<name>`.
+/// The trees are walked (stat, readdir, readlink), each regular file opened once and, if it's an
+/// ELF, its headers read for its slot; nothing else of any file is read. The result is
+/// deterministic: it depends only on the trees (not on `roots`' order).
+pub fn synthesize(roots: &[(PathBuf, PathBuf)]) -> Result<Synthesized> {
+    Ok(Image::scan_roots(roots)?.synthesized())
+}
+
+/// Scans `source`, writes the image to `image`, and returns where every file is: [`synthesize`]
+/// with `source` as the root, written out.
+pub fn build(source: &Path, image: &Path) -> Result<Layout> {
+    let img = Image::scan(source)?;
+    img.write(image)?;
+    Ok(img.layout)
+}
+
 enum Kind {
     /// Children by name (sorted), and the parent's node.
     Dir {
@@ -129,7 +225,8 @@ enum Kind {
         parent: usize,
     },
     File {
-        source: PathBuf,
+        /// Its [`HostFile`], or None when it's empty.
+        file: Option<usize>,
         paths: Vec<PathBuf>,
         elf: bool,
         slot: u64,
@@ -166,7 +263,7 @@ impl Node {
     }
 }
 
-/// A tree scanned and laid out, ready to write.
+/// A tree scanned and laid out: every node's nid and blocks assigned, the files open.
 pub struct Image {
     /// In walk order (depth-first, sorted): the root is node 0, at nid 0.
     nodes: Vec<Node>,
@@ -174,49 +271,119 @@ pub struct Image {
     meta_blocks: u64,
     blocks: u64,
     layout: Layout,
+    files: Vec<HostFile>,
 }
 
-/// Scans `source`, writes the image to `image`, and returns where every file is.
-pub fn build(source: &Path, image: &Path) -> Result<Layout> {
-    let img = Image::scan(source)?;
-    img.write(image)?;
-    Ok(img.layout)
+/// Where the roots go in the image: a host tree, or a directory made to lead to them.
+enum Mount<'a> {
+    Host(&'a Path),
+    Dir(BTreeMap<Vec<u8>, Mount<'a>>),
+}
+
+impl<'a> Mount<'a> {
+    fn of(roots: &'a [(PathBuf, PathBuf)]) -> Result<Mount<'a>> {
+        let mut top = Mount::Dir(BTreeMap::new());
+        for (host, at) in roots {
+            let mut names = Vec::new();
+            for c in at.components() {
+                match c {
+                    Component::RootDir | Component::CurDir => {}
+                    Component::Normal(n) => names.push(n.as_bytes().to_vec()),
+                    _ => return Err(Error::BadRoot(at.clone())),
+                }
+            }
+            let Some((last, dirs)) = names.split_last() else {
+                // The image's root: then the only root.
+                if roots.len() > 1 {
+                    return Err(Error::RootsOverlap(at.clone()));
+                }
+                return Ok(Mount::Host(host));
+            };
+            let mut m = &mut top;
+            for name in dirs {
+                let Mount::Dir(d) = m else {
+                    return Err(Error::RootsOverlap(at.clone()));
+                };
+                m = d
+                    .entry(name.clone())
+                    .or_insert_with(|| Mount::Dir(BTreeMap::new()));
+            }
+            let Mount::Dir(d) = m else {
+                return Err(Error::RootsOverlap(at.clone()));
+            };
+            if d.insert(last.clone(), Mount::Host(host)).is_some() {
+                return Err(Error::RootsOverlap(at.clone()));
+            }
+        }
+        Ok(top)
+    }
 }
 
 impl Image {
     /// Reads the tree under `source` (a directory; followed if it's a symlink, as a `result` link
     /// would be) and lays the image out. Files' contents are read only for ELF headers here.
     pub fn scan(source: &Path) -> Result<Image> {
-        let md = fs::metadata(source).map_err(io_err(source))?;
-        if !md.is_dir() {
-            return Err(Error::NotDir(source.to_owned()));
-        }
+        Image::scan_roots(&[(source.to_owned(), PathBuf::from("/"))])
+    }
+
+    /// [`synthesize`]'s walk and layout.
+    pub fn scan_roots(roots: &[(PathBuf, PathBuf)]) -> Result<Image> {
         let mut scan = Scan {
             nodes: Vec::new(),
             links: HashMap::new(),
+            files: Vec::new(),
         };
-        scan.nodes.push(Node {
-            kind: Kind::Dir {
-                entries: Vec::new(),
-                parent: 0,
-            },
-            perms: (md.mode() & 0o7777) as u16,
-            nlink: 2,
-            size: 0,
-            nid: 0,
-            inline: false,
-            blkaddr: 0,
-        });
-        scan.walk(source, Path::new(""), 0)?;
-        Image::plan(scan.nodes)
+        match Mount::of(roots)? {
+            Mount::Host(source) => {
+                let perms = dir_perms(source)?;
+                scan.push(
+                    Kind::Dir {
+                        entries: Vec::new(),
+                        parent: 0,
+                    },
+                    perms,
+                    2,
+                    0,
+                );
+                scan.walk(source, Path::new(""), 0)?;
+            }
+            Mount::Dir(dirs) => {
+                scan.push(
+                    Kind::Dir {
+                        entries: Vec::new(),
+                        parent: 0,
+                    },
+                    0o755,
+                    2,
+                    0,
+                );
+                scan.mount(&dirs, Path::new(""), 0)?;
+            }
+        }
+        Image::plan(scan.nodes, scan.files)
     }
 
     pub fn layout(&self) -> &Layout {
         &self.layout
     }
 
+    /// The image as extents: its metadata, then each file's data and slot, in block order.
+    pub fn synthesized(self) -> Synthesized {
+        let extents = self.extents();
+        Synthesized {
+            extents,
+            layout: self.layout,
+            files: self.files,
+        }
+    }
+
+    /// Writes the image (see [`Synthesized::write`]).
+    pub fn write(&self, image: &Path) -> Result<()> {
+        write_extents(&self.extents(), &self.files, self.layout.size, image)
+    }
+
     /// Assigns nids and blocks.
-    fn plan(mut nodes: Vec<Node>) -> Result<Image> {
+    fn plan(mut nodes: Vec<Node>, files: Vec<HostFile>) -> Result<Image> {
         // Sizes first: a directory's size depends on its names only, not on the nids in it.
         for i in 0..nodes.len() {
             nodes[i].size = match &nodes[i].kind {
@@ -249,7 +416,7 @@ impl Image {
             }
         }
         let meta_blocks = next;
-        let mut files = Vec::new();
+        let mut layout = Vec::new();
         for n in &mut nodes {
             if let Kind::File {
                 paths, elf, slot, ..
@@ -260,7 +427,7 @@ impl Image {
                     next += slot / BLOCK;
                 }
                 for path in paths {
-                    files.push(FileLayout {
+                    layout.push(FileLayout {
                         path: path.clone(),
                         nid: n.nid,
                         offset: n.blkaddr as u64 * BLOCK,
@@ -272,22 +439,22 @@ impl Image {
             }
         }
         block_of(next)?;
-        files.sort_by(|a, b| a.path.cmp(&b.path));
+        layout.sort_by(|a, b| a.path.cmp(&b.path));
         let layout = Layout {
             size: next * BLOCK,
-            files,
+            files: layout,
         };
         Ok(Image {
             nodes,
             meta_blocks,
             blocks: next,
             layout,
+            files,
         })
     }
 
-    /// Writes the image: metadata, then each file's data at its block. The slots' gaps and the
-    /// image's tail are holes (the file is extended, not written), so they cost no disk.
-    pub fn write(&self, image: &Path) -> Result<()> {
+    /// The metadata blocks: superblock, inodes, inline and block-sized directory and symlink data.
+    fn metadata(&self) -> Vec<u8> {
         let mut meta = vec![0u8; (self.meta_blocks * BLOCK) as usize];
         format::Super {
             root_nid: 0,
@@ -323,28 +490,71 @@ impl Image {
             };
             meta[at..at + data.len()].copy_from_slice(&data);
         }
-        let mut out = File::create(image).map_err(io_err(image))?;
-        out.write_all(&meta).map_err(io_err(image))?;
+        meta
+    }
+
+    /// The metadata, then each file in the nodes' order, which is the order of their blocks.
+    fn extents(&self) -> Vec<Extent> {
+        let mut out = vec![Extent::Metadata(self.metadata())];
+        let mut at = self.meta_blocks * BLOCK;
         for n in &self.nodes {
-            let Kind::File { source, .. } = &n.kind else {
+            let Kind::File {
+                file: Some(file),
+                slot,
+                ..
+            } = n.kind
+            else {
                 continue;
             };
-            if n.size == 0 {
-                continue;
+            debug_assert_eq!(at, n.blkaddr as u64 * BLOCK);
+            let data = n.size.next_multiple_of(BLOCK);
+            out.push(Extent::File {
+                file,
+                offset: 0,
+                len: data,
+            });
+            if slot > data {
+                out.push(Extent::Zeros(slot - data));
             }
-            let mut src = File::open(source).map_err(io_err(source))?;
-            out.seek(SeekFrom::Start(n.blkaddr as u64 * BLOCK))
-                .map_err(io_err(image))?;
-            // Take one byte more than expected, to notice a file that grew.
-            let copied =
-                io::copy(&mut (&mut src).take(n.size + 1), &mut out).map_err(io_err(source))?;
-            if copied != n.size {
-                return Err(Error::Changed(source.clone()));
-            }
+            at += slot;
         }
-        out.set_len(self.blocks * BLOCK).map_err(io_err(image))?;
-        Ok(())
+        debug_assert_eq!(at, self.layout.size);
+        out
     }
+}
+
+/// Writes `extents` to `image`: what each is, zeros as holes; `size` is their total.
+fn write_extents(extents: &[Extent], files: &[HostFile], size: u64, image: &Path) -> Result<()> {
+    let mut out = File::create(image).map_err(io_err(image))?;
+    let mut at = 0;
+    for e in extents {
+        match e {
+            Extent::Metadata(bytes) => {
+                out.seek(SeekFrom::Start(at)).map_err(io_err(image))?;
+                out.write_all(bytes).map_err(io_err(image))?;
+            }
+            &Extent::File { file, offset, len } => {
+                let f = &files[file];
+                // The file's bytes the extent holds, and whether it runs to the file's end: then
+                // one byte more is asked for, to notice a file that grew.
+                let want = len.min(f.size.saturating_sub(offset));
+                let to_end = offset + want == f.size;
+                let mut src = &f.file;
+                src.seek(SeekFrom::Start(offset)).map_err(io_err(&f.path))?;
+                out.seek(SeekFrom::Start(at)).map_err(io_err(image))?;
+                let copied = io::copy(&mut src.take(want + to_end as u64), &mut out)
+                    .map_err(io_err(&f.path))?;
+                if copied != want {
+                    return Err(Error::Changed(f.path.clone()));
+                }
+            }
+            Extent::Zeros(_) => {}
+        }
+        at += e.len();
+    }
+    debug_assert_eq!(at, size);
+    out.set_len(size).map_err(io_err(image))?;
+    Ok(())
 }
 
 /// A directory node's data, with "." and ".." (the kernel doesn't need them, but readdir and fsck
@@ -366,13 +576,72 @@ fn dir_data(nodes: &[Node], i: usize) -> Vec<u8> {
     format::dir_data(&all)
 }
 
+/// A root's permission bits; it must be a directory (followed if it's a symlink).
+fn dir_perms(source: &Path) -> Result<u16> {
+    let md = fs::metadata(source).map_err(io_err(source))?;
+    if !md.is_dir() {
+        return Err(Error::NotDir(source.to_owned()));
+    }
+    Ok((md.mode() & 0o7777) as u16)
+}
+
 struct Scan {
     nodes: Vec<Node>,
     /// Regular files with more than one link, by (device, inode): their node.
     links: HashMap<(u64, u64), usize>,
+    files: Vec<HostFile>,
 }
 
 impl Scan {
+    /// Adds the directories `dirs` lead to (node `idx`, at `rel` in the image), and the roots in
+    /// them, in name order as `walk` adds a directory's entries.
+    fn mount(&mut self, dirs: &BTreeMap<Vec<u8>, Mount>, rel: &Path, idx: usize) -> Result<()> {
+        let mut entries = Vec::with_capacity(dirs.len());
+        for (name, m) in dirs {
+            let rel = rel.join(OsStr::from_bytes(name));
+            if name.len() > format::NAME_MAX {
+                return Err(Error::NameTooLong(rel));
+            }
+            let child = match m {
+                Mount::Host(source) => {
+                    let perms = dir_perms(source)?;
+                    let child = self.push(
+                        Kind::Dir {
+                            entries: Vec::new(),
+                            parent: idx,
+                        },
+                        perms,
+                        2,
+                        0,
+                    );
+                    self.walk(source, &rel, child)?;
+                    child
+                }
+                Mount::Dir(dirs) => {
+                    let child = self.push(
+                        Kind::Dir {
+                            entries: Vec::new(),
+                            parent: idx,
+                        },
+                        0o755,
+                        2,
+                        0,
+                    );
+                    self.mount(dirs, &rel, child)?;
+                    child
+                }
+            };
+            entries.push((name.clone(), child));
+        }
+        let subdirs = entries.len() as u32;
+        let Kind::Dir { entries: e, .. } = &mut self.nodes[idx].kind else {
+            unreachable!()
+        };
+        *e = entries;
+        self.nodes[idx].nlink = 2 + subdirs;
+        Ok(())
+    }
+
     /// Adds the children of `dir` (node `idx`, at `rel` in the image), depth-first.
     fn walk(&mut self, dir: &Path, rel: &Path, idx: usize) -> Result<()> {
         let mut names = Vec::new();
@@ -458,17 +727,31 @@ impl Scan {
             paths.push(rel);
             return Ok(node);
         }
-        let size = md.len();
         let f = File::open(&path).map_err(io_err(&path))?;
+        // The file opened is the one the directory listed (not another put there since), and
+        // its size is the open file's.
+        let fmd = f.metadata().map_err(io_err(&path))?;
+        if (fmd.dev(), fmd.ino()) != key || !fmd.is_file() {
+            return Err(Error::Changed(path));
+        }
+        let size = fmd.len();
         let kind = elf::classify(&f).map_err(io_err(&path))?;
         let data = elf::round_up(size, BLOCK).ok_or(Error::TooLarge(u64::MAX))?;
         let (elf, slot) = match kind {
             elf::Kind::Data => (false, data),
             elf::Kind::Elf { mapped } => (true, data.max(mapped.unwrap_or(0))),
         };
+        let file = (size > 0).then(|| {
+            self.files.push(HostFile {
+                path: path.clone(),
+                file: f,
+                size,
+            });
+            self.files.len() - 1
+        });
         let node = self.push(
             Kind::File {
-                source: path,
+                file,
                 paths: vec![rel],
                 elf,
                 slot,

@@ -195,9 +195,10 @@ against threaded mode (`threads`), and the host filter refusing a hostile progra
    Images from extents: a guest disk assembled from an ordered list of {metadata bytes | a range of
    a host file, mapped before lockdown | zeros}, and `exobox_erofs::synthesize(paths)`, which lays
    out an erofs image over a closure's files as they are in the host store (metadata made in
-   memory, every file mapped once: one copy of every byte, the page cache shared with the host).
-   `exobox::store` then needs no image copies; the per-path image cache stays for very large
-   closures (one host mapping per file costs every fork and exit).
+   memory, no file's data read or copied: one copy of every byte, the page cache shared with the
+   host). Done: memblk disks of extents, `synthesize`. Next: `map_image` from extents, in-place
+   mapping over the per-file mappings, `exobox::store` without image copies (the per-path image
+   cache stays for very large closures: one host mapping per file costs every fork and exit).
 8. For capnix (`~/src/capnix-proper`, "What exobox needs to provide"): a host fd passed to the guest
    at a given fd (its Cap'n Web channel at 1000), with the filter widened to exactly that fd; the
    program run as a given uid (setup is the guest's init, as root, and can drop to it before exec);

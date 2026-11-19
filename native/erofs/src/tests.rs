@@ -114,6 +114,67 @@ fn hard_links_share_a_slot() {
     assert_eq!(file(&img, "x/lib.so").nid, file(&img, "y").nid);
     assert_eq!(file(&img, "y").slot, 0x3000);
     assert_eq!(img.layout().files.len(), 2);
+    // One host file for both names: one mapping, then the slot's zeros.
+    let s = img.synthesized();
+    assert_eq!(s.files.len(), 1);
+    assert_eq!(s.files[0].path, src.path().join("x/lib.so"));
+    assert_eq!(
+        s.extents[1..],
+        [
+            Extent::File {
+                file: 0,
+                offset: 0,
+                len: BLOCK
+            },
+            Extent::Zeros(0x2000)
+        ]
+    );
+}
+
+#[test]
+fn extents() {
+    // Metadata, then each file with data in walk order (empty ones have no extent), an ELF's
+    // slot tail as zeros; their lengths add up to the image's.
+    let src = tree(&[
+        ("a", vec![1; 5000]),
+        ("b/empty", Vec::new()),
+        ("b/l.so", elf64(3, &[(0, 0, 9, 0x9000)], 9)),
+        ("c", vec![2; 4096]),
+    ]);
+    let s = synthesize(&[(src.path().to_owned(), "/".into())]).unwrap();
+    let Extent::Metadata(meta) = &s.extents[0] else {
+        panic!("{:?}", s.extents[0])
+    };
+    assert_eq!(meta.len() as u64, s.layout.files[0].offset);
+    let file = |file, len| Extent::File {
+        file,
+        offset: 0,
+        len,
+    };
+    assert_eq!(
+        s.extents[1..],
+        [
+            file(0, 2 * BLOCK),
+            file(1, BLOCK),
+            Extent::Zeros(0x8000),
+            file(2, BLOCK)
+        ]
+    );
+    let names: Vec<_> = s
+        .files
+        .iter()
+        .map(|f| f.path.strip_prefix(src.path()).unwrap())
+        .collect();
+    assert_eq!(names, [Path::new("a"), Path::new("b/l.so"), Path::new("c")]);
+    assert_eq!(
+        s.extents.iter().map(Extent::len).sum::<u64>(),
+        s.layout.size
+    );
+
+    // A file that changes after it's laid out isn't written as if it hadn't.
+    fs::write(src.path().join("c"), vec![2; 4097]).unwrap();
+    let out = tempfile::NamedTempFile::new().unwrap();
+    assert!(matches!(s.write(out.path()), Err(Error::Changed(p)) if p.ends_with("c")));
 }
 
 #[test]
