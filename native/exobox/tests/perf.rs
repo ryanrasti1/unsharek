@@ -89,6 +89,18 @@ fn sandboxed(mode: Mode, prog: &Path, extra: &[PathBuf]) -> Command {
     cmd
 }
 
+/// `cmd` exec'd in a user namespace of its own, which this process (its owner, in the parent
+/// namespace) holds every capability in: so it may read a sandbox's `/proc/<pid>/smaps_rollup`,
+/// which lockdown's `PR_SET_DUMPABLE` 0 closes to its plain owner (the PSS budgets' reading).
+fn own_userns(mut cmd: Command) -> Command {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: unshare between fork and exec, async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| if libc::unshare(libc::CLONE_NEWUSER) < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) });
+    }
+    cmd
+}
+
 fn external(var: &str) -> Result<PathBuf, Failed> {
     env::var_os(var).map(PathBuf::from).ok_or_else(|| format!("{var} unset: run in the devshell (./test --perf)").into())
 }
@@ -224,7 +236,7 @@ fn mem_standalone(mode: Mode) -> Result<(), Failed> {
         Ok(total? / N as u64)
     };
     let native = measure(&|| Command::new(fx::bin("ready_idle")))?;
-    let per = measure(&|| sandboxed(mode, &fx::bin("ready_idle"), &[]))?;
+    let per = measure(&|| own_userns(sandboxed(mode, &fx::bin("ready_idle"), &[])))?;
     println!("PSS per idle sandbox, {N} at once: {per} KB ({native} KB native; budget {MEM_STANDALONE_BUDGET_KB} KB)");
     if per > MEM_STANDALONE_BUDGET_KB {
         return Err(format!("{per} KB per sandbox > {MEM_STANDALONE_BUDGET_KB} KB").into());
@@ -285,7 +297,8 @@ fn template(mode: Mode) -> Result<(), Failed> {
         unsafe {
             cmd.pre_exec(move || {
                 let r = if fd == 3 { libc::fcntl(3, libc::F_SETFD, 0) } else { libc::dup2(fd, 3) };
-                if r < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+                // Its own user namespace: see `own_userns` (its children's PSS is read).
+                if r < 0 || libc::unshare(libc::CLONE_NEWUSER) < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
             });
         }
     }
