@@ -377,13 +377,14 @@ fn provider() -> (OnConnect, OnResolve, OnListen) {
     (connect, resolve, listen)
 }
 
-/// The child: a sandbox for argv (`ARGV`), with the provider (`provider`), the name-based one
-/// (`named`), none (`nohooks`), or fd 3 passed as fd 1000 (`passfd`).
+/// The child: a sandbox for argv (`ARGV`), with the provider (`provider`; `provider_user`: and
+/// the guard drops init to uid/gid 1000), the name-based one (`named`), none (`nohooks`), or fd 3
+/// passed as fd 1000 (`passfd`).
 fn child(kind: &str) -> ! {
     let argv: Vec<OsString> = std::env::var(ARGV).unwrap().split('\x1f').map(OsString::from).collect();
     let mut b = exobox::Sandbox::builder();
     match kind {
-        "provider" | "provider_syscall" => {
+        "provider" | "provider_syscall" | "provider_user" => {
             STRAY_SYSCALL.store(kind == "provider_syscall", std::sync::atomic::Ordering::Relaxed);
             let (connect, resolve, listen) = provider();
             // The session up before the program: no first hook has to start it.
@@ -398,7 +399,7 @@ fn child(kind: &str) -> ! {
     // SAFETY: fd 3 is this process's, from the parent, and nothing else owns it.
     let fd3 = unsafe { OwnedFd::from_raw_fd(3) };
     match kind {
-        "provider" | "provider_syscall" | "named" => drop(sb.hold_fd_as("net", fd3).unwrap()),
+        "provider" | "provider_syscall" | "provider_user" | "named" => drop(sb.hold_fd_as("net", fd3).unwrap()),
         "passfd" => sb.pass_fd(fd3, 1000).unwrap(),
         _ => drop(fd3),
     }
@@ -406,6 +407,10 @@ fn child(kind: &str) -> ! {
     {
         let _g = sb.intercept().unwrap();
         exobox::setup::mount_closure(&mounts).unwrap();
+        if kind == "provider_user" {
+            // SAFETY: the guest's init dropping to uid/gid 1000 (a build user, as capnix's).
+            unsafe { assert!(libc::setresgid(1000, 1000, 1000) == 0 && libc::setresuid(1000, 1000, 1000) == 0) };
+        }
     }
     let env: Vec<OsString> = vec!["EXOBOX_TEST_MODE=coroutine".into()];
     let e = sb.run(&argv, &env).unwrap_err();
@@ -618,6 +623,14 @@ fn main() {
     case(
         "net_resolve",
         "provider",
+        net("resolve", &["echo.test", "10.0.0.1", "nx.test", "denied.test"]),
+        "NET_RESOLVE_OK",
+    );
+    // The resolver's files are exobox's, written before the guards: a guard's setresuid doesn't
+    // keep them from being written (`run` wrote them after the guards, as uid 1000: EACCES).
+    case(
+        "net_resolve_user",
+        "provider_user",
         net("resolve", &["echo.test", "10.0.0.1", "nx.test", "denied.test"]),
         "NET_RESOLVE_OK",
     );
