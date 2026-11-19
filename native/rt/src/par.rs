@@ -361,16 +361,23 @@ fn pop_waiter() -> Option<u16> {
 }
 
 /// Give up the token. A directed hand-off (a runnable coroutine bound to another host) takes
-/// priority, then an acquire-waiter; otherwise the kernel thread when a timer is pending or a host
-/// fd is waited for (so it is serviced: [`idle_watching`]) or `allow_none` is false, else the
-/// token is left free. Returns the slot it went to (or [`NONE_SLOT`]).
+/// priority, then an acquire-waiter; otherwise the kernel thread when a timer is pending, a host
+/// fd is waited for (so it is serviced: [`idle_watching`]), a coroutine bound to no host is
+/// runnable, or `allow_none` is false, else the token is left free. Returns the slot it went to
+/// (or [`NONE_SLOT`]).
+///
+/// The unbound coroutine: arming the kernel's timer (`timer_set_oneshot`) wakes the timer's
+/// coroutine to re-read its deadline, and until it runs the deadline is on no heap. A thread
+/// that armed it and went back to user mode left it free, nothing pending, and nobody ran it:
+/// another thread's sleep never ended while that one was busy (busy_sleep, threaded and fork).
+/// Only token holders run coroutines bound to no host.
 fn give(id: u16, allow_none: bool) -> u32 {
     lock();
     let target = if let Some(home) = sched().par_bound_elsewhere(id) {
         home as u32
     } else if let Some(w) = pop_waiter() {
         w as u32
-    } else if !allow_none || sched().par_next_deadline().is_some() || idle_watching() {
+    } else if !allow_none || sched().par_next_deadline().is_some() || idle_watching() || sched().par_unbound_ready() {
         KERNEL as u32
     } else {
         NONE_SLOT
