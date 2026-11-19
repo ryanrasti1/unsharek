@@ -6,11 +6,18 @@
 #   ./test -E 'test(/^escape/)'      the filter's cases
 #   ./test --no-fail-fast            (the default stops at the first failure)
 #   ./test --perf                    the performance budgets instead (tests/perf.rs; tens of seconds)
+#   ./test --vs-native               each mode against native on build workloads (native/bench/quick.py)
 set -euo pipefail
 root="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=devshell.sh
 source "$root/devshell.sh"
 cd "$root"
+if [[ "${1:-}" == --vs-native ]]; then
+  # Where each mode stands against native on the workloads that matter, in seconds
+  # (native/bench/quick.py); not a correctness test.
+  shift
+  exec "$root/native/bench/quick" "$@"
+fi
 profile=default
 build=()
 if [[ "${1:-}" == --perf ]]; then
