@@ -85,7 +85,8 @@ let
           ../Cargo.lock
           (fs.difference ../native (fs.fileFilter (f: f.hasExt "md") ../native))
           # exobox-tcb, the TCB (its own repository to be)
-          (fs.difference ../tcb (fs.fileFilter (f: f.hasExt "md") ../tcb))
+          # (its README too: a test checks its allowlist table against the filter)
+          ../tcb
           # A workspace member: cargo loads every member's manifest, built or not (the
           # package failed to build without it).
           (fs.difference ../examples (fs.fileFilter (f: f.hasExt "md") ../examples))

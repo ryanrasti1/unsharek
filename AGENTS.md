@@ -33,7 +33,7 @@
 - What the host sees of a run (its exit status or signal, its stdin and a slow reader of its
   stdout, its host CPU time, files on the host, the CLI's flags, programs from nixpkgs) is a case
   in `cases()` of `native/exobox/tests/suite.rs`: a program in `native/fixtures/c/` run by
-  `exobox run`. The library's API (hooks, held and passed fds, guards, templates) is
+  `exobox run`. The library's API (hooks, held and passed fds, setup closures, templates) is
   `native/exobox/tests/{guest,net}.rs`'.
 - A bug found gets a regression test first, in whichever of these fits; its comment says what
   broke and where. A known bug's test that fails is `#[ignore = "<why>"]` in the modes it fails
@@ -43,17 +43,19 @@
 - Escape tests probe the filter with `--deny=errno`; the default (`kill`) has its own case.
 
 ## Code
-- The trusted computing base is `native/exobox/src/tcb/` and nothing else
-  (`native/exobox/TCB.md`): the authority inventory, the security filter, lockdown. Keep it
-  small. A change that widens what the host allows (a filter rule, an fd or a shared mapping
-  kept past lockdown) is a TCB change: it goes through the inventory and the filter, with a test
-  in `tcb/filter/tests.rs`, and TCB.md says why. The runtime (`native/rt`), the kernel and the
-  batteries (`native/kit`: setup, store, net, alloc) are not trusted: they are given resources,
-  never produce values the filter trusts, and know nothing of the security filter. A network
-  hook is never a policy point.
+- The trusted computing base is the crate `exobox-tcb` (`tcb/`) and nothing else
+  (`tcb/README.md`: the guarantee, what isn't guaranteed, the design, the review checklist):
+  lockdown's checks and the one seccomp filter. It depends on seccompiler and libc only, and on
+  nothing of exobox's: build it as its own repository. Keep it small. A change that widens what
+  the host allows (a filter rule, a kind of guest fd or mapping lockdown accepts) is a TCB change,
+  with a test in `tcb/` (`src/filter/tests.rs`, `tests/lockdown.rs`), and tcb/README.md's table
+  and checklist follow it (a test checks the table against `rules()`). Everything else (exobox's
+  API and batteries in `native/exobox`, the runtime `native/rt`, the kernel) is not trusted: it
+  is given grants, never produces values the filter trusts, and knows nothing of the filter. A
+  network hook is never a policy point.
 - Comments live in the code, next to what they explain: why it is so, what broke before. The
-  top-level README describes the project and its modes; `native/exobox/TCB.md` how to review
-  isolation; there is no other docs tree yet.
+  top-level README describes the project and its modes; `tcb/README.md` how to review isolation;
+  there is no other docs tree yet.
 - Library first: the CLI (`native/exobox/src/main.rs`) only turns arguments into a `Config`.
 - Proven, current crates by default. Record each dependency's cost (binary size, build time) in
   `native/DEPS.md` when adding it.

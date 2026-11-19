@@ -233,3 +233,17 @@ symbols by `nm --size-sort`, its BTreeMap and Vec code with it) run once per san
 |---|---|---|---|
 | seccompiler 0.5 (default features: no `json`) | the security filter's allowlist, rules with 64-bit argument conditions, to classic BPF (`tcb/filter.rs`); not its `apply_filter*`, which make libc syscalls the routing filter would trap: lockdown installs through the gate | library (the TCB) | ~24 KB stripped; ~0.3 s cold build (release); depends only on libc, already in the tree |
 | exobox-kit (workspace) | the batteries, re-exported as `exobox::{setup, store, net, alloc}` | library | none: code moved from exobox |
+
+## exobox-tcb (2026-11-19): seccompiler moves to the TCB's own crate; exobox-kit is gone
+The TCB is now `exobox-tcb` (`tcb/`, to become its own repository): lockdown's checks and the one
+seccomp filter. **seccompiler is exobox-tcb's dependency** (with libc, its only other), no longer
+exobox's directly; the filter is compiled with it as before, at lockdown, in the sandbox's
+process. exobox-kit (`native/kit`) is folded back into exobox (`setup`, `store`, `net`, `alloc`,
+`image` are its modules again), so exobox depends on talc, futures-io/-core, rustix and tokio
+(optional) directly once more. No crate is added or removed from the build: the costs below are
+unchanged, only who depends on what.
+
+| Crate | For | Where | Cost noted |
+|---|---|---|---|
+| seccompiler 0.5 | the filter's allowlist, to classic BPF (`tcb/src/filter.rs`) | exobox-tcb (the TCB) | as before: ~24 KB stripped, ~0.3 s cold build |
+| exobox-tcb (workspace, path) | lockdown and the filter | exobox | none: code moved from exobox's `src/tcb` |
