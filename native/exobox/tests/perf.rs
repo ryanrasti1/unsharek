@@ -32,13 +32,6 @@ impl Mode {
             Mode::Fork => "fork",
         }
     }
-    fn config(self) -> exobox::Mode {
-        match self {
-            Mode::Coroutine => exobox::Mode::Coroutine,
-            Mode::Threaded => exobox::Mode::Threaded,
-            Mode::Fork => exobox::Mode::Fork,
-        }
-    }
 }
 
 const ALL: [Mode; 3] = [Mode::Coroutine, Mode::Threaded, Mode::Fork];
@@ -63,6 +56,9 @@ const BUILD_RATIO: f64 = 4.0;
 const COROUTINE_PARALLEL_RATIO: f64 = 6.0;
 
 fn main() {
+    if let Ok(mode) = env::var("EXOBOX_PERF_TEMPLATE") {
+        template_process(&mode);
+    }
     let args = Arguments::from_args();
     let mut trials = vec![];
     for mode in ALL {
@@ -70,7 +66,8 @@ fn main() {
         trials.push(Trial::test(format!("syscalls::{m}"), move || syscalls(mode)));
         trials.push(Trial::test(format!("startup::{m}"), move || startup(mode)));
         trials.push(Trial::test(format!("mem_standalone::{m}"), move || mem_standalone(mode)));
-        trials.push(Trial::test(format!("template::{m}"), move || template(mode)));
+        // Fork mode: a template's children would need copies of the kernel's shared memory.
+        trials.push(Trial::test(format!("template::{m}"), move || template(mode)).with_ignored_flag(matches!(mode, Mode::Fork)));
         trials.push(Trial::test(format!("compute::{m}"), move || compute(mode)));
     }
     // Coroutine mode too: its exit hung, a thread parked in an emulated futex when main ended.
@@ -235,31 +232,103 @@ fn mem_standalone(mode: Mode) -> Result<(), Failed> {
     Ok(())
 }
 
-/// Startup and memory of sandboxes forked from one template.
-fn template(mode: Mode) -> Result<(), Failed> {
-    let config = exobox::Config { mode: mode.config(), allow_paths: vec![fx::bin_dir()], ..Default::default() };
-    let tmpl = exobox::Template::start(config).map_err(|e| e.to_string())?;
-    let mut kids = vec![];
-    let mut times = vec![];
-    for _ in 0..N {
-        let (stdin_r, stdin_w) = std::io::pipe()?;
-        let (stdout_r, stdout_w) = std::io::pipe()?;
-        let stderr = std::io::stderr().as_fd_owned()?;
-        let t = Instant::now();
-        let pid = tmpl
-            .spawn(&[OsString::from(fx::bin("ready_idle"))], [stdin_r.into(), stdout_w.into(), stderr])
-            .map_err(|e| e.to_string())?;
-        wait_ready(stdout_r, Duration::from_secs(5))?;
-        times.push(t.elapsed());
-        kids.push((pid, stdin_w));
+/// The template process (this binary re-run, `TEMPLATE` its mode): one sandbox built and set up
+/// (the fixtures' closure mounted), then a child forked per line on fd 3 (its control pipe: the
+/// children read stdin), each running `ready_idle` (stdout and stdin the template's: READY, then
+/// it waits for stdin's end). Prints `PID <pid>` per child, then waits for them all.
+fn template_process(mode: &str) -> ! {
+    let m = if mode == "threaded" { exobox::Mode::Threaded } else { exobox::Mode::Coroutine };
+    let prog = fx::bin("ready_idle");
+    let mut sb = exobox::Sandbox::builder().mode(m).build().unwrap();
+    let mounts = sb.map_closure(&prog, &[fx::bin_dir()]).unwrap();
+    {
+        let _g = sb.intercept().unwrap();
+        exobox::setup::mount_closure(&mounts).unwrap();
     }
-    thread::sleep(Duration::from_millis(200));
-    let total: Result<u64, Failed> = kids.iter().map(|(pid, _)| pss_kb(*pid)).sum();
-    let per = total? / N as u64;
-    drop(kids); // stdin's end: each child exits
+    let argv = [OsString::from(&prog)];
+    let mut kids = vec![];
+    // SAFETY: fd 3 is the control pipe the parent gave this process.
+    let mut ctl = BufReader::new(unsafe { <fs::File as std::os::fd::FromRawFd>::from_raw_fd(3) });
+    let mut line = String::new();
+    while ctl.read_line(&mut line).is_ok_and(|n| n > 0) {
+        line.clear();
+        let child = sb.spawn(|sb| sb.run(&argv, &[])).unwrap();
+        println!("PID {}", child.pid());
+        kids.push(child);
+    }
+    for k in kids {
+        let _ = k.wait();
+    }
+    std::process::exit(0)
+}
+
+/// Startup and memory of sandboxes forked from one template: start to READY per child (the
+/// template's fork, the child's own setup and exec), and PSS with `N` children at once.
+fn template(mode: Mode) -> Result<(), Failed> {
+    if matches!(mode, Mode::Fork) {
+        return Err("fork-mode templates are not implemented".into());
+    }
+    let (ctl_r, mut ctl) = std::io::pipe()?;
+    let mut cmd = Command::new(env::current_exe()?);
+    cmd.env("EXOBOX_PERF_TEMPLATE", mode.name()).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        let fd = ctl_r.as_raw_fd();
+        // SAFETY: dup2 and fcntl between fork and exec, async-signal-safe. (If the pipe is fd 3
+        // already, dup2 does nothing and close-on-exec stays: cleared instead.)
+        unsafe {
+            cmd.pre_exec(move || {
+                let r = if fd == 3 { libc::fcntl(3, libc::F_SETFD, 0) } else { libc::dup2(fd, 3) };
+                if r < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+            });
+        }
+    }
+    let mut tmpl = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
+    drop(ctl_r);
+    let stdin = tmpl.stdin.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let out = tmpl.stdout.take().unwrap();
+    thread::spawn(move || {
+        for l in BufReader::new(out).lines() {
+            let Ok(l) = l else { break };
+            if tx.send(l).is_err() {
+                break;
+            }
+        }
+    });
+    let mut pids = vec![];
+    let mut times = vec![];
+    let result = (|| -> Result<(), Failed> {
+        for _ in 0..N {
+            let t = Instant::now();
+            writeln!(ctl, "go")?;
+            let (mut pid, mut ready) = (None, false);
+            while pid.is_none() || !ready {
+                let l = rx.recv_timeout(Duration::from_secs(5)).map_err(|_| "no READY within 5 s")?;
+                if let Some(p) = l.strip_prefix("PID ") {
+                    pid = p.parse::<u32>().ok();
+                } else if l.trim() == "READY" {
+                    ready = true;
+                }
+            }
+            times.push(t.elapsed());
+            pids.push(pid.unwrap());
+        }
+        Ok(())
+    })();
+    let per = result.and_then(|()| {
+        thread::sleep(Duration::from_millis(200));
+        let total: Result<u64, Failed> = pids.iter().map(|&p| pss_kb(p)).sum();
+        Ok(total? / N as u64)
+    });
+    drop(ctl); // the template's loop ends
+    drop(stdin); // and every child's stdin
+    let _ = tmpl.wait();
+    let per = per?;
     times.sort();
     let median = times[N / 2];
-    println!("template children: start to READY median {median:?} (budget {TEMPLATE_STARTUP_BUDGET:?}); PSS {per} KB each (budget {MEM_TEMPLATE_BUDGET_KB} KB)");
+    println!("template children: start to READY median {median:?} of {times:?} (budget {TEMPLATE_STARTUP_BUDGET:?}); PSS {per} KB each, {N} at once (budget {MEM_TEMPLATE_BUDGET_KB} KB)");
     let mut over = vec![];
     if median > TEMPLATE_STARTUP_BUDGET {
         over.push(format!("startup {median:?}"));
@@ -268,17 +337,6 @@ fn template(mode: Mode) -> Result<(), Failed> {
         over.push(format!("{per} KB per child"));
     }
     if over.is_empty() { Ok(()) } else { Err(over.join("; ").into()) }
-}
-
-trait AsFdOwned {
-    fn as_fd_owned(&self) -> std::io::Result<std::os::fd::OwnedFd>;
-}
-
-impl AsFdOwned for std::io::Stderr {
-    fn as_fd_owned(&self) -> std::io::Result<std::os::fd::OwnedFd> {
-        use std::os::fd::AsFd;
-        self.as_fd().try_clone_to_owned()
-    }
 }
 
 /// Four CPU-bound threads. Host threads run them in parallel (budget against native); a

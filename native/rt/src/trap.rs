@@ -252,6 +252,44 @@ pub unsafe fn clone_thread(
     check(r).map(|tid| tid as u32)
 }
 
+/// Host code's `clone` with a new stack, re-issued from the gate (`passthrough`): the child must
+/// resume the trapped context, not the dispatcher's, so it starts as `clone_thread`'s does, from a
+/// `rt_sigreturn` frame built below `newsp` (free memory: a clone's stack data sits at and above
+/// it) from the trapping call's own ucontext, with `rax` 0 and `rsp` `newsp`. `altstack` is what
+/// the child's alternate stack becomes (Linux resets it for a `CLONE_VM` child that isn't a
+/// vfork's). The FPU starts in its initial state. Returns the raw result (the parent's).
+///
+/// # Safety
+/// `newsp` is the top of a stack the child may use, with a few hundred bytes free below it; the
+/// flags and the other arguments are the trapping call's (a raw `clone`).
+pub unsafe fn clone_resume(flags: usize, newsp: usize, ptid: usize, ctid: usize, tls: usize, tmpl: &Ucontext, altstack: StackT) -> isize {
+    let frame = ((newsp - 8 - size_of::<Ucontext>()) & !63) - 8;
+    // SAFETY: below the child's stack top: the caller's.
+    unsafe { (frame as *mut usize).write(restorer as *const () as usize) };
+    let mut u = *tmpl;
+    u.link = 0;
+    u.stack = altstack;
+    u.mcontext.rax = 0;
+    u.mcontext.rsp = newsp as u64;
+    u.mcontext.fpregs = 0;
+    // SAFETY: inside the child's stack, aligned for a Ucontext.
+    unsafe { ((frame + 8) as *mut Ucontext).write(u) };
+    // SAFETY: the caller's; the child runs only from the prepared frame.
+    unsafe { gate(NR_CLONE as usize, flags, frame, ptid, ctid, tls, 0) }
+}
+
+/// Return from a signal handler of host code's (`passthrough`): its `rt_sigreturn` trapped, so
+/// it is made again here from the gate, at the trapped `rsp` (the frame is at `rsp - 8`, where the
+/// kernel looks), with the FS base the handler ran with (`rt_sigreturn` doesn't restore it). The
+/// SIGSYS frame that brought us here is abandoned: the restored frame is the whole state.
+///
+/// # Safety
+/// `rsp` and `fs` are a trapped `rt_sigreturn`'s.
+#[unsafe(naked)]
+pub unsafe extern "C" fn sigreturn_at(rsp: usize, fs: usize) -> ! {
+    core::arch::naked_asm!("wrfsbase rsi", "mov rsp, rdi", "mov eax, 15", "jmp exobox_rt_gate_syscall", "ud2")
+}
+
 /// Wait for an eventfd's count (a CPU token): `read` of its 8 bytes, which blocks while it is 0.
 pub fn eventfd_read(fd: u32) -> Result<u64, Errno> {
     let mut v = [0u8; 8];

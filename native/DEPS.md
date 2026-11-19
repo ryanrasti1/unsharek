@@ -9,7 +9,7 @@ are the release `exobox` binary (x86_64, glibc, Rust 1.99.1), unstripped / strip
 | Crate | For | Where | Cost noted |
 |---|---|---|---|
 | clap 4 (derive) | the CLI's arguments | binary | most of the baseline's size (to measure alone once the runtime is in) |
-| syscalls 0.6 | syscall names and numbers (`--allow` rules, the audit's table) | library | a name table |
+| syscalls 0.6 | syscall names and numbers (the audit's table; `--allow` rules until the library API's reshape) | test (library until the reshape) | a name table |
 | thiserror 2 | the library's error type | library | none at run time (a derive) |
 | cc 1 | finds the C compiler for the test programs | fixtures' build.rs | test-only |
 | libtest-mimic 0.8 | the suite's table of trials, nextest-compatible | test | test-only |
@@ -191,3 +191,16 @@ when a hook or a passed fd's poll first needs it.
 | futures-core 0.3 | `Stream`: `on_listen`'s inbound connections | library | traits only |
 | tokio 1 (optional, feature `tokio`, no default features) | tokio's `AsyncRead`/`AsyncWrite` for hooks' streams and `HeldFd`/`GuestSocket` (capnweb-rs's channel) | library | off by default; with it, tokio's io traits only (no runtime) |
 | rustix (workspace) | `Errno`, the runtime's error type, in the adapters | library | already in the tree |
+
+## The library's reshape (2026-11-18): builder, intercept guards, templates (native/build)
+No new crates in the library. `syscalls` leaves it (its `--allow` rules are gone; the suite keeps
+it as a dev-dependency for the audit's table). A new workspace crate, `exobox-build`
+(`native/build`), holds the fixed-address link that was `native/exobox/build.rs`'s, for any
+embedder's build script: its one dependency is `cc` (already in the tree), and it is a
+build-dependency only, of exobox and of the examples. `Builder::restrict`'s rustdoc shows
+seccompiler, which stays the caller's dependency, not exobox's (nor a dev-dependency: the tests
+write their restrictions as BPF by hand).
+
+| Crate | For | Where | Cost noted |
+|---|---|---|---|
+| exobox-build (workspace) | the binary's fixed-address link (`link_fixed_address`), shared with embedders | exobox's and the examples' build.rs | build only; pulls cc, already in the tree |

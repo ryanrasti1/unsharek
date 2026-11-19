@@ -22,7 +22,6 @@ lkl-sys = { path = "../lkl-sys" }
 libc.workspace = true
 # Errno, the runtime's error type, in the hooks' adapters
 rustix.workspace = true
-syscalls.workspace = true
 thiserror.workspace = true
 # The global allocator after lockdown (src/alloc.rs): the hooks' and the executor's allocations,
 # from a region reserved before it
@@ -42,6 +41,8 @@ exobox-build = { path = "../build" }
 
 [dev-dependencies]
 exobox-fixtures = { path = "../fixtures" }
+# the suite's sysaudit table: syscall names by number
+syscalls.workspace = true
 libtest-mimic.workspace = true
 tempfile.workspace = true
 

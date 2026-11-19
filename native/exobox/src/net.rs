@@ -1,8 +1,8 @@
 //! Pluggable networking: the hooks a sandbox runs for the program's network (README plan item 9).
 //!
 //! The program's AF_INET sockets are its own for loopback (127.0.0.0/8, 0.0.0.0): connects, binds
-//! and listens there are the guest kernel's, as always. Everything else goes to the [`Hooks`]
-//! given to [`Sandbox::run`](crate::Sandbox::run):
+//! and listens there are the guest kernel's, as always. Everything else goes to the hooks given
+//! to the sandbox's builder ([`Builder::on_connect`](crate::Builder::on_connect) and the rest):
 //!
 //! - **`on_connect(cx, pid, addr)`**: a program's `connect` to `addr`. `Ok(stream)`: the program's
 //!   connect succeeds, and exobox copies both ways between its socket and `stream` (who closes
@@ -16,11 +16,20 @@
 //!   error leaves the listen the guest's alone (the program's `listen` succeeded already).
 //! - **`on_resolve(cx, pid, name)`**: a name lookup. The guest's `/etc/resolv.conf` names
 //!   10.0.2.3, the guest's libc asks it over UDP, and exobox answers from this hook: A records
-//!   for its IPv4 addresses (IPv6 ones are left out), AAAA with no data.
-//! - **`pre_exec()`**: host code run as the guest's init before the program (what `run`'s setup
-//!   closure was): mounts, files.
+//!   for its IPv4 addresses (IPv6 ones are left out). Only A queries reach the hook: any other
+//!   (glibc's AAAA beside each A) is answered with no data, NOERROR, at once.
+//! - **No `on_resolve`, but an `on_connect`**: every name resolves, to an address of its own
+//!   that exobox picks (10.64.0.0/10, one per name, for the sandbox's life), and `on_connect`
+//!   learns which name an address came from with [`Cx::name_of`]: name-based policy with no
+//!   resolver of the provider's. (With an `on_resolve`, `name_of` names its addresses too.)
+//! - **`on_start(cx)`** ([`Builder::on_start`](crate::Builder::on_start)): a task started at
+//!   lockdown, before the program: a provider's session, up before the first connect.
 //!
 //! With no hook, everything but loopback is unreachable (`ENETUNREACH`, and lookups fail).
+//!
+//! **Templates.** The hooks are given at build, once for every instance a template forks; each
+//! instance holds its own provider's fd under a name
+//! ([`Sandbox::hold_fd_as`](crate::Sandbox::hold_fd_as)), which a hook finds with [`Cx::held`].
 //!
 //! **Errors** ([`NetError`]), as the program sees them: for a connect, `Denied` EACCES,
 //! `Refused` ECONNREFUSED, `Unreachable` ENETUNREACH, `Timeout` ETIMEDOUT, `NoName` ENETUNREACH,
@@ -80,7 +89,6 @@ use rustix::io::Errno;
 
 pub use exobox_rt::executor::{FdReady, Sleep};
 
-use crate::Error;
 
 /// Why a hook refused (see the module comment for each one's errno).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -141,43 +149,15 @@ impl From<io::Error> for NetError {
 // ------------------------------------------------------------------------------------------------
 // The hooks.
 
-/// What a sandbox runs for its program: before it starts, and for its network (module comment).
-/// Each field defaults to none: `Hooks { on_connect: OnConnect::new(..), ..Default::default() }`.
+pub(crate) type StartFn = Box<dyn FnOnce(Cx) -> Pin<Box<dyn Future<Output = ()>>>>;
+
+/// What a sandbox runs for its program's network (module comment): the builder's.
 #[derive(Default)]
-pub struct Hooks {
-    pub pre_exec: PreExec,
+pub(crate) struct Hooks {
     pub on_connect: OnConnect,
     pub on_listen: OnListen,
     pub on_resolve: OnResolve,
-}
-
-impl std::fmt::Debug for Hooks {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Hooks")
-            .field("pre_exec", &self.pre_exec.0.is_some())
-            .field("on_connect", &self.on_connect.0.is_some())
-            .field("on_listen", &self.on_listen.0.is_some())
-            .field("on_resolve", &self.on_resolve.0.is_some())
-            .finish()
-    }
-}
-
-type PreExecFn = Box<dyn FnOnce() -> Result<(), Error>>;
-
-/// Host code run as the guest's init before the program's exec: every syscall it makes is the
-/// guest's (host data must be read before `run` and moved in). Files and fds it leaves open are
-/// the program's.
-#[derive(Default)]
-pub struct PreExec(pub(crate) Option<PreExecFn>);
-
-impl PreExec {
-    pub fn new<F, E>(f: F) -> PreExec
-    where
-        F: FnOnce() -> Result<(), E> + 'static,
-        E: Into<Error>,
-    {
-        PreExec(Some(Box::new(move || f().map_err(Into::into))))
-    }
+    pub on_start: Option<StartFn>,
 }
 
 use tsi::{ConnectFn, ListenFn, ResolveFn};
@@ -301,16 +281,23 @@ impl OnResolve {
         Fut: Future<Output = Result<Vec<IpAddr>, NetError>> + 'static,
     {
         OnResolve(Some(Box::new(move |_, pid, name| {
-            let fut = f(Cx, pid, name);
+            let fut = f(Cx, pid, name.clone());
             Box::pin(async move {
                 match fut.await {
-                    Ok(ips) => Ok(ips
-                        .into_iter()
-                        .filter_map(|ip| match ip {
-                            IpAddr::V4(v4) => Some(v4),
-                            IpAddr::V6(_) => None,
-                        })
-                        .collect()),
+                    Ok(ips) => {
+                        let v4: Vec<_> = ips
+                            .into_iter()
+                            .filter_map(|ip| match ip {
+                                IpAddr::V4(v4) => Some(v4),
+                                IpAddr::V6(_) => None,
+                            })
+                            .collect();
+                        let mut n = names();
+                        for a in &v4 {
+                            n.by_addr.insert(*a, name.clone());
+                        }
+                        Ok(v4)
+                    }
                     Err(e) => Err(e.rcode()),
                 }
             })
@@ -319,13 +306,59 @@ impl OnResolve {
 }
 
 impl Hooks {
-    /// The network hooks, given to the runtime (the rest is `pre_exec`).
-    pub(crate) fn install(self) -> (PreExec, bool) {
-        let resolves = self.on_resolve.0.is_some();
-        tsi::set_hooks(tsi::Hooks { connect: self.on_connect.0, listen: self.on_listen.0, resolve: self.on_resolve.0 });
-        (self.pre_exec, resolves)
+    /// The network hooks, given to the runtime: whether names resolve (the guest's resolver
+    /// files are then written), and the task to start at lockdown. With an `on_connect` and no
+    /// `on_resolve`, names resolve to addresses of their own ([`Cx::address_for`]).
+    pub(crate) fn install(self) -> (bool, Option<StartFn>) {
+        let resolve = match (self.on_resolve.0, &self.on_connect.0) {
+            (Some(r), _) => Some(r),
+            (None, Some(_)) => OnResolve::new(|cx: Cx, _, name: String| {
+                let a = cx.address_for(&name);
+                async move { Ok(vec![a]) }
+            })
+            .0,
+            (None, None) => None,
+        };
+        let resolves = resolve.is_some();
+        tsi::set_hooks(tsi::Hooks { connect: self.on_connect.0, listen: self.on_listen.0, resolve });
+        (resolves, self.on_start)
     }
 }
+
+// ------------------------------------------------------------------------------------------------
+// Names: held fds by name, addresses by the name they were resolved from.
+
+/// What the hooks look up by name. Written by host code before lockdown and by the executor
+/// after: one thread at a time, so the lock is never contended (a contended `std` lock would
+/// park in a futex: module comment).
+struct Names {
+    held: Vec<(String, HeldFd)>,
+    /// Each name a lookup answered, by address (the hook's addresses, or exobox's own).
+    by_addr: std::collections::BTreeMap<std::net::Ipv4Addr, String>,
+    /// exobox's own addresses, by name.
+    own: std::collections::BTreeMap<String, std::net::Ipv4Addr>,
+}
+
+static NAMES: std::sync::Mutex<Names> = std::sync::Mutex::new(Names {
+    held: Vec::new(),
+    by_addr: std::collections::BTreeMap::new(),
+    own: std::collections::BTreeMap::new(),
+});
+
+fn names() -> std::sync::MutexGuard<'static, Names> {
+    NAMES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub(crate) fn name_held(name: &str, fd: HeldFd) {
+    let mut n = names();
+    n.held.retain(|(k, _)| k != name);
+    n.held.push((name.to_owned(), fd));
+}
+
+/// The first of exobox's own addresses (10.64.0.0/10): far from loopback, from the nameserver's
+/// 10.0.2.3 and from a provider's usual 10.0.0.N.
+const OWN_BASE: u32 = u32::from_be_bytes([10, 64, 0, 1]);
+const OWN_COUNT: u32 = (1 << 22) - 2;
 
 // ------------------------------------------------------------------------------------------------
 // The adapters: a hook's streams as the runtime's.
@@ -403,6 +436,31 @@ where
 pub struct Cx;
 
 impl Cx {
+    /// The fd held under `name` ([`Sandbox::hold_fd_as`](crate::Sandbox::hold_fd_as)).
+    pub fn held(&self, name: &str) -> Option<HeldFd> {
+        names().held.iter().find(|(k, _)| k == name).map(|&(_, fd)| fd)
+    }
+
+    /// The name a lookup of the program's resolved to `addr` (the latest, if several), if any:
+    /// for an `on_connect` that decides by name.
+    pub fn name_of(&self, addr: IpAddr) -> Option<String> {
+        let IpAddr::V4(a) = addr else { return None };
+        names().by_addr.get(&a).cloned()
+    }
+
+    /// An address of `name`'s own, the same for the sandbox's life: what names resolve to when
+    /// there is no `on_resolve` (an `on_resolve` may answer with it too). 10.64.0.0/10.
+    pub fn address_for(&self, name: &str) -> IpAddr {
+        let mut n = names();
+        if let Some(a) = n.own.get(name) {
+            return IpAddr::V4(*a);
+        }
+        let k = n.own.len() as u32 % OWN_COUNT;
+        let a = std::net::Ipv4Addr::from(OWN_BASE + k);
+        n.own.insert(name.to_owned(), a);
+        IpAddr::V4(a)
+    }
+
     /// Run `f` in the background on the executor, to completion (a provider's session, say).
     pub fn spawn(&self, f: impl Future<Output = ()> + 'static) {
         executor::spawn(f)
@@ -458,6 +516,24 @@ impl HeldFd {
     /// One `write`; `WouldBlock` if there's no room.
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
         exobox_rt::trap::write(self.fd as u32, buf).map_err(io_err)
+    }
+
+    /// Read what is there, waiting (on the executor) until something is: `Ok(0)` is EOF. (As
+    /// `AsyncRead`, futures' `AsyncReadExt` works on it too.)
+    pub async fn read_async(&self, buf: &mut [u8]) -> io::Result<usize> {
+        std::future::poll_fn(|cx| self.poll_io(cx, POLLIN, || self.read(buf))).await
+    }
+
+    /// Write all of `buf`, waiting (on the executor) for room.
+    pub async fn write_all_async(&self, mut buf: &[u8]) -> io::Result<()> {
+        while !buf.is_empty() {
+            let n = std::future::poll_fn(|cx| self.poll_io(cx, POLLOUT, || self.write(buf))).await?;
+            if n == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            buf = &buf[n..];
+        }
+        Ok(())
     }
 
     fn poll_io(&self, cx: &mut Context<'_>, events: i16, mut f: impl FnMut() -> io::Result<usize>) -> Poll<io::Result<usize>> {
