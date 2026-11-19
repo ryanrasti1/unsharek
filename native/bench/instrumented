@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# An instrumented exobox, for native/PERF.md's breakdowns, built in a scratch copy of this tree
+# (the tree itself is untouched): HEAD's native/ and lkl/, plus the counters (stats/stats.rs,
+# applied by stats/apply.py: cargo feature `stats`, printed as EXOBOX_STATS lines on stderr at
+# the sandbox's end) and the named experiments:
+#   aff8    sched_getaffinity reports 8 CPUs (the shipped runtime reports one)
+#   idler   the kernel idler sleeps to its deadline without the CPU token; a return to user mode
+#           hands the token to it only when a deadline is due (or earlier than its sleep)
+#   spin    a token waiter spins ~20 us before blocking on its eventfd
+# Usage: native/bench/instrumented SCRATCH_DIR [aff8] [idler] [spin]
+# Prints the binary's path (SCRATCH_DIR/bin/exobox-stats[-exp...]); pass it to native/bench/run
+# as --exobox PATH or --variant NAME=PATH.
+set -euo pipefail
+root="$(cd "$(dirname "$0")/../.." && pwd)"
+# First: the devshell's environment sets variables of its own (`name`, among others).
+# shellcheck source=../../devshell.sh
+source "$root/devshell.sh"
+d=$1
+shift
+mkdir -p "$d/tree" "$d/bin"
+rm -rf "$d/tree/native" "$d/tree/lkl" "$d/tree/examples"
+git -C "$root" archive HEAD native lkl examples Cargo.toml Cargo.lock | tar -x -C "$d/tree"
+cp "$root/native/bench/stats/stats.rs" "$d/tree/native/rt/src/stats.rs"
+aff=
+variant=stats
+for e in "$@"; do
+  variant="$variant-$e"
+  [ "$e" = aff8 ] && aff=0xff
+done
+python3 "$root/native/bench/stats/apply.py" "$d/tree" $aff || exit 1
+for e in "$@"; do
+  case $e in
+    idler) python3 "$root/native/bench/stats/exp_idler.py" "$d/tree" || exit 1 ;;
+    spin) python3 "$root/native/bench/stats/exp_spin.py" "$d/tree" || exit 1 ;;
+    aff8) ;;
+    *) echo "unknown experiment $e" >&2; exit 2 ;;
+  esac
+done
+(cd "$d/tree" && cargo build --release -q -p exobox --bin exobox --features exobox/stats) || exit 1
+cp "$d/tree/target/release/exobox" "$d/bin/exobox-$variant"
+echo "$d/bin/exobox-$variant"

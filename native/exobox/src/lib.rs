@@ -434,14 +434,14 @@ impl Guest {
     /// `program`'s Nix closure (plus `allow_paths`, each a store path with its closure or a
     /// host directory, read-only) as images from the default cache ([`store::Cache::open_default`],
     /// built where missing), mapped, each with where [`setup::mount_closure`] mounts it.
-    pub fn map_closure(&mut self, program: &Path, allow_paths: &[PathBuf]) -> Result<Vec<(Image, PathBuf)>, Error> {
+    pub fn map_closure(&mut self, program: &Path, allow_paths: &[PathBuf]) -> Result<Vec<setup::Mount>, Error> {
         let store = store::Cache::open_default()?.store(program, allow_paths)?;
         self.map_store(&store)
     }
 
     /// Each of `store`'s images mapped, with where [`setup::mount_closure`] mounts it.
-    pub fn map_store(&mut self, store: &store::Store) -> Result<Vec<(Image, PathBuf)>, Error> {
-        store.mounts.iter().map(|m| Ok((self.map_image(&m.image)?, m.guest.clone()))).collect()
+    pub fn map_store(&mut self, store: &store::Store) -> Result<Vec<setup::Mount>, Error> {
+        store.mounts.iter().map(|m| Ok(setup::Mount { image: self.map_image(&m.image)?, at: m.guest.clone(), kind: m.kind })).collect()
     }
 
     /// Hold host fd `fd` for the hooks (a provider's connection, made before `run`): made
@@ -462,7 +462,8 @@ impl Guest {
     /// guard drops, every syscall the calling thread makes is served by the guest kernel, as its
     /// init (PID 1, root). Anything the guest kernel can do, a guard can: mounts, files, ids
     /// (`setresuid`: the program is exec'd with init's credentials as they are then), the
-    /// hostname. The first guard installs the routing filter (permanent: seccomp filters can't
+    /// hostname, the clock (`clock_settime`; the program gets EPERM for both, as an unprivileged
+    /// user would). The first guard installs the routing filter (permanent: seccomp filters can't
     /// be removed); after the guard's drop, the runtime passes the trapped syscalls through to the
     /// host (`exobox_rt::passthrough`), so host code behaves as before, until [`Guest::run`].
     /// Guards may come and go any number of times, interleaved with host work.
@@ -509,9 +510,12 @@ impl Guest {
         })
     }
 
-    /// Install the network hooks, begin setup (the routing filter in, if it isn't), write the
-    /// resolver's files if a hook resolves, run `lockdown` (the security filter), start the
-    /// hooks' `on_start` task, exec.
+    /// Install the network hooks, begin setup (the routing filter in, if it isn't), run
+    /// `lockdown` (the security filter), start the hooks' `on_start` task, exec.
+    ///
+    /// Nothing here touches the guest's files: this runs after the caller's guards, as init with
+    /// the credentials they left (a `setresuid` to a build user), which the exec is meant to have
+    /// and exobox's own writes are not (the resolver's files are written at build).
     fn launch(
         mut self,
         hooks: net::Hooks,
@@ -523,19 +527,9 @@ impl Guest {
         self.own(None)?;
         let args: Vec<&[u8]> = argv.iter().map(|a| a.as_bytes()).collect();
         let envs: Vec<&[u8]> = env.iter().map(|a| a.as_bytes()).collect();
-        let (resolves, on_start) = hooks.install();
+        let on_start = hooks.install();
         guest::route()?;
         guest::intercept_begin()?;
-        let r = (|| {
-            if resolves {
-                setup::resolver().map_err(Error::io("the guest's resolver"))?;
-            }
-            Ok(())
-        })();
-        if let Err(e) = r {
-            guest::intercept_end();
-            return Err(e);
-        }
         lockdown()?;
         if let Some(f) = on_start {
             exobox_rt::executor::spawn(f(Cx));
@@ -667,9 +661,14 @@ impl Builder {
     }
 
     /// Boot the guest for the mode. Fork mode's processes share the kernel's memory, mapped
-    /// shared here.
+    /// shared here. When the program's names resolve (an `on_resolve` or `on_connect` hook), the
+    /// guest's `/etc/resolv.conf` and `/etc/hosts` are written now, root's ([`setup::resolver`]):
+    /// a guard may change them.
     pub fn build(self) -> Result<Sandbox, Error> {
         let guest = Guest::boot_as(self.config, self.mode == Mode::Fork)?;
+        if self.hooks.resolves() {
+            setup::resolver().map_err(Error::io("the guest's resolver"))?;
+        }
         let token_fds = if self.mode != Mode::Coroutine {
             // Make the CPU-token eventfds and switch the runtime to threaded (before lockdown),
             // then start the kernel idler host thread and wait for it to install its signal stack.
@@ -782,12 +781,12 @@ impl Sandbox {
     }
 
     /// [`Guest::map_closure`].
-    pub fn map_closure(&mut self, program: &Path, allow_paths: &[PathBuf]) -> Result<Vec<(Image, PathBuf)>, Error> {
+    pub fn map_closure(&mut self, program: &Path, allow_paths: &[PathBuf]) -> Result<Vec<setup::Mount>, Error> {
         self.guest.map_closure(program, allow_paths)
     }
 
     /// [`Guest::map_store`].
-    pub fn map_store(&mut self, store: &store::Store) -> Result<Vec<(Image, PathBuf)>, Error> {
+    pub fn map_store(&mut self, store: &store::Store) -> Result<Vec<setup::Mount>, Error> {
         self.guest.map_store(store)
     }
 
@@ -883,10 +882,10 @@ impl Sandbox {
         }
     }
 
-    /// Lockdown and exec: the routing filter (if no guard installed it), the network hooks, the
-    /// guest's resolver files when names resolve, then the security filter (the mode's, and the
-    /// restrictions) and the exec of `argv[0]` inside the guest with `argv` and `env` (each
-    /// `NAME=value`). Never returns on success: the process's status is the program's. On failure
+    /// Lockdown and exec: the routing filter (if no guard installed it), the network hooks
+    /// (whose resolver files, when names resolve, [`Builder::build`] wrote), then the security
+    /// filter (the mode's, and the restrictions) and the exec of `argv[0]` inside the guest with
+    /// `argv` and `env` (each `NAME=value`), as init with the credentials the guards left. Never returns on success: the process's status is the program's. On failure
     /// the error is the caller's to report and exit with (after lockdown its syscalls are the
     /// guest's, and printing and exiting work through it).
     ///
@@ -1064,7 +1063,7 @@ pub fn run(config: Config) -> Result<Infallible, Error> {
     for i in &config.images {
         let img = sb.map_image_as(&i.path, &i.name)?;
         if let Some(at) = &i.mount {
-            mounts.push((img, at.clone()));
+            mounts.push(setup::Mount { image: img, at: at.clone(), kind: store::Kind::Dir });
         }
     }
     // The program's path as the host resolves it: the guest's working directory is `/`.

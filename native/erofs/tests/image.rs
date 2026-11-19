@@ -425,14 +425,20 @@ fn synthesized_roots() {
     symlink("../one/bin/tool", s.join("two/tool")).unwrap();
     fs::hard_link(s.join("one/lib/data"), s.join("two/data-link")).unwrap();
     fs::set_permissions(s.join("two"), fs::Permissions::from_mode(0o555)).unwrap();
+    // Store paths that are a file and a symlink, stored as they are.
+    file("four", b"a store path that is a file");
+    fs::set_permissions(s.join("four"), fs::Permissions::from_mode(0o444)).unwrap();
+    symlink("aaa-one/bin/tool", s.join("five")).unwrap();
     let roots = [
         (s.join("two"), PathBuf::from("/nix/store/bbb-two")),
         (s.join("one"), PathBuf::from("/nix/store/aaa-one")),
         (s.join("three"), PathBuf::from("/x")),
+        (s.join("four"), PathBuf::from("/nix/store/ccc-four")),
+        (s.join("five"), PathBuf::from("/nix/store/ddd-five")),
     ];
     let synth = exobox_erofs::synthesize(&roots).unwrap();
     check_layout(&synth.layout);
-    // Each file with data once, in the image's order: one's, then two's own.
+    // Each file with data once, in the image's order: one's, then two's own, then four.
     let names: Vec<_> = synth
         .files
         .iter()
@@ -440,7 +446,7 @@ fn synthesized_roots() {
         .collect();
     assert_eq!(
         names,
-        ["one/bin/tool", "one/lib/data", "two/share/readme"].map(PathBuf::from)
+        ["one/bin/tool", "one/lib/data", "two/share/readme", "four"].map(PathBuf::from)
     );
     let nid = |p: &str| {
         synth
@@ -477,13 +483,23 @@ fn synthesized_roots() {
         v
     };
     assert_eq!(names(&out), ["nix", "x"]);
-    assert_eq!(names(&out.join("nix/store")), ["aaa-one", "bbb-two"]);
+    assert_eq!(
+        names(&out.join("nix/store")),
+        ["aaa-one", "bbb-two", "ccc-four", "ddd-five"]
+    );
     assert_eq!(
         fs::metadata(out.join("nix")).unwrap().mode() & 0o7777,
         0o755
     );
+    let four = out.join("nix/store/ccc-four");
+    assert_eq!(fs::read(&four).unwrap(), b"a store path that is a file");
+    assert_eq!(fs::symlink_metadata(&four).unwrap().mode(), 0o100444);
+    assert_eq!(
+        fs::read_link(out.join("nix/store/ddd-five")).unwrap(),
+        Path::new("aaa-one/bin/tool")
+    );
     let mut pairs = HashMap::new();
-    for (host, at) in &roots {
+    for (host, at) in roots.iter().filter(|(h, _)| h.is_dir()) {
         let mounted = out.join(at.strip_prefix("/").unwrap());
         compare(
             host,
@@ -495,7 +511,7 @@ fn synthesized_roots() {
     }
 
     // Places that aren't one: outside the image, taken twice, inside another root, the image's
-    // root and another; and a root that isn't a directory.
+    // root and another; and an image's root that isn't a directory.
     let root = |host: &str, at: &str| (s.join(host), PathBuf::from(at));
     for bad in [
         vec![root("one", "/a/../b")],
@@ -503,7 +519,8 @@ fn synthesized_roots() {
         vec![root("one", "/a"), root("two", "/a/b")],
         vec![root("one", "/a/b"), root("two", "a")],
         vec![root("one", "/"), root("two", "/b")],
-        vec![root("one/lib/data", "/a")],
+        vec![root("one/lib/data", "/")],
+        vec![root("four", "/a"), root("two", "/a/b")],
     ] {
         assert!(exobox_erofs::synthesize(&bad).is_err(), "{bad:?}");
     }

@@ -200,9 +200,11 @@ impl Synthesized {
     }
 }
 
-/// Lays out an image of the directories `roots` (`(host dir, its path in the image)`): each host
-/// tree at its own place (`/` for the image's root itself, then the only root; directories that
-/// lead to the places, 0755, are made). Say a closure's store paths, each at `/<hash>-<name>`.
+/// Lays out an image of `roots` (`(host path, its path in the image)`): each host tree at its own
+/// place (`/` for the image's root itself, then the only root, a directory, followed if it's a
+/// symlink; directories that lead to the places, 0755, are made). A root elsewhere is taken as it
+/// is, not followed: a directory, a file or a symlink, as a store path may be any of them. Say a
+/// closure's store paths, each at `/<hash>-<name>`.
 /// The trees are walked (stat, readdir, readlink), each regular file opened once and, if it's an
 /// ELF, its headers read for its slot; nothing else of any file is read. The result is
 /// deterministic: it depends only on the trees (not on `roots`' order).
@@ -597,27 +599,22 @@ impl Scan {
     /// them, in name order as `walk` adds a directory's entries.
     fn mount(&mut self, dirs: &BTreeMap<Vec<u8>, Mount>, rel: &Path, idx: usize) -> Result<()> {
         let mut entries = Vec::with_capacity(dirs.len());
+        let mut subdirs = 0;
         for (name, m) in dirs {
             let rel = rel.join(OsStr::from_bytes(name));
             if name.len() > format::NAME_MAX {
                 return Err(Error::NameTooLong(rel));
             }
             let child = match m {
+                // As it is (not followed): a directory walked, a file or a symlink stored, as a
+                // store path may be either (a script, a source tarball, a link).
                 Mount::Host(source) => {
-                    let perms = dir_perms(source)?;
-                    let child = self.push(
-                        Kind::Dir {
-                            entries: Vec::new(),
-                            parent: idx,
-                        },
-                        perms,
-                        2,
-                        0,
-                    );
-                    self.walk(source, &rel, child)?;
+                    let (child, dir) = self.entry(source.to_path_buf(), rel, idx)?;
+                    subdirs += dir as u32;
                     child
                 }
                 Mount::Dir(dirs) => {
+                    subdirs += 1;
                     let child = self.push(
                         Kind::Dir {
                             entries: Vec::new(),
@@ -633,7 +630,6 @@ impl Scan {
             };
             entries.push((name.clone(), child));
         }
-        let subdirs = entries.len() as u32;
         let Kind::Dir { entries: e, .. } = &mut self.nodes[idx].kind else {
             unreachable!()
         };
@@ -654,50 +650,11 @@ impl Scan {
         let mut subdirs = 0;
         for name in names {
             let path = dir.join(&name);
-            let rel = rel.join(&name);
             if name.len() > format::NAME_MAX {
                 return Err(Error::NameTooLong(path));
             }
-            let md = fs::symlink_metadata(&path).map_err(io_err(&path))?;
-            let ft = md.file_type();
-            let perms = (md.mode() & 0o7777) as u16;
-            let child = if ft.is_dir() {
-                subdirs += 1;
-                let child = self.push(
-                    Kind::Dir {
-                        entries: Vec::new(),
-                        parent: idx,
-                    },
-                    perms,
-                    2,
-                    0,
-                );
-                self.walk(&path, &rel, child)?;
-                child
-            } else if ft.is_symlink() {
-                let target = fs::read_link(&path).map_err(io_err(&path))?;
-                self.push(
-                    Kind::Symlink(target.into_os_string().into_vec()),
-                    0o777,
-                    1,
-                    0,
-                )
-            } else if ft.is_file() {
-                self.file(path, rel, &md, perms)?
-            } else {
-                let kind = if ft.is_block_device() {
-                    "block device"
-                } else if ft.is_char_device() {
-                    "character device"
-                } else if ft.is_fifo() {
-                    "fifo"
-                } else if ft.is_socket() {
-                    "socket"
-                } else {
-                    "file of unknown type"
-                };
-                return Err(Error::Unsupported { path, kind });
-            };
+            let (child, dir) = self.entry(path, rel.join(&name), idx)?;
+            subdirs += dir as u32;
             entries.push((name.into_vec(), child));
         }
         let Kind::Dir { entries: e, .. } = &mut self.nodes[idx].kind else {
@@ -706,6 +663,51 @@ impl Scan {
         *e = entries;
         self.nodes[idx].nlink = 2 + subdirs;
         Ok(())
+    }
+
+    /// Adds host `path` (at `rel` in the image, a child of node `parent`), not followed if it's a
+    /// symlink, and what is under it if it's a directory: its node, and whether it's a directory.
+    fn entry(&mut self, path: PathBuf, rel: PathBuf, parent: usize) -> Result<(usize, bool)> {
+        let md = fs::symlink_metadata(&path).map_err(io_err(&path))?;
+        let ft = md.file_type();
+        let perms = (md.mode() & 0o7777) as u16;
+        let child = if ft.is_dir() {
+            let child = self.push(
+                Kind::Dir {
+                    entries: Vec::new(),
+                    parent,
+                },
+                perms,
+                2,
+                0,
+            );
+            self.walk(&path, &rel, child)?;
+            child
+        } else if ft.is_symlink() {
+            let target = fs::read_link(&path).map_err(io_err(&path))?;
+            self.push(
+                Kind::Symlink(target.into_os_string().into_vec()),
+                0o777,
+                1,
+                0,
+            )
+        } else if ft.is_file() {
+            self.file(path, rel, &md, perms)?
+        } else {
+            let kind = if ft.is_block_device() {
+                "block device"
+            } else if ft.is_char_device() {
+                "character device"
+            } else if ft.is_fifo() {
+                "fifo"
+            } else if ft.is_socket() {
+                "socket"
+            } else {
+                "file of unknown type"
+            };
+            return Err(Error::Unsupported { path, kind });
+        };
+        Ok((child, ft.is_dir()))
     }
 
     fn file(
