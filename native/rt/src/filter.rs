@@ -11,9 +11,11 @@
 //! The program, in order:
 //! 1. arch is not x86-64, or the x32 bit is set: kill (a filter that only knows x86-64 numbers
 //!    must not judge another ABI's).
-//! 2. `rt_sigreturn`: allow from anywhere (the SIGSYS handler returns through it).
-//! 3. not from the gate: `SECCOMP_RET_TRAP` (the program's syscall, served in-process).
-//! 4. from the gate: the first rule whose number matches and whose conditions all hold allows;
+//! 2. not from the gate: `SECCOMP_RET_TRAP` (the program's syscall, served in-process). The
+//!    program's `rt_sigreturn` too: it returns from a handler the runtime ran (`guest`'s signal
+//!    delivery), so it is the runtime's to serve. (It was allowed from anywhere, for the SIGSYS
+//!    handler's return; that return now goes through the gate, `trap`'s restorer.)
+//! 3. from the gate: the first rule whose number matches and whose conditions all hold allows;
 //!    nothing matching is `deny`. Or, for [`Policy::RouteOnly`], allow everything.
 //!
 //! **Two filters, stacked.** The sandbox's routing and its security are separate layers, each a
@@ -49,6 +51,7 @@ pub const NR_READ: u32 = 0;
 pub const NR_WRITE: u32 = 1;
 pub const NR_RT_SIGRETURN: u32 = 15;
 pub const NR_MADVISE: u32 = 28;
+pub const NR_KILL: u32 = 62;
 pub const NR_CLONE: u32 = 56;
 pub const NR_EXIT: u32 = 60;
 pub const NR_EXIT_GROUP: u32 = 231;
@@ -172,6 +175,9 @@ pub struct Params<'a> {
     pub arena: &'a [(u64, u64)],
     /// The CPU-token eventfds, an inclusive range (threaded and fork mode; ignored otherwise).
     pub token_fds: (u32, u32),
+    /// The sandbox's own host pid: the one process `kill` from the gate may signal (coroutine and
+    /// threaded mode: a guest death by a signal is the sandbox's, `guest`'s `die`).
+    pub pid: u32,
     /// The user's rules, after the mode's.
     pub extra: &'a [Rule<'a>],
 }
@@ -238,6 +244,8 @@ enum Is {
     Eq(u64),
     /// Within `Params::token_fds`.
     TokenFd,
+    /// Exactly `Params::pid`.
+    Pid,
     /// Within one of `Params::arena`'s ranges: the entry becomes one rule per range.
     Arena,
 }
@@ -250,14 +258,21 @@ struct Entry {
 
 /// The host allowlist from the gate. Everything a mode uses and nothing else; adding an entry
 /// widens what a compromised program can do through the gate, so each says why it is needed.
-/// (`rt_sigreturn` is not here: it is allowed from any address, before the gate check.)
 const HOST: &[Entry] = &[
+    // The SIGSYS handler's return (`trap`'s restorer jumps to the gate's `syscall`), and a new
+    // host thread's start (`trap::clone_thread`'s frame).
+    Entry { modes: ALL, nr: NR_RT_SIGRETURN, conds: &[] },
     // The program's stdout and stderr, written by the runtime on its behalf.
     Entry { modes: ALL, nr: NR_WRITE, conds: &[(0, Is::In(1, 2))] },
     // stdin: the guest's file for it is read from the host's fd 0.
     Entry { modes: ALL, nr: NR_READ, conds: &[(0, Is::Eq(0))] },
-    // Ending the process, including a fatal signal the program sends itself.
+    // Ending the process.
     Entry { modes: ALL, nr: NR_EXIT_GROUP, conds: &[] },
+    // Ending it by a signal: the guest's process died of one (its default action), and the
+    // sandbox dies of the same, as the program would natively (abort's SIGABRT). Only this
+    // process, only a signal number: the program can end the sandbox anyway. Not fork mode yet:
+    // its processes' pids differ from the one pinned here.
+    Entry { modes: COROUTINE | THREADED, nr: NR_KILL, conds: &[(0, Is::Pid), (1, Is::In(1, 64))] },
     // The one wait: idle to the next timer (coroutine), a thread's timed sleep on its eventfd
     // (threaded), the program's nanosleep. At most one pollfd and no signal mask (a mask would
     // let the gate change the host's blocked signals, SIGSYS among them).
@@ -422,6 +437,7 @@ impl Emit<'_> {
                 Is::In(lo, hi) => (lo, hi),
                 Is::Eq(v) => (v, v),
                 Is::TokenFd => (params.token_fds.0 as u64, params.token_fds.1 as u64),
+                Is::Pid => (params.pid as u64, params.pid as u64),
                 Is::Arena => {
                     arena_at = Some(i);
                     (0, 0) // per range, below
@@ -460,17 +476,14 @@ pub fn compile(params: &Params, out: &mut Program) -> Result<(), Error> {
     e.ld(OFF_NR)?;
     e.push(JGE_K, 0, 1, X32_SYSCALL_BIT)?;
     e.ret(SECCOMP_RET_KILL_PROCESS)?;
-    // 2. The SIGSYS handler's return, from wherever it runs.
-    e.push(JEQ_K, 0, 1, NR_RT_SIGRETURN)?;
-    e.ret(SECCOMP_RET_ALLOW)?;
-    // 3. Not the gate (either half of the address differs): the program's syscall, trapped.
+    // 2. Not the gate (either half of the address differs): the program's syscall, trapped.
     e.ld(OFF_IP)?;
     e.push(JEQ_K, 1, 0, ip as u32)?;
     e.ret(SECCOMP_RET_TRAP)?;
     e.ld(OFF_IP + 4)?;
     e.push(JEQ_K, 1, 0, (ip >> 32) as u32)?;
     e.ret(SECCOMP_RET_TRAP)?;
-    // 4. The gate: the mode's list, then the user's rules, then deny; or all of it.
+    // 3. The gate: the mode's list, then the user's rules, then deny; or all of it.
     let bit = match params.policy {
         Policy::RouteOnly => return e.ret(SECCOMP_RET_ALLOW),
         Policy::Mode(Mode::Coroutine) => COROUTINE,

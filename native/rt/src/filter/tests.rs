@@ -8,6 +8,7 @@ const GATE: u64 = 0x0000_7f12_3456_7890;
 /// Two arenas: an ordinary one, and one spanning 2^32 (lo and hi differ in the high half).
 const ARENA: [(u64, u64); 2] = [(0x7f00_0000_0000, 0x7f00_4000_0000), (0xffff_0000, 0x1_0001_0000)];
 const TOKENS: (u32, u32) = (1100, 1356);
+const PID: u32 = 4242;
 const DENY: u32 = SECCOMP_RET_ERRNO | EPERM;
 const ALLOW: u32 = SECCOMP_RET_ALLOW;
 const MODES: [Mode; 3] = [Mode::Coroutine, Mode::Threaded, Mode::Fork];
@@ -60,7 +61,7 @@ fn run(prog: &[SockFilter], d: &Data) -> u32 {
 
 fn build(mode: Mode, deny: Deny, extra: &[Rule]) -> Program {
     let mut p = Program::new();
-    let params = Params { policy: Policy::Mode(mode), deny, gate_ip: GATE, arena: &ARENA, token_fds: TOKENS, extra };
+    let params = Params { policy: Policy::Mode(mode), deny, gate_ip: GATE, arena: &ARENA, token_fds: TOKENS, pid: PID, extra };
     compile(&params, &mut p).unwrap();
     p
 }
@@ -113,16 +114,14 @@ fn not_from_the_gate_traps() {
                 // Off by one, off only in the high half, off only in the low half, and nowhere.
                 for ip in [GATE + 2, GATE - 2, GATE ^ (1 << 40), GATE ^ 1, 0, u64::MAX] {
                     let d = Data { nr, arch: AUDIT_ARCH_X86_64, ip, args: [0; 6] };
-                    let want = if nr == NR_RT_SIGRETURN { ALLOW } else { SECCOMP_RET_TRAP };
-                    assert_eq!(check(&prog, d), want, "{mode:?} nr {nr} ip {ip:#x}");
+                    assert_eq!(check(&prog, d), SECCOMP_RET_TRAP, "{mode:?} nr {nr} ip {ip:#x}");
                 }
             }
         }
     }
 }
 
-/// The routing-only filter: arch and x32 killed, rt_sigreturn allowed, everything else not from
-/// the gate trapped and everything from it allowed, whatever the other parameters say.
+/// The routing-only filter: arch and x32 killed, everything not from the gate trapped and everything from it allowed, whatever the other parameters say.
 #[test]
 fn route_only() {
     let mut prog = Program::new();
@@ -133,6 +132,7 @@ fn route_only() {
         gate_ip: GATE,
         arena: &ARENA,
         token_fds: TOKENS,
+        pid: PID,
         extra: &extra,
     };
     compile(&params, &mut prog).unwrap();
@@ -140,8 +140,7 @@ fn route_only() {
         for args in [[0; 6], [u64::MAX; 6], [1, 2, 3, 4, 5, 6]] {
             assert_eq!(check(&prog, gate(nr, args)), ALLOW, "nr {nr} from the gate");
             let d = Data { nr, arch: AUDIT_ARCH_X86_64, ip: GATE + 2, args };
-            let want = if nr == NR_RT_SIGRETURN { ALLOW } else { SECCOMP_RET_TRAP };
-            assert_eq!(check(&prog, d), want, "nr {nr} elsewhere");
+            assert_eq!(check(&prog, d), SECCOMP_RET_TRAP, "nr {nr} elsewhere");
         }
     }
     let other = Data { arch: 0x4000_0003, ..gate(1, [0; 6]) };
@@ -202,6 +201,21 @@ fn ppoll() {
     }
 }
 
+/// `kill` from the gate: the sandbox's own pid and a signal number, in coroutine and threaded mode
+/// only (a fork mode process's pid isn't the one pinned).
+#[test]
+fn kill_self() {
+    let ok = [PID as u64, 6, 0, 0, 0, 0];
+    for mode in [Mode::Coroutine, Mode::Threaded] {
+        edges(mode, NR_KILL, ok, 0, &[(PID as u64, PID as u64)]);
+        edges(mode, NR_KILL, ok, 1, &[(1, 64)]);
+        // The rest are anything (kill has two arguments).
+        edges(mode, NR_KILL, ok, 2, &[(0, u64::MAX)]);
+    }
+    let prog = build(Mode::Fork, Deny::Errno, &[]);
+    assert_eq!(check(&prog, gate(NR_KILL, ok)), DENY);
+}
+
 #[test]
 fn madvise() {
     let ok = [ARENA[0].0, 0, MADV_DONTNEED, 0, 0, 0];
@@ -236,6 +250,7 @@ fn madvise() {
         gate_ip: GATE,
         arena: &[],
         token_fds: TOKENS,
+        pid: PID,
         extra: &[],
     };
     compile(&params, &mut p).unwrap();
@@ -436,6 +451,7 @@ fn errors() {
             gate_ip: GATE,
             arena,
             token_fds,
+            pid: PID,
             extra,
         };
         compile(&params, p)
@@ -513,6 +529,7 @@ fn installs_in_the_kernel() {
             gate_ip,
             arena: &ARENA,
             token_fds: TOKENS,
+        pid: PID,
             extra: &[],
         };
         compile(&params, &mut prog).unwrap();
@@ -560,7 +577,7 @@ fn installs_in_the_kernel() {
 #[test]
 fn stacked_filters_in_the_kernel() {
     let gate_ip = crate::trap::gate_ip();
-    let params = |policy| Params { policy, deny: Deny::Errno, gate_ip, arena: &ARENA, token_fds: TOKENS, extra: &[] };
+    let params = |policy| Params { policy, deny: Deny::Errno, gate_ip, arena: &ARENA, token_fds: TOKENS, pid: PID, extra: &[] };
     let (mut route, mut mode) = (Program::new(), Program::new());
     compile(&params(Policy::RouteOnly), &mut route).unwrap();
     compile(&params(Policy::Mode(Mode::Coroutine)), &mut mode).unwrap();

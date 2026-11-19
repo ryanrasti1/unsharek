@@ -91,6 +91,10 @@ pub unsafe extern "C" fn gate(
         "mov r10, r8",
         "mov r8, r9",
         "mov r9, [rsp + 8]",
+        // The restorer's `rt_sigreturn` comes here too (see `restorer`).
+        ".globl exobox_rt_gate_syscall",
+        ".hidden exobox_rt_gate_syscall",
+        "exobox_rt_gate_syscall:",
         "syscall",
         // What the kernel reports as the instruction pointer: the filter's `gate_ip`. A thread made
         // by `clone_thread` starts here too, on its new stack (see there).
@@ -197,8 +201,7 @@ pub unsafe fn exit_thread() -> ! {
 /// its ordinary stack would overrun it (Go's ~128-byte spare). The way capnix settled it (tier A,
 /// `27955f1c`), with no filter entry: the child returns from the gate's `syscall` on a stack
 /// whose first word is the SIGSYS restorer, so the gate's `ret` lands in `rt_sigreturn` on a frame
-/// built from the trapping `clone`'s own ucontext (`tmpl`). `rt_sigreturn` (allowed from anywhere)
-/// restores that frame, installing the alternate stack (`restore_altstack`) and resuming at
+/// built from the trapping `clone`'s own ucontext (`tmpl`). `rt_sigreturn` (from the gate) restores that frame, installing the alternate stack (`restore_altstack`) and resuming at
 /// `entry(arg)` with the program's signal mask.
 ///
 /// # Safety
@@ -397,11 +400,14 @@ static TARGET: AtomicUsize = AtomicUsize::new(0);
 static RUNTIME_FS: AtomicUsize = AtomicUsize::new(0);
 
 // x86-64 signal numbers and flags (arch/x86/include/uapi/asm/signal.h, asm-generic/signal-defs.h).
+const SIGBUS: usize = 7;
+const SIGSEGV: usize = 11;
 const SIGPIPE: usize = 13;
 const SIGSYS: usize = 31;
 const SA_SIGINFO: u64 = 0x4;
 const SA_ONSTACK: u64 = 0x0800_0000;
 const SA_NODEFER: u64 = 0x4000_0000;
+const SIG_DFL: usize = 0;
 const SIG_IGN: usize = 1;
 const NR_RT_SIGACTION: usize = 13;
 const NR_SIGALTSTACK: usize = 131;
@@ -410,7 +416,10 @@ const NR_SIGALTSTACK: usize = 131;
 /// `target`, and capture the calling thread's FS base as the runtime's (every trap switches to
 /// it). Also ignores SIGPIPE on the host: a write to a closed stdout pipe must come back as
 /// `EPIPE` for the guest to handle, not kill the sandbox (the program's SIGPIPE is the guest
-/// kernel's to deliver).
+/// kernel's to deliver). And resets SIGSEGV and SIGBUS to their default (std's stack-overflow
+/// handlers): a fault dies of its signal at once, and so does the sandbox when the guest's
+/// process died of one (`guest`'s `die` sends it to itself); a handler of the host's would return
+/// through libc's restorer, whose `rt_sigreturn` now traps.
 ///
 /// Before lockdown (it makes host calls the filter doesn't allow). Each host thread also needs
 /// [`set_altstack`].
@@ -429,7 +438,8 @@ pub unsafe fn install(dispatch: Dispatch, target: Target) -> Result<(), Errno> {
         mask: 0,
     };
     let pipe = X86Sigaction { handler: SIG_IGN, ..X86Sigaction::default() };
-    for (sig, act) in [(SIGSYS, &sys), (SIGPIPE, &pipe)] {
+    let dfl = X86Sigaction { handler: SIG_DFL, ..X86Sigaction::default() };
+    for (sig, act) in [(SIGSYS, &sys), (SIGPIPE, &pipe), (SIGSEGV, &dfl), (SIGBUS, &dfl)] {
         // Through the gate, which before lockdown is a plain syscall: rustix's rt_sigaction is
         // behind its unstable `runtime` feature. sigsetsize 8: the kernel's sigset_t.
         // SAFETY: the kernel reads `act` during the call.
@@ -461,11 +471,13 @@ pub fn frame_size(uc: &Ucontext) -> usize {
 // ------------------------------------------------------------------------------------------------
 // The entry and exit.
 
-/// Where a handler returns to: `rt_sigreturn`, which the filter allows from anywhere. It reads the
-/// frame at sp - 8, i.e. the (moved) frame whose return address the entry's `ret` just popped.
+/// Where a handler returns to: `rt_sigreturn`, made from the gate's `syscall` instruction, the
+/// only place the filter allows it from (anywhere else it traps: the program's own `rt_sigreturn`
+/// returns from a handler the runtime ran, and is the runtime's to serve). It reads the frame at
+/// sp - 8, i.e. the (moved) frame whose return address the entry's `ret` just popped.
 #[unsafe(naked)]
 unsafe extern "C" fn restorer() -> ! {
-    core::arch::naked_asm!("mov eax, 15", "syscall", "ud2")
+    core::arch::naked_asm!("mov eax, 15", "jmp exobox_rt_gate_syscall", "ud2")
 }
 
 /// The SIGSYS handler as installed. The kernel enters with rdi = signo, rsi = &siginfo,

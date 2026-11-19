@@ -521,6 +521,7 @@ impl Sandbox {
             gate_ip: exobox_rt::trap::gate_ip(),
             arena: &arena,
             token_fds: self.token_fds,
+            pid: std::process::id(),
             extra: &extra,
         };
         filter::compile(&params, prog).map_err(|e| Error::Io {

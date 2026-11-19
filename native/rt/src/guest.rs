@@ -241,7 +241,7 @@ pub unsafe fn boot(b: Boot) -> Result<(), Error> {
 /// Install the routing-only filter (`filter::Policy::RouteOnly`): from now on every syscall not
 /// from the gate traps and is served by the guest, as init. The setup phase begins.
 pub fn route() -> Result<(), Error> {
-    let p = Params { policy: Policy::RouteOnly, deny: Deny::Kill, gate_ip: trap::gate_ip(), arena: &[], token_fds: (0, 0), extra: &[] };
+    let p = Params { policy: Policy::RouteOnly, deny: Deny::Kill, gate_ip: trap::gate_ip(), arena: &[], token_fds: (0, 0), pid: 0, extra: &[] };
     // SAFETY: the static program, used only here and in `lock`, one at a time.
     let prog = unsafe { FILTER.get() };
     filter::compile(&p, prog).map_err(|_| Error { what: "the routing filter", errno: Errno::INVAL })?;
