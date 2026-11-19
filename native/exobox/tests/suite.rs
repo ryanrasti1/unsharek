@@ -183,6 +183,8 @@ fn cases() -> Vec<Case> {
         fixture("gsbase", ALL),
         // The guest kernel's clock is the host's (a new file's mtime, a raw clock_gettime).
         fixture("clock", ALL),
+        // /dev's nodes are 0666: a user that isn't root writes /dev/null.
+        fixture("devnodes", ALL),
         Case { cpu_budget: Some(Duration::from_millis(100)), ..fixture("idle", ALL) },
         // JITs work with no flag: W^X would be hardening of the program, not the sandbox's.
         fixture("rwx", ALL),

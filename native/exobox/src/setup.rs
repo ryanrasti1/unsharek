@@ -191,8 +191,12 @@ pub fn defaults(entropy: &[u8]) -> io::Result<()> {
         [(c"/dev/null", 1, 3), (c"/dev/zero", 1, 5), (c"/dev/full", 1, 7), (c"/dev/random", 1, 8), (c"/dev/urandom", 1, 9), (c"/dev/tty", 5, 0)]
     {
         mknod(path, major, minor)?;
+        // mknod's mode passes through the umask too (0644, root's): anyone may use these, as on
+        // any Linux (capnix's build user couldn't write /dev/null).
+        sys(l::__lkl__NR_fchmodat, [AT_FDCWD, p(path), 0o666, 0, 0, 0])?;
     }
     mkdir(c"/dev/pts", 0o755)?;
+    // /dev/ptmx is devpts' own node, 0666 by `ptmxmode`.
     mount(c"devpts", c"/dev/pts", c"devpts", 0, p(c"mode=620,ptmxmode=666"))?;
     symlink(c"pts/ptmx", c"/dev/ptmx")?;
     symlink(c"/proc/self/fd", c"/dev/fd")?;

@@ -185,6 +185,14 @@ fn intercept(m: Mode, name: &str) -> exobox::Error {
     }
     {
         let _g = sb.intercept().unwrap();
+        // uid 1000 uses /dev's nodes (they were 0644, root's: capnix's build user couldn't write
+        // /dev/null).
+        check("guard 3: uid 1000 writes /dev/null", std::fs::write("/dev/null", "x").is_ok());
+        for dev in ["/dev/zero", "/dev/urandom"] {
+            let mut b = [0u8; 16];
+            let read = std::fs::File::open(dev).and_then(|mut f| f.read_exact(&mut b));
+            check(&format!("guard 3: uid 1000 reads {dev}"), read.is_ok());
+        }
         // A guard's clock_settime is the guest kernel's, which asks for CAP_SYS_TIME: uid 1000
         // has none. (The program's gets sysmap's EPERM whoever it is: sysaudit.)
         // SAFETY: a timespec of the host's time.
