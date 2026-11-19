@@ -336,8 +336,8 @@ fn sigpipe_ignored() {
     });
 }
 
-/// Mirrors native/fixtures/c/small_stack.c: a syscall writes nothing below the caller's sp, and a
-/// trapped one must not either. Here the trap comes with 256 bytes of headroom, everything below
+/// Mirrors guest-tests' `memory::small_stack`: a syscall writes nothing below the caller's sp, and
+/// a trapped one must not either. Here the trap comes with 256 bytes of headroom, everything below
 /// poisoned; the frame goes to the alternate stack and then the control stack.
 #[test]
 fn small_stack() {
