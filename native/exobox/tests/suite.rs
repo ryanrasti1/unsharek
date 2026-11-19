@@ -61,8 +61,6 @@ enum Arg {
 enum Status {
     Code(i32),
     Signal(i32),
-    /// Killed by the signal, or exit 128 + it (where the sandbox emulates the default action).
-    Fatal(i32),
     Any,
 }
 
@@ -150,6 +148,11 @@ impl Case {
     }
 }
 
+fn group_exit(name: &'static str, waiters: &'static str, how: &'static str, st: Status) -> Case {
+    let expect = Expect { stdout: vec!["GROUP_EXIT_READY"], not_stdout: vec!["GROUP_EXIT_SURVIVED"], ..status(st) };
+    Case { hold_stdin: true, ..case(name, Prog::Fixture("group_exit"), ALL, expect).args(vec![Arg::Lit(waiters), Arg::Lit(how)]) }
+}
+
 fn cases() -> Vec<Case> {
     let mut c = vec![
         // Basics, in every mode.
@@ -162,6 +165,8 @@ fn cases() -> Vec<Case> {
         fixture("small_stack", ALL),
         fixture("stdio_meminfo", ALL),
         fixture("sigsys", ALL),
+        // Handlers run as the program (item 8); its fork steps only where there are processes.
+        fixture("signals", ALL),
         fixture("gsbase", ALL),
         Case { cpu_budget: Some(Duration::from_millis(100)), ..fixture("idle", ALL) },
         // JITs work with no flag: W^X would be hardening of the program, not the sandbox's.
@@ -169,8 +174,10 @@ fn cases() -> Vec<Case> {
         // How a run ends.
         case("exit_code", Prog::Fixture("exit_status"), ALL, status(Status::Code(42)))
             .args(vec![Arg::Lit("exit42")]),
-        case("abort", Prog::Fixture("exit_status"), ALL, status(Status::Fatal(6))).args(vec![Arg::Lit("abort")]),
-        case("sigterm", Prog::Fixture("exit_status"), ALL, status(Status::Fatal(15))).args(vec![Arg::Lit("term")]),
+        // A death by a signal is the sandbox's too (the guest's default action, then `kill` of
+        // itself), as natively.
+        case("abort", Prog::Fixture("exit_status"), ALL, status(Status::Signal(6))).args(vec![Arg::Lit("abort")]),
+        case("sigterm", Prog::Fixture("exit_status"), ALL, status(Status::Signal(15))).args(vec![Arg::Lit("term")]),
         Case {
             stdin: Some("through stdin\n"),
             ..case("stdin", Prog::Fixture("exit_status"), ALL, ok("through stdin")).args(vec![Arg::Lit("cat")])
@@ -232,8 +239,18 @@ fn cases() -> Vec<Case> {
             .native(Some(ok("DENIED_LOADED"))),
         // Fork mode.
         fixture("fork", FORK),
-        fixture("signals", FORK),
+
         fixture("forkthreads", FORK),
+        // Exec's kernel half: close-on-exec fds, handlers reset, the other threads ended.
+        fixture("exec_reset", ALL),
+        fixture("exec_reset", ALL).renamed("exec_reset_threads").args(vec![Arg::Lit("threads")]),
+        // A process ends though its other threads wait where the runtime has them, not the kernel:
+        // an emulated futex, a host fd (stdin; a passed fd is tests/guest.rs's). By exit, by a
+        // signal's default action, and by an itimer's while every thread waits so.
+        group_exit("group_exit_futex", "futex", "exit", Status::Code(3)),
+        group_exit("group_exit_stdin", "stdin", "exit", Status::Code(3)),
+        group_exit("group_exit_signal", "futex,stdin", "signal", Status::Signal(15)),
+        group_exit("group_exit_alarm", "futex,stdin", "alarm", Status::Signal(14)),
         // A thread blocked reading a host fd must not keep its process from exiting (capnix).
         Case { hold_stdin: true, ..fixture("hostfd_thread", ALL).args(vec![Arg::Lit("exit")]) },
         Case { hold_stdin: true, ..fixture("hostfd_thread", ALL).renamed("hostfd_thread_sleep").args(vec![Arg::Lit("sleep")]) },
@@ -401,7 +418,6 @@ fn run(c: &Case, mode: Mode, secret: &PathBuf) -> Result<(), Failed> {
     let status_ok = match expect.status {
         Status::Code(n) => status.code() == Some(n),
         Status::Signal(s) => status.signal() == Some(s),
-        Status::Fatal(s) => status.signal() == Some(s) || status.code() == Some(128 + s),
         Status::Any => true,
     };
     if !status_ok {
@@ -447,7 +463,6 @@ impl std::fmt::Debug for DebugStatus {
         match self.0 {
             Status::Code(n) => write!(f, "exit {n}"),
             Status::Signal(s) => write!(f, "signal {s}"),
-            Status::Fatal(s) => write!(f, "signal {s} or exit {}", 128 + s),
             Status::Any => write!(f, "any"),
         }
     }

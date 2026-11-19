@@ -519,6 +519,10 @@ unsafe extern "C" fn timer_fired(arg: *mut c_void) {
     // SAFETY: LKL's timer function (`timer_fn`: triggers the timer IRQ) runs on any thread.
     unsafe { f() };
     ts.runner.set(None);
+    // The timer may have sent a signal (an itimer's SIGALRM, a POSIX timer's): a program thread
+    // parked in one of the runtime's own waits learns of it only at its next call into the kernel,
+    // so cut those waits short (they go back to waiting if there was nothing for them).
+    sched().interrupt_waits();
     if ts.release_on_return.replace(false) {
         // Freed by `f` itself. The coroutine returns to `timer_main`, which sees the timer freed
         // and ends without yielding first, so the slot can't be handed out under it.
@@ -626,30 +630,54 @@ const POLLOUT: i16 = 4;
 /// watches one; or the program keeps the CPU busy, and idle never runs).
 const FD_REPOLL_NS: u64 = 5_000_000;
 
+/// The kernel's "restart this call if no handler says otherwise" (include/linux/errno.h).
+const ERESTARTSYS: core::ffi::c_long = 512;
+
 /// `hostfd_rw`: a read or write on the host's fd for a guest file made by `host_fd`, called with
 /// the CPU free and the task asleep. The host thread is every coroutine's, so it must not block in
 /// the host: poll the fd (through the gate), and until it is ready block the coroutine, the idle
 /// wait watching the fd; then the one read or write, which won't block. Through the gate, so the
 /// filter decides: reads of 0 and writes of 1 and 2 (the program's stdio) and nothing else.
+///
+/// **Ends and signals.** The kernel's wait for this is uninterruptible (hostfd.c: the task asleep
+/// outside the CPU, as in a disk read), so neither a group exit nor a signal reaches a thread
+/// blocked here: its process never ended while a reader waited on a silent stdin (capnix's
+/// channel at fd 1000). So the wait is short: one poll interval (or less: it is marked
+/// interruptible, `Sched::interrupt_waits`, which a group exit, an exec, a `kill` or a timer
+/// wakes), and then, if the fd still isn't ready, `-ERESTARTSYS` with nothing done. The call's
+/// return to the program (`syscall_return`, the kernel series' item 8) then sees what is pending:
+/// a fatal signal ends the task, a caught one runs its handler and the call restarts under
+/// `SA_RESTART` or is `EINTR`, as a pipe's read; with nothing pending the kernel runs the call
+/// again, back here. (The kernel-side fix would be hostfd.c waiting interruptibly and the host
+/// op being told to give up: see the item-8 notes in `guest`.)
 unsafe extern "C" fn hostfd_rw(fd: c_int, buf: *mut c_void, len: c_ulong, write: c_int) -> core::ffi::c_long {
     let events = if write != 0 { POLLOUT } else { POLLIN };
     let zero = crate::xabi::Timespec { tv_sec: 0, tv_nsec: 0 };
-    loop {
+    let ready = || {
         let mut p = crate::trap::PollFd { fd, events, revents: 0 };
-        match crate::trap::ppoll(Some(&mut p), Some(&zero)) {
-            Ok(n) if n > 0 => break,
-            Ok(_) => {}
-            Err(e) => return -(e.raw_os_error() as core::ffi::c_long),
+        crate::trap::ppoll(Some(&mut p), Some(&zero)).map(|n| n > 0)
+    };
+    match ready() {
+        Ok(true) => {}
+        Ok(false) => {
+            let s = sched();
+            let deadline = s.now().saturating_add(FD_REPOLL_NS);
+            s.set_interruptible(true);
+            if FD_WAIT.0.get().is_none() {
+                FD_WAIT.0.set(Some((fd, events, s.current())));
+                s.block(Some(deadline));
+                FD_WAIT.0.set(None);
+            } else {
+                s.sleep_until(deadline);
+            }
+            s.set_interruptible(false);
+            match ready() {
+                Ok(true) => {}
+                Ok(false) => return -ERESTARTSYS,
+                Err(e) => return -(e.raw_os_error() as core::ffi::c_long),
+            }
         }
-        let s = sched();
-        let deadline = s.now().saturating_add(FD_REPOLL_NS);
-        if FD_WAIT.0.get().is_none() {
-            FD_WAIT.0.set(Some((fd, events, s.current())));
-            s.block(Some(deadline));
-            FD_WAIT.0.set(None);
-        } else {
-            s.sleep_until(deadline);
-        }
+        Err(e) => return -(e.raw_os_error() as core::ffi::c_long),
     }
     let r = if write != 0 {
         // SAFETY: the kernel's buffer of len bytes.

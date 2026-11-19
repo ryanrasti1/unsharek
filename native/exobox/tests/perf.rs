@@ -59,6 +59,8 @@ const MEM_TEMPLATE_BUDGET_KB: u64 = 3 * 1024;
 /// threads); make -j4 of GNU hello 2.8 s against 0.8 (fork and exec dominate).
 const PARALLEL_RATIO: f64 = 1.5;
 const BUILD_RATIO: f64 = 4.0;
+/// The same work on one host thread (coroutine mode): four threads' worth of CPU, serialised.
+const COROUTINE_PARALLEL_RATIO: f64 = 6.0;
 
 fn main() {
     let args = Arguments::from_args();
@@ -71,6 +73,8 @@ fn main() {
         trials.push(Trial::test(format!("template::{m}"), move || template(mode)));
         trials.push(Trial::test(format!("compute::{m}"), move || compute(mode)));
     }
+    // Coroutine mode too: its exit hung, a thread parked in an emulated futex when main ended.
+    trials.push(Trial::test("xz::coroutine", || xz(Mode::Coroutine)));
     trials.push(Trial::test("xz::threaded", || xz(Mode::Threaded)));
     trials.push(Trial::test("xz::fork", || xz(Mode::Fork)));
     trials.push(Trial::test("make::fork", make));
@@ -341,7 +345,10 @@ fn xz(mode: Mode) -> Result<(), Failed> {
         args(&mut c);
         c
     }, Duration::from_secs(30))?;
-    ratio_check("xz -T4, 16 MB", sb, native, PARALLEL_RATIO)
+    // Coroutine mode runs the four threads on one CPU: it must finish (it hung at exit), at about
+    // the cost of xz -T1.
+    let budget = if matches!(mode, Mode::Coroutine) { COROUTINE_PARALLEL_RATIO } else { PARALLEL_RATIO };
+    ratio_check("xz -T4, 16 MB", sb, native, budget)
 }
 
 /// A C build: 16 files compiled by make -j4 (fork, exec, pipes, threads), from a copy in a

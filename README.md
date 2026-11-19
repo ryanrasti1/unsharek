@@ -81,6 +81,10 @@ that mounts `/dev/exobox/<name>` with `mount(2)` and execs the next one).
   guest kernel (x86-64 numbers translated to the generic table, structs translated), rewritten
   (`open` to `openat`, `fork` to `clone`, ...), emulated (memory, threads, futexes, the thread
   pointer), or refused. About 0.8 µs a call.
+- **Signals** are the guest kernel's: actions, masks, delivery, default actions. At a call's
+  return it hands a caught signal to the runtime, which builds Linux's frame on the program's stack
+  (or its alternate stack) and runs the handler as the program; the handler's `rt_sigreturn` traps
+  and hands the registers and mask back. A death by a signal is the sandbox's, by the same signal.
 - **Memory.** Before lockdown exobox reserves one region for the program (its arena): readable,
   writable and executable, so JITs work. After lockdown there is no host `mmap`: the program's
   memory calls are served from the arena, and freed pages go back with `madvise` where the mode
@@ -197,7 +201,10 @@ the unit tests of exobox and exobox-erofs.
 | `threaded` | a host thread per program thread, made lazily; one guest CPU passed between them | one | coroutine's, without `madvise`, plus `read`/`write` on the CPU-token eventfds, `clone` with exactly the thread flag set, `exit(0)` |
 | `fork` | as threaded | a guest fork is a host fork; the processes share one guest kernel | threaded's, plus `clone(SIGCHLD)` with no stack |
 
-`rt_sigreturn` (the SIGSYS handler's return) is allowed in every mode. `--deny=kill` (the default)
+`rt_sigreturn` from the gate (the SIGSYS handler's return) is allowed in every mode, and in
+coroutine and threaded mode `kill` of the sandbox's own pid (a guest process that dies of a signal
+makes the sandbox die of the same); the program's own `rt_sigreturn` traps, as it returns from a
+handler the runtime ran. `--deny=kill` (the default)
 kills the sandbox on anything else from the gate; `--deny=errno` returns `EPERM`, for probing.
 `--allow RULE` adds one syscall, with conditions on its arguments.
 

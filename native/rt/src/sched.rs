@@ -191,6 +191,9 @@ struct Slot {
     /// ([`Sched::par_context_switch`]), so runtime code on its stack can find its host thread
     /// ([`Sched::par_host_of_stack`]) without a register of its own (the GS base is the program's).
     on_host: Cell<u16>,
+    /// Blocked in a wait of the runtime's own (an emulated futex, a host fd's I/O) rather than an
+    /// LKL one: [`Sched::interrupt_waits`] wakes it ([`Sched::set_interruptible`]).
+    interruptible: Cell<bool>,
     tls: [Cell<usize>; TLS_KEYS],
 }
 
@@ -217,6 +220,7 @@ impl Slot {
             exit: Cell::new(0),
             home: Cell::new(NONE),
             on_host: Cell::new(NONE),
+            interruptible: Cell::new(false),
             tls: [const { Cell::new(0) }; TLS_KEYS],
         }
     }
@@ -275,6 +279,8 @@ pub struct Sched {
     /// Threaded mode's driver ([`Par`]): when set, [`Sched::schedule`] delegates to it (a host
     /// thread per program thread, taking turns on one CPU token). `None` in coroutine mode.
     par: Cell<Option<&'static dyn Par>>,
+    /// Coroutines marked [`Sched::set_interruptible`].
+    interruptible: Cell<usize>,
 }
 
 /// Threaded mode's scheduler driver (`par`): the single hook [`Sched::schedule`] delegates to when
@@ -347,6 +353,7 @@ impl Sched {
             tls_used: Cell::new(0),
             tls_dtors: [const { Cell::new(None) }; TLS_KEYS],
             par: Cell::new(None),
+            interruptible: Cell::new(0),
         }
     }
 
@@ -795,6 +802,9 @@ impl Sched {
         let s = &self.slots[i as usize];
         debug_assert!(s.heap_pos.get() == NONE && s.wq.get().is_null());
         s.state.set(State::Free);
+        if s.interruptible.replace(false) {
+            self.interruptible.set(self.interruptible.get() - 1);
+        }
         s.start.set(Start::None);
         s.detached.set(false);
         s.joiner.set(NONE);
@@ -830,6 +840,34 @@ impl Sched {
     /// Sleep until `deadline` (CLOCK_MONOTONIC ns), or until woken.
     pub fn sleep_until(&self, deadline: u64) -> Wake {
         self.block(Some(deadline))
+    }
+
+    /// Mark the current coroutine's next waits as the runtime's own, which
+    /// [`Sched::interrupt_waits`] may cut short (`true`), or no longer (`false`, once it is back).
+    /// LKL's waits (semaphores, mutexes) are never marked: they are the kernel's, and it ends or
+    /// signals their tasks itself.
+    pub fn set_interruptible(&self, on: bool) {
+        let s = &self.slots[self.current.get() as usize];
+        if s.interruptible.replace(on) != on {
+            let n = self.interruptible.get();
+            self.interruptible.set(if on { n + 1 } else { n - 1 });
+        }
+    }
+
+    /// Wake every coroutine blocked in a wait marked [`Sched::set_interruptible`], with
+    /// [`Wake::Interrupted`]: the kernel may have something for its task (a group exit, an exec's
+    /// kill, a signal) that it only learns at the task's next call. Each such waiter then makes
+    /// one (the guest's futex, the host fd's restart). Cheap when there are none.
+    pub fn interrupt_waits(&self) {
+        if self.interruptible.get() == 0 {
+            return;
+        }
+        for i in 0..self.fresh.get() {
+            let s = &self.slots[i as usize];
+            if s.interruptible.get() && s.state.get() == State::Blocked {
+                self.resume(i, Wake::Interrupted);
+            }
+        }
     }
 
     /// Make a blocked coroutine runnable. If it was on a wait queue it leaves it, with

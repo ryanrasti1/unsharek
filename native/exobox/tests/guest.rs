@@ -6,6 +6,8 @@
 //!   `openat` through it reaches the host and succeeds).
 //! - Layer 3, `Sandbox`: the same gate call is refused once the mode's filter is stacked on the
 //!   routing one (deny=errno: EPERM, the program survives to say so).
+//! - `Sandbox::pass_fd`: a host socket as guest fd 1000 (fd_echo answers on it); and a thread
+//!   blocked reading it doesn't keep its process from ending (group_exit), in each mode.
 
 use std::ffi::OsString;
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -19,6 +21,10 @@ use libtest_mimic::{Arguments, Failed, Trial};
 mod common;
 
 const CHILD: &str = "EXOBOX_GUEST_TEST_CHILD";
+/// The child's mode (`coroutine`, the default, or `threaded`) and the fixture's arguments
+/// (space-separated).
+const CHILD_MODE: &str = "EXOBOX_GUEST_TEST_MODE";
+const CHILD_ARGS: &str = "EXOBOX_GUEST_TEST_ARGS";
 
 /// The child: boot `layer`, mount the fixtures' closure, run fixture `name`.
 fn child(layer: &str, name: &str) -> ! {
@@ -30,8 +36,10 @@ fn child(layer: &str, name: &str) -> ! {
         ..Default::default()
     };
     let store = exobox::store(&config).unwrap();
-    let argv: Vec<OsString> = vec![program.into()];
-    let env: Vec<OsString> = vec!["EXOBOX_TEST_MODE=coroutine".into()];
+    let mode = std::env::var(CHILD_MODE).unwrap_or_else(|_| "coroutine".into());
+    let mut argv: Vec<OsString> = vec![program.into()];
+    argv.extend(std::env::var(CHILD_ARGS).unwrap_or_default().split_whitespace().map(OsString::from));
+    let env: Vec<OsString> = vec![format!("EXOBOX_TEST_MODE={mode}").into()];
     let e = match layer {
         "guest" => {
             let mut g = exobox::Guest::boot(exobox::GuestConfig::default()).unwrap();
@@ -39,7 +47,8 @@ fn child(layer: &str, name: &str) -> ! {
             g.run(&argv, &env, move || exobox::setup::mount_closure(&mounts)).unwrap_err()
         }
         _ => {
-            let mut sb = exobox::Sandbox::boot(exobox::Mode::Coroutine, exobox::GuestConfig::default()).unwrap();
+            let m = if mode == "threaded" { exobox::Mode::Threaded } else { exobox::Mode::Coroutine };
+            let mut sb = exobox::Sandbox::boot(m, exobox::GuestConfig::default()).unwrap();
             sb.deny(exobox::Deny::Errno);
             if layer == "passfd" {
                 // The parent's socketpair end, inherited at fd 3 (`run_passfd`), as guest fd 1000.
@@ -65,17 +74,27 @@ fn run(layer: &str, name: &str) -> Result<(i32, String, String), Failed> {
     Ok((status.code().unwrap_or(-1), out, err))
 }
 
-/// The `passfd` layer: a socketpair, one end the child's fd 3; "ping" sent before it starts, the
-/// answer read after it ends.
-fn run_passfd() -> Result<(i32, String, String, String), Failed> {
+/// The `passfd` layer: a socketpair, one end the child's fd 3; `send` sent before it starts (none:
+/// the socket stays open and silent while it runs), the answer read after it ends. The child runs
+/// `fixture args` in `mode`.
+fn run_passfd(
+    mode: &str,
+    fixture: &str,
+    args: &str,
+    send: Option<&[u8]>,
+) -> Result<(std::process::ExitStatus, String, String, String), Failed> {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::os::unix::process::CommandExt;
     let (mut ours, theirs) = UnixStream::pair()?;
-    ours.write_all(b"ping")?;
+    if let Some(b) = send {
+        ours.write_all(b)?;
+    }
     let theirs_fd = theirs.as_raw_fd();
     let mut cmd = Command::new(std::env::current_exe()?);
-    cmd.env(CHILD, "passfd:fd_echo")
+    cmd.env(CHILD, format!("passfd:{fixture}"))
+        .env(CHILD_MODE, mode)
+        .env(CHILD_ARGS, args)
         .env("EXOBOX_GUEST_TEST_CACHE", PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("image-cache"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -89,7 +108,7 @@ fn run_passfd() -> Result<(i32, String, String, String), Failed> {
     ours.set_nonblocking(true)?;
     let mut answer = vec![0; 64];
     let n = ours.read(&mut answer).unwrap_or(0);
-    Ok((status.code().unwrap_or(-1), out, err, String::from_utf8_lossy(&answer[..n]).into_owned()))
+    Ok((status, out, err, String::from_utf8_lossy(&answer[..n]).into_owned()))
 }
 
 fn main() {
@@ -98,11 +117,11 @@ fn main() {
         child(layer, name);
     }
     let args = Arguments::from_args();
-    let trials = vec![
+    let mut trials = vec![
         Trial::test("sandbox_pass_fd", || {
-            let (code, out, err, answer) = run_passfd()?;
-            if code != 0 || !out.contains("FD_ECHO_OK") || answer != "got:ping" {
-                return Err(format!("exit {code}, answer {answer:?}\n{out}\n{err}").into());
+            let (st, out, err, answer) = run_passfd("coroutine", "fd_echo", "", Some(b"ping"))?;
+            if st.code() != Some(0) || !out.contains("FD_ECHO_OK") || answer != "got:ping" {
+                return Err(format!("{st:?}, answer {answer:?}\n{out}\n{err}").into());
             }
             Ok(())
         }),
@@ -131,5 +150,19 @@ fn main() {
             Ok(())
         }),
     ];
+    // A thread blocked reading the passed fd (open, silent) while main exits with 3, or dies of
+    // SIGTERM: the process ends so, within the timeout (capnix's app hung on its fd 1000).
+    for mode in ["coroutine", "threaded"] {
+        for (how, want) in [("exit", (Some(3), None)), ("signal", (None, Some(15)))] {
+            trials.push(Trial::test(format!("pass_fd_reader_{how}::{mode}"), move || {
+                use std::os::unix::process::ExitStatusExt;
+                let (st, out, err, _) = run_passfd(mode, "group_exit", &format!("fd1000,futex {how}"), None)?;
+                if (st.code(), st.signal()) != want || !out.contains("GROUP_EXIT_READY") || out.contains("reader of fd") {
+                    return Err(format!("{st:?}, wanted {want:?}\n{out}\n{err}").into());
+                }
+                Ok(())
+            }));
+        }
+    }
     libtest_mimic::run(&args, trials).exit();
 }

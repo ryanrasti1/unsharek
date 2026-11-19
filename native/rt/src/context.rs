@@ -269,6 +269,59 @@ impl JmpBuf {
     pub const fn new() -> Self {
         JmpBuf { sp: 0 }
     }
+
+    /// The saved frame's lowest address: everything below it on that stack is free while the
+    /// call that saved it is active.
+    pub fn sp(&self) -> usize {
+        self.sp
+    }
+}
+
+/// Where and how [`call_program`] enters program code: `rip(rdi, rsi, rdx)` on stack `rsp` (whose
+/// first word is the return address the program code returns to), FS base `fs`. `#[repr(C)]`:
+/// the assembly reads it at fixed offsets.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ProgramCall {
+    pub rip: usize,
+    pub rsp: usize,
+    pub rdi: usize,
+    pub rsi: usize,
+    pub rdx: usize,
+    pub fs: usize,
+}
+
+/// Save a jump-back point in `*buf` (as [`call_with_jump_back`]) and enter program code as
+/// `call` says: a signal handler, run by the runtime as the program would be interrupted (the
+/// guest's signal delivery). The program's FS is loaded; the x87 and SSE control state are reset,
+/// as Linux starts a handler with a fresh FPU state; DF is clear. Program code can't return here:
+/// only [`jump`]`(buf, val)` comes back, from runtime code on this stack (the trap of the
+/// handler's `rt_sigreturn`, its frame below this one), returning `val`, with the FS base the
+/// runtime code had (the trap entry switched it back).
+///
+/// # Safety
+/// `call` is a state the program can run from; the stack below the saved frame stays free for
+/// the traps of the code it runs.
+#[unsafe(naked)]
+pub unsafe extern "C" fn call_program(buf: *mut JmpBuf, call: *const ProgramCall) -> usize {
+    core::arch::naked_asm!(
+        save_frame!(),
+        "mov [rdi], rsp",
+        "mov rax, [rsi + 40]",
+        "wrfsbase rax",
+        "mov rsp, [rsi + 8]",
+        "mov rdi, [rsi + 16]",
+        "mov rdx, [rsi + 32]",
+        "mov r11, [rsi]",
+        "mov rsi, [rsi + 24]",
+        // A fresh FPU control state, written below the handler's frame (free stack).
+        "fninit",
+        "mov dword ptr [rsp - 8], 0x1f80",
+        "ldmxcsr dword ptr [rsp - 8]",
+        "cld",
+        "xor eax, eax",
+        "jmp r11",
+    )
 }
 
 /// Save a jump-back point in `*buf`, then call `f(arg)` on this stack. Returns 0 when `f`

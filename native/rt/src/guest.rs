@@ -26,9 +26,14 @@
 //! task's own coroutine: init's (pid 1, after its exit ran in the guest) ends the sandbox with
 //! its status; another thread's ends its coroutine.
 //!
-//! **Stopgap** for a kernel item not landed yet, marked `STOPGAP(item 8)`: signals. A signal the
-//! program sends its own process whose action is the default and fatal ends the sandbox with
-//! 128 + the signal, as capnix did; handlers are recorded by LKL but never run.
+//! **Signals** are the kernel's (item 8): actions, masks, `kill`, default actions. At a call's
+//! return to the program the kernel takes a pending caught signal and calls the
+//! `signal_handler` host op ([`signal_handler`]), which runs the program's handler as Linux
+//! would on that trap: a frame on the program's stack (see "Signal delivery" below), the
+//! handler entered as the program, its own calls trapped as any, and its `rt_sigreturn` (which
+//! traps: the filter allows it only from the gate) handing the registers, mask and alternate
+//! stack back to the kernel's half of sigreturn. A default action that ends the process comes
+//! back as `task_exit` with the signal, and the sandbox dies of the same signal ([`die`]).
 
 use core::cell::{Cell, UnsafeCell};
 use core::ffi::{CStr, c_long};
@@ -38,7 +43,7 @@ use lkl_sys as l;
 use rustix::io::Errno;
 
 use crate::arena::{self, Arena, Backing, Extent, FileMap};
-use crate::context::{self, Registers};
+use crate::context::{self, JmpBuf, ProgramCall, Registers};
 use crate::exec::{self, Files, Scratch, StackParams};
 use crate::filter::{self, Deny, Params, Policy, Program as Filter};
 use crate::futex::{self, Futexes};
@@ -48,7 +53,7 @@ use crate::par;
 use crate::sched::{Config, Sched, Stacks, Tid};
 use crate::sync::TlsKey;
 use crate::sysmap::{self, Emulate, Rewrite, Route, StatForm, k, lkl};
-use crate::trap::{self, Ucontext};
+use crate::trap::{self, StackT, Ucontext};
 use crate::xabi::{self, Itimerval, LklSigaction, LklStat, Timespec, Timeval, X86Sigaction, X86Stat};
 
 /// A static only this host thread touches (coroutine mode: one host thread, cooperative).
@@ -110,6 +115,28 @@ struct Thread {
     attach: Cell<i32>,
     /// `CLONE_CHILD_CLEARTID` / `set_tid_address`: zeroed and futex-woken at its exit.
     clear_tid: Cell<usize>,
+    // Signal delivery's per-thread state, for both modes ([`cur`]: threaded mode's by host slot).
+    /// The trap being served (its ucontext), innermost first: the registers a handler interrupts.
+    uc: Cell<usize>,
+    /// The innermost handler the runtime is running for this thread (a [`SigRec`] in
+    /// [`signal_handler`]'s frame), 0: none.
+    sig_top: Cell<usize>,
+    /// The program's mask while the runtime's own calls in this dispatch run with every signal
+    /// blocked ([`lkl_quiet`]); restored at the dispatch's end ([`unquiet`]).
+    quiet: Cell<Option<u64>>,
+    /// Handlers run, and whether the last was `SA_RESTART`: a woken futex wait learns from them
+    /// whether its probe ran one ([`futex_call`]).
+    handled: Cell<u32>,
+    handled_restart: Cell<bool>,
+}
+
+impl Thread {
+    /// A slot taken by a new thread, or freed: no trap, no handler.
+    fn reset_signals(&self) {
+        self.uc.set(0);
+        self.sig_top.set(0);
+        self.quiet.set(None);
+    }
 }
 
 struct State {
@@ -129,6 +156,8 @@ struct State {
     restorers: [Cell<usize>; 65],
     /// Calls served, for the dispatcher's turn-taking.
     served: Cell<u32>,
+    /// The sandbox's host pid ([`die`]: the one `kill` the filter allows).
+    host_pid: Cell<u32>,
     /// The host's auxiliary vector values, for every exec.
     aux: Cell<Aux>,
     /// The running program's absolute path (STOPGAP(item 10): `/proc/self/exe`).
@@ -143,10 +172,22 @@ static S: State = State {
     arena_busy: Cell::new(false),
     root_top: Cell::new(0),
     key: Cell::new(None),
-    threads: [const { Thread { used: Cell::new(false), co: Cell::new(0), attach: Cell::new(0), clear_tid: Cell::new(0) } };
-        THREADS],
+    threads: [const {
+        Thread {
+            used: Cell::new(false),
+            co: Cell::new(0),
+            attach: Cell::new(0),
+            clear_tid: Cell::new(0),
+            uc: Cell::new(0),
+            sig_top: Cell::new(0),
+            quiet: Cell::new(None),
+            handled: Cell::new(0),
+            handled_restart: Cell::new(false),
+        }
+    }; THREADS],
     restorers: [const { Cell::new(0) }; 65],
     served: Cell::new(0),
+    host_pid: Cell::new(0),
     aux: Cell::new(Aux { hwcap: 0, hwcap2: 0, sysinfo_ehdr: 0, minsigstksz: 0 }),
     exe_len: Cell::new(0),
 };
@@ -212,6 +253,8 @@ pub unsafe fn boot(b: Boot) -> Result<(), Error> {
     S.arena_hi.set(b.arena.0 + b.arena.1);
     let key = TlsKey::alloc(&SCHED, None).ok_or(Error { what: "a TLS key", errno: Errno::NOMEM })?;
     S.key.set(Some(key));
+    // SAFETY: getpid, before lockdown.
+    S.host_pid.set(unsafe { trap::gate(39, 0, 0, 0, 0, 0, 0) } as u32);
     let root = &S.threads[0];
     root.used.set(true);
     root.co.set(SCHED.current().raw());
@@ -225,6 +268,7 @@ pub unsafe fn boot(b: Boot) -> Result<(), Error> {
     // written only here, before the kernel reads it.
     let r = unsafe {
         (*host::ops()).task_exit = Some(task_exit);
+        (*host::ops()).signal_handler = Some(signal_handler);
         l::lkl_init(host::ops())
     };
     if r < 0 {
@@ -333,7 +377,13 @@ pub fn exec(path: &[u8], argv: &[&[u8]], envp: &[&[u8]], aux: Aux) -> Errno {
     S.aux.set(aux);
     // The loader's calls are the kernel's: in threaded mode with the CPU token (not a trap's
     // dispatch, which takes it itself), given up as the program starts.
-    match with_token(|| load(path, argv, envp, false)) {
+    let loaded = with_token(|| {
+        let r = load(path, argv, envp, false);
+        // The loader's calls ran with signals blocked: the program starts with init's mask.
+        unquiet(cur());
+        r
+    });
+    match loaded {
         Ok(regs) => {
             // Everything this function's callers have on the root's stack is dead from here: the
             // root's trap frames go below this point (`target`).
@@ -361,7 +411,7 @@ fn load(path: &[u8], argv: &[&[u8]], envp: &[&[u8]], replace: bool) -> Result<Re
     // SAFETY: the loader's scratch is used only here, once.
     let scratch = unsafe { SCRATCH.get() };
     let mut random = [0u8; 16];
-    let r = lkl_call(l::__lkl__NR_getrandom, [random.as_mut_ptr() as usize, 16, 0, 0, 0, 0]);
+    let r = lkl_quiet(l::__lkl__NR_getrandom, [random.as_mut_ptr() as usize, 16, 0, 0, 0, 0]);
     if r != 16 {
         return Err(Errno::IO);
     }
@@ -386,6 +436,24 @@ fn load(path: &[u8], argv: &[&[u8]], envp: &[&[u8]], replace: bool) -> Result<Re
         prog.close(&mut g);
         return Err(e);
     }
+    // The point of no return: the new image is checked, the old one still mapped (the kernel
+    // walks its robust futex list). The kernel's half of the exec (item 10): the other threads
+    // end, close-on-exec files close, caught signals' actions reset, the alternate stack goes,
+    // the task is named after the file. Its other threads die at their next call into the kernel:
+    // those parked in the runtime's own waits are woken to make one (the kill is sent before
+    // they run: they need the CPU, or in threaded mode the token, which this thread keeps until
+    // new_exec waits for them).
+    SCHED.interrupt_waits();
+    if replace {
+        // The old image's shared file mappings written back while the arena's fds for them are
+        // open: new_exec closes them (close-on-exec), and the unmap below only finds them closed.
+        writeback();
+    }
+    if let Err(e) = new_exec(path) {
+        prog.close(&mut g);
+        return Err(e);
+    }
+    cur().sig_top.set(0);
     set_exe(path);
     with_arena(|a, b| {
         if replace {
@@ -420,25 +488,38 @@ fn res(r: isize) -> Result<usize, Errno> {
 /// The NUL-terminated copy of a path for LKL (the loader's paths have none).
 static PATH: Local<[u8; exec::PATH_MAX + 1]> = Local::new([0; exec::PATH_MAX + 1]);
 
+/// `path` NUL-terminated in [`PATH`], for one LKL call.
+fn c_path(path: &[u8]) -> Result<usize, Errno> {
+    if path.len() >= exec::PATH_MAX || path.contains(&0) {
+        return Err(Errno::NAMETOOLONG);
+    }
+    // SAFETY: used only for the duration of the caller's calls, which don't touch it again.
+    let buf = unsafe { PATH.get() };
+    buf[..path.len()].copy_from_slice(path);
+    buf[path.len()] = 0;
+    Ok(buf.as_ptr() as usize)
+}
+
+/// The kernel's half of an exec (`new_exec`, item 10), as the exec-ing thread.
+fn new_exec(path: &[u8]) -> Result<(), Errno> {
+    let p = c_path(path)?;
+    res(lkl_quiet(l::__lkl__NR_new_exec, [p, 0, 0, 0, 0, 0])).map(|_| ())
+}
+
 impl Files for Guest {
     fn open(&mut self, path: &[u8]) -> arena::Result<u64> {
-        if path.len() >= exec::PATH_MAX || path.contains(&0) {
-            return Err(Errno::NAMETOOLONG);
-        }
-        // SAFETY: used only for the duration of these calls, which don't touch it again.
-        let buf = unsafe { PATH.get() };
-        buf[..path.len()].copy_from_slice(path);
-        buf[path.len()] = 0;
-        const O_CLOEXEC: usize = 0o2000000;
-        let p = buf.as_ptr() as usize;
+        let p = c_path(path)?;
+        // Not close-on-exec: the exec's kernel half (`new_exec`) runs between this open and the
+        // mapping, which closes the file (`exec::Program::map`).
+        const O_RDONLY: usize = 0;
         // execve's checks: a regular file this user may execute.
         const X_OK: usize = 1;
-        res(lkl_call(lkl::FACCESSAT as c_long, [k::AT_FDCWD as isize as usize, p, X_OK, 0, 0, 0]))?;
-        let fd = res(lkl_call(lkl::OPENAT as c_long, [k::AT_FDCWD as isize as usize, p, O_CLOEXEC, 0, 0, 0]))?;
+        res(lkl_quiet(lkl::FACCESSAT as c_long, [k::AT_FDCWD as isize as usize, p, X_OK, 0, 0, 0]))?;
+        let fd = res(lkl_quiet(lkl::OPENAT as c_long, [k::AT_FDCWD as isize as usize, p, O_RDONLY, 0, 0, 0]))?;
         let mut st = LklStat::default();
-        let r = res(lkl_call(lkl::FSTAT as c_long, [fd, &mut st as *mut _ as usize, 0, 0, 0, 0]));
+        let r = res(lkl_quiet(lkl::FSTAT as c_long, [fd, &mut st as *mut _ as usize, 0, 0, 0, 0]));
         if r.is_err() || st.st_mode & 0o170000 != 0o100000 {
-            lkl_call(l::__lkl__NR_close, [fd, 0, 0, 0, 0, 0]);
+            lkl_quiet(l::__lkl__NR_close, [fd, 0, 0, 0, 0, 0]);
             return Err(r.err().unwrap_or(Errno::ACCESS));
         }
         Ok(fd as u64)
@@ -446,16 +527,16 @@ impl Files for Guest {
 
     fn size(&mut self, file: u64) -> arena::Result<u64> {
         let mut st = LklStat::default();
-        res(lkl_call(lkl::FSTAT as c_long, [file as usize, &mut st as *mut _ as usize, 0, 0, 0, 0]))?;
+        res(lkl_quiet(lkl::FSTAT as c_long, [file as usize, &mut st as *mut _ as usize, 0, 0, 0, 0]))?;
         Ok(st.st_size as u64)
     }
 
     fn pread(&mut self, file: u64, offset: u64, buf: &mut [u8]) -> arena::Result<usize> {
-        res(lkl_call(l::__lkl__NR_pread64, [file as usize, buf.as_mut_ptr() as usize, buf.len(), offset as usize, 0, 0]))
+        res(lkl_quiet(l::__lkl__NR_pread64, [file as usize, buf.as_mut_ptr() as usize, buf.len(), offset as usize, 0, 0]))
     }
 
     fn close_file(&mut self, file: u64) {
-        lkl_call(l::__lkl__NR_close, [file as usize, 0, 0, 0, 0, 0]);
+        lkl_quiet(l::__lkl__NR_close, [file as usize, 0, 0, 0, 0, 0]);
     }
 }
 
@@ -463,14 +544,14 @@ impl Backing for Guest {
     fn read(&mut self, file: u64, offset: u64, addr: usize, len: usize) -> arena::Result<usize> {
         // An image's file from its host mapping, not through the kernel's page cache (`memblk`).
         // SAFETY: the arena's range being filled, nothing else's.
-        if let Some(n) = unsafe { memblk::pread(lkl_call, file as usize, offset, addr, len) } {
+        if let Some(n) = unsafe { memblk::pread(lkl_quiet, file as usize, offset, addr, len) } {
             return Ok(n);
         }
-        res(lkl_call(l::__lkl__NR_pread64, [file as usize, addr, len, offset as usize, 0, 0]))
+        res(lkl_quiet(l::__lkl__NR_pread64, [file as usize, addr, len, offset as usize, 0, 0]))
     }
 
     fn write(&mut self, file: u64, offset: u64, addr: usize, len: usize) -> arena::Result<usize> {
-        res(lkl_call(l::__lkl__NR_pwrite64, [file as usize, addr, len, offset as usize, 0, 0]))
+        res(lkl_quiet(l::__lkl__NR_pwrite64, [file as usize, addr, len, offset as usize, 0, 0]))
     }
 
     fn retain(&mut self, file: u64) -> arena::Result<u64> {
@@ -478,16 +559,16 @@ impl Backing for Guest {
         const F_DUPFD_CLOEXEC: usize = 1030;
         const O_ACCMODE: usize = 3;
         const O_RDWR: usize = 2;
-        let fl = res(lkl_call(lkl::FCNTL as c_long, [file as usize, F_GETFL, 0, 0, 0, 0]))?;
+        let fl = res(lkl_quiet(lkl::FCNTL as c_long, [file as usize, F_GETFL, 0, 0, 0, 0]))?;
         if fl & O_ACCMODE != O_RDWR {
             return Err(Errno::ACCESS);
         }
         // A high fd, out of the way of the program's own numbering (it is in its table).
-        res(lkl_call(lkl::FCNTL as c_long, [file as usize, F_DUPFD_CLOEXEC, 512, 0, 0, 0])).map(|f| f as u64)
+        res(lkl_quiet(lkl::FCNTL as c_long, [file as usize, F_DUPFD_CLOEXEC, 512, 0, 0, 0])).map(|f| f as u64)
     }
 
     fn close(&mut self, file: u64) {
-        lkl_call(l::__lkl__NR_close, [file as usize, 0, 0, 0, 0, 0]);
+        lkl_quiet(l::__lkl__NR_close, [file as usize, 0, 0, 0, 0, 0]);
     }
 
     fn release(&mut self, addr: usize, len: usize) -> arena::Result<()> {
@@ -496,7 +577,7 @@ impl Backing for Guest {
     }
 
     fn locate(&mut self, file: u64, offset: u64) -> Option<(usize, u64)> {
-        memblk::locate(lkl_call, file as usize, offset)
+        memblk::locate(lkl_quiet, file as usize, offset)
     }
 }
 
@@ -588,6 +669,43 @@ fn lkl_call(nr: c_long, a: [usize; 6]) -> isize {
     unsafe { l::lkl_syscall(nr, p.as_mut_ptr()) as isize }
 }
 
+/// The current program thread's runtime state: coroutine mode's by coroutine ([`me`]), threaded
+/// mode's by host thread (`par`'s slot, the same index into the table).
+fn cur() -> &'static Thread {
+    if par::enabled() { &S.threads[par::my_id() as usize] } else { me() }
+}
+
+/// `lkl_call` for the runtime's own calls in a dispatch (the loader's, the arena's file I/O, a
+/// clone's `new_thread`): a call's return is where the kernel delivers signals, and a handler must
+/// not run in the middle of the runtime's work (the arena held, an exec half done, a clone's
+/// child not made yet). So the first such call of a dispatch blocks every signal, and the
+/// dispatch's end restores the program's mask ([`unquiet`]), whose return delivers what came
+/// meanwhile, as at the program's call's return. Two more calls, only for dispatches that make
+/// calls of their own (file mappings, exec), not the forwarded ones.
+fn lkl_quiet(nr: c_long, a: [usize; 6]) -> isize {
+    let t = cur();
+    if t.quiet.get().is_none() {
+        const SIG_SETMASK: usize = 2;
+        let (all, mut old) = (!0u64, 0u64);
+        let r = lkl_call(
+            l::__lkl__NR_rt_sigprocmask,
+            [SIG_SETMASK, &all as *const u64 as usize, &mut old as *mut u64 as usize, 8, 0, 0],
+        );
+        if r == 0 {
+            t.quiet.set(Some(old));
+        }
+    }
+    lkl_call(nr, a)
+}
+
+/// The end of a dispatch's quiet calls ([`lkl_quiet`]): the program's mask back.
+fn unquiet(t: &Thread) {
+    if let Some(old) = t.quiet.take() {
+        const SIG_SETMASK: usize = 2;
+        lkl_call(l::__lkl__NR_rt_sigprocmask, [SIG_SETMASK, &old as *const u64 as usize, 0, 8, 0, 0]);
+    }
+}
+
 const CLONE_VM: usize = 0x100;
 const CLONE_VFORK: usize = 0x4000;
 const CLONE_THREAD: usize = 0x1_0000;
@@ -614,7 +732,7 @@ fn clone(uc: &Ucontext, a: [usize; 6]) -> Result<usize, Errno> {
         return Err(Errno::FAULT);
     }
     let coroutine_slot = if par::enabled() { 0 } else { S.threads.iter().position(|t| !t.used.get()).ok_or(Errno::AGAIN)? };
-    let tid = res(lkl_call(l::__lkl__NR_new_thread, [0; 6]))?;
+    let tid = res(lkl_quiet(l::__lkl__NR_new_thread, [0; 6]))?;
     let m = &uc.mcontext;
     let regs = Registers {
         rax: 0,
@@ -651,6 +769,7 @@ fn clone(uc: &Ucontext, a: [usize; 6]) -> Result<usize, Errno> {
         t.co.set(co.raw());
         t.attach.set(tid as i32);
         t.clear_tid.set(clear_tid);
+        t.reset_signals();
     }
     if flags & CLONE_PARENT_SETTID != 0 {
         write_user(ptid, tid as u32)?;
@@ -680,10 +799,9 @@ fn exit_group(code: usize) -> ! {
     writeback();
     if par::enabled() {
         // Threaded mode: end the whole sandbox at once (the gate's `exit_group` ends every host
-        // thread). Going through the kernel would leave a program thread blocked in an emulated
-        // futex (parked in the scheduler, not in LKL) unwoken: the kernel's group-exit reaches a
-        // task only at its next syscall, which such a thread never makes. The status is the
-        // program's own.
+        // thread), the status the program's own. Through the kernel, a thread running user code
+        // would hold the end up until its next call (threads in the runtime's own waits are
+        // woken, as in coroutine mode: `task_exit`), and only this process is in the sandbox.
         finish(code as i32 & 0xff);
     }
     lkl_call(l::__lkl__NR_exit_group, [code, 0, 0, 0, 0, 0]);
@@ -708,13 +826,24 @@ fn exit_thread(code: usize) -> ! {
 }
 
 /// The `task_exit` host op (item 6): the calling coroutine's task ended in its syscall, the CPU
-/// released and LKL's TLS for it cleared. pid 1: init's end, the sandbox's, with its wait status
-/// (a fatal signal as 128 + it, as a shell reports it). Otherwise a thread: its coroutine ends.
+/// released and LKL's TLS for it cleared. pid 1: init's end, the sandbox's, with its wait status:
+/// an exit code, or a signal the sandbox then dies of ([`die`]). Otherwise a thread: its
+/// coroutine ends.
+///
+/// A thread's end may be its process's (exit_group, a fatal signal: the kernel has sent every
+/// other thread its kill before this one ends): the threads parked in the runtime's own waits (an
+/// emulated futex, a host fd) aren't in the kernel to be ended, so they are woken to make a call,
+/// at which the kernel ends them (`futex_call`, `host::hostfd_rw`). Without it a process whose
+/// other thread waited in a futex, or read a silent stdin, never ended.
 unsafe extern "C" fn task_exit(pid: core::ffi::c_int, status: core::ffi::c_int) {
     if pid == 1 {
-        let code = if status & 0x7f == 0 { (status >> 8) & 0xff } else { 128 + (status & 0x7f) };
-        finish(code);
+        if status & 0x7f == 0 {
+            finish((status >> 8) & 0xff);
+        }
+        die(status & 0x7f);
     }
+    SCHED.interrupt_waits();
+    cur().reset_signals();
     if par::enabled() {
         // A program thread's guest task ended: end its host thread (its Sched coroutine is freed
         // when the slot is reused). Never returns.
@@ -736,48 +865,334 @@ unsafe extern "C" fn task_exit(pid: core::ffi::c_int, status: core::ffi::c_int) 
 // ------------------------------------------------------------------------------------------------
 // Numbers the dispatcher looks at before routing.
 
-const NR_KILL: usize = 62;
 const NR_READLINK: usize = 89;
 const NR_READLINKAT: usize = 267;
-const NR_TKILL: usize = 200;
-const NR_TGKILL: usize = 234;
+const NR_RT_SIGRETURN: u64 = 15;
+
+/// Calls that send a signal: after one, the threads parked in the runtime's own waits are woken
+/// to take it (`SCHED.interrupt_waits`). kill, tkill, tgkill, rt_sigqueueinfo,
+/// rt_tgsigqueueinfo, pidfd_send_signal.
+fn sends_signal(nr: usize) -> bool {
+    matches!(nr, 62 | 200 | 234 | 129 | 297 | 424)
+}
 
 // ------------------------------------------------------------------------------------------------
-// STOPGAP(item 8): signals the program sends its own process.
+// Signal delivery (the kernel series' item 8): the program's handlers, run by the runtime.
+//
+// The kernel decides everything but running the handler: which signal, when (a call's return to
+// the program), the handler's mask, `SA_RESETHAND`, restart or `EINTR`, the default actions. It
+// calls `signal_handler` inside the call's `lkl_syscall`, with the CPU released, on the trapped
+// thread's coroutine (in threaded mode its host thread), deep in the dispatch of the trap. From
+// there, as Linux's `setup_rt_frame` (arch/x86/kernel/signal_64.c) would:
+//
+// - **The frame.** Below the trapped sp and its red zone, or at the top of the alternate stack
+//   (`SA_ONSTACK`, a stack set, not already on it): the FPU state (the trap's xsave area, copied,
+//   64-aligned), then `struct rt_sigframe`: the return address (the program's restorer, kept from
+//   its `rt_sigaction`: LKL's sigaction has none), a kernel `ucontext` (the trap's registers,
+//   `uc_sigmask` the mask the kernel will restore, `uc_stack` the thread's alternate stack) and
+//   the siginfo. sp % 16 == 8 at the handler, as if called.
+// - **The call.** `context::call_program` saves the runtime's place (a [`SigRec`] in this frame,
+//   linked from the thread's `sig_top`) and jumps to `handler(sig, &info, &uc)` on that stack, as
+//   the program: its FS, a fresh FPU control state; in threaded mode without the CPU token. The
+//   handler's own calls trap as any: their frames go below the saved place ([`handler_top`], the
+//   target hook's answer while a handler runs), and they may block, nest other handlers, exec.
+// - **The return.** The program's restorer makes `rt_sigreturn`, which traps (the filter allows
+//   it only from the gate). [`sigreturn`] finds the record whose frame it names, copies the
+//   frame's registers (the handler may have changed them: Go's preemption, musl's cancellation)
+//   and FPU state into the trap the handler interrupted, its `uc_sigmask` and `uc_stack` to where
+//   the kernel reads them back, and jumps back into `signal_handler`, which returns to the kernel
+//   1 (the call restarts if it would) or 0 if the program counter moved (`EINTR`).
+// - **A handler that never returns** (`siglongjmp`): its record and the dispatch frames above it
+//   are dead. The target hook drops records whose handler the program has left (its sp above the
+//   frame, or off the alternate stack it ran on) before placing the next trap's frame, so 50
+//   `siglongjmp`s don't stack 50 dispatches. The kernel holds nothing across the op.
+// - **Not at a program call.** A handler must not run in the middle of the runtime's own work: its
+//   own calls in a dispatch run with signals blocked (`lkl_quiet`). A signal for a thread parked
+//   in a wait of the runtime's (an emulated futex, a host fd) is taken when it is woken
+//   (`Sched::interrupt_waits`: after a `kill`, a timer, a thread's end) and makes a call.
+//
+// Known limits: a signal for a thread running user code waits for its next call into the kernel
+// (the series leaves out interrupting user code); faults (SIGSEGV, SIGFPE) are the host's and end
+// the sandbox, not the program's handlers'.
 
-const SIGCHLD: usize = 17;
-const SIGCONT: usize = 18;
-const SIGSTOP: usize = 19;
-const SIGTTOU: usize = 22;
-const SIGURG: usize = 23;
-const SIGWINCH: usize = 28;
+const SA_ONSTACK: u64 = 0x0800_0000;
+const SA_RESTART: u64 = 0x1000_0000;
+const SS_DISABLE: i32 = 2;
+const SIGSEGV: i32 = 11;
+const SIGPIPE: i32 = 13;
+const SIGSYS: i32 = 31;
+/// How far below its frame a handler on the program's own stack is still taken to be running.
+const HANDLER_REACH: usize = 16 << 20;
 
-/// `kill`, `tkill`, `tgkill` aimed at our own process: what its action would do, done here (LKL
-/// records actions and masks but delivers nothing to the program yet; and its init would ignore
-/// a default-fatal signal, as Linux's does). Other targets: LKL's.
-fn self_signal(nr: usize, a: [usize; 6]) -> Option<isize> {
-    let pid = lkl_call(l::__lkl__NR_getpid, [0; 6]);
-    let sig = match nr {
-        NR_KILL if a[0] as i32 == 0 || a[0] as isize == pid => a[1],
-        NR_TGKILL if a[0] as isize == pid => a[2],
-        NR_TKILL if lkl_call(l::__lkl__NR_tgkill, [pid as usize, a[0], 0, 0, 0, 0]) == 0 => a[1],
-        _ => return None,
+/// A handler the runtime is running for a thread, in [`signal_handler`]'s frame.
+struct SigRec {
+    /// The next outer one (0: none).
+    prev: usize,
+    /// The `rt_sigframe`'s start (its return address): the handler's `rt_sigreturn` traps with sp
+    /// just above it.
+    frame: usize,
+    /// The alternate stack it runs on, `[lo, hi)`, if it was switched to.
+    alt: Option<(usize, usize)>,
+    /// The runtime's place: the handler's traps go below it.
+    jmp: JmpBuf,
+    /// The trap the handler interrupted (its ucontext), and its program counter then.
+    uc: usize,
+    rip: u64,
+    /// Its FPU state's size (the copy in the frame).
+    fp_len: usize,
+    /// Where the kernel reads back the mask and alternate stack sigreturn restores.
+    mask: *mut u64,
+    stack: *mut StackT,
+}
+
+impl SigRec {
+    /// Whether the program, trapping at `sp`, is still inside this handler.
+    fn live(&self, sp: usize) -> bool {
+        match self.alt {
+            Some((lo, _)) => sp >= lo && sp < self.frame,
+            None => sp < self.frame && self.frame - sp < HANDLER_REACH,
+        }
+    }
+}
+
+/// # Safety
+/// `r` is a live record of the current thread's (`sig_top`'s chain).
+unsafe fn rec<'a>(r: usize) -> &'a SigRec {
+    // SAFETY: the caller's.
+    unsafe { &*(r as *const SigRec) }
+}
+
+/// The target hook's answer for a program trap while handlers run: below the innermost one's
+/// saved place, after dropping those the program has left (a `siglongjmp`). An `rt_sigreturn`
+/// names its own handler (sp is its frame + 8). `None`: no handler runs.
+fn handler_top(uc: &Ucontext) -> Option<usize> {
+    let t = cur();
+    let sp = uc.mcontext.rsp as usize;
+    let mut r = t.sig_top.get();
+    if uc.mcontext.rax == NR_RT_SIGRETURN {
+        while r != 0 {
+            // SAFETY: the chain's records are live until popped here.
+            let x = unsafe { rec(r) };
+            if x.frame.wrapping_add(8) == sp {
+                t.sig_top.set(r);
+                return Some(x.jmp.sp());
+            }
+            r = x.prev;
+        }
+        r = t.sig_top.get();
+    }
+    // SAFETY: as above.
+    while r != 0 && !unsafe { rec(r) }.live(sp) {
+        r = unsafe { rec(r) }.prev;
+    }
+    t.sig_top.set(r);
+    // SAFETY: as above.
+    (r != 0).then(|| unsafe { rec(r) }.jmp.sp())
+}
+
+/// The size of the FPU state at `fp` (a frame's xsave area): `fpstate`'s `sw_reserved` says, when
+/// its magic is there (`FP_XSTATE_MAGIC1`), else the legacy 512 bytes.
+///
+/// # Safety
+/// `fp` is 0 or a frame's FPU state.
+unsafe fn fpstate_len(fp: usize) -> usize {
+    if fp == 0 {
+        return 0;
+    }
+    const FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
+    // SAFETY: the caller's; sw_reserved is at 464 of the 512-byte legacy area.
+    let (magic, size) = unsafe { (((fp + 464) as *const u32).read(), ((fp + 468) as *const u32).read()) };
+    if magic == FP_XSTATE_MAGIC1 && (512..=64 * 1024).contains(&(size as usize)) { size as usize } else { 512 }
+}
+
+/// The `signal_handler` host op (see the section comment).
+unsafe extern "C" fn signal_handler(sig: *mut l::lkl_signal) -> core::ffi::c_int {
+    // SAFETY: the kernel's, for the call.
+    let s = unsafe { &*sig };
+    let t = cur();
+    let ucp = t.uc.get();
+    if ucp == 0 || S.phase.get() != Phase::Program {
+        // Not at a program trap (the runtime's own calls outside a dispatch, setup code): there is
+        // nothing to interrupt. As if the handler returned at once.
+        return 1;
+    }
+    debug_assert!(t.quiet.get().is_none(), "a handler at a quiet call");
+    // SAFETY: the dispatch's trap frame, live below us.
+    let uc = unsafe { &mut *(ucp as *mut Ucontext) };
+    let signo = s.sig as usize;
+    let restorer = S.restorers.get(signo).map_or(0, Cell::get);
+    // SAFETY: the kernel's stack_t and sigset_t, for the call.
+    let (stack, mask) = unsafe { (*(s.stack as *const StackT), *(s.mask as *const u64)) };
+    let sp = uc.mcontext.rsp as usize;
+    let on_alt = stack.size != 0 && (stack.sp..stack.sp.wrapping_add(stack.size)).contains(&sp);
+    let alt = (s.flags & SA_ONSTACK != 0 && stack.flags & SS_DISABLE == 0 && stack.size != 0 && !on_alt)
+        .then(|| (stack.sp, stack.sp + stack.size));
+    let mut top = match alt {
+        Some((_, hi)) => hi,
+        None => sp.wrapping_sub(128),
     };
-    if sig == 0 || sig > 64 {
-        return None;
-    }
-    let mut old = LklSigaction::default();
-    if lkl_call(lkl::RT_SIGACTION as c_long, [sig, 0, &mut old as *mut _ as usize, 8, 0, 0]) != 0 {
-        return None;
-    }
-    const SIG_DFL: usize = 0;
-    let ignored_by_default = matches!(sig, SIGCHLD | SIGCONT | SIGURG | SIGWINCH | SIGSTOP..=SIGTTOU);
-    if old.handler == SIG_DFL && !ignored_by_default {
+    let fp = uc.mcontext.fpregs;
+    // SAFETY: the trap's own FPU state.
+    let fp_len = unsafe { fpstate_len(fp) };
+    top = top.wrapping_sub(fp_len) & !63;
+    let fp_at = top;
+    let frame = (top.wrapping_sub(8 + size_of::<Ucontext>() + 128) & !15).wrapping_sub(8);
+    if restorer == 0 || frame > top || !user(frame, top - frame + fp_len) {
+        // No way to return (x86-64 requires SA_RESTORER), or no room: Linux's force_sigsegv.
         writeback();
-        finish(128 + sig as i32);
+        die(SIGSEGV);
     }
-    // TODO(item 8): a handler is recorded but not run; SIG_IGN and ignored defaults do nothing.
-    Some(0)
+    let fuc = frame + 8;
+    let info = fuc + size_of::<Ucontext>();
+    let mut u = *uc;
+    u.link = 0;
+    u.stack = stack;
+    u.sigmask = mask;
+    u.mcontext.fpregs = if fp != 0 { fp_at } else { 0 };
+    // SAFETY: checked to be program memory, room for all of it; the trap's FPU state, the
+    // kernel's 128-byte siginfo.
+    unsafe {
+        if fp != 0 {
+            core::ptr::copy_nonoverlapping(fp as *const u8, fp_at as *mut u8, fp_len);
+        }
+        (frame as *mut usize).write(restorer);
+        (fuc as *mut Ucontext).write_unaligned(u);
+        core::ptr::copy_nonoverlapping(s.info as *const u8, info as *mut u8, 128);
+    }
+    let mut r = SigRec {
+        prev: t.sig_top.get(),
+        frame,
+        alt,
+        jmp: JmpBuf::new(),
+        uc: ucp,
+        rip: uc.mcontext.rip,
+        fp_len,
+        mask: s.mask as *mut u64,
+        stack: s.stack as *mut StackT,
+    };
+    let rp: *mut SigRec = &raw mut r;
+    t.sig_top.set(rp as usize);
+    t.handled.set(t.handled.get().wrapping_add(1));
+    t.handled_restart.set(s.flags & SA_RESTART != 0);
+    // handler(sig) or, under SA_SIGINFO, handler(sig, info, uc): the same registers either way,
+    // as Linux sets them.
+    let call = ProgramCall {
+        rip: s.handler as usize,
+        rsp: frame,
+        rdi: signo,
+        rsi: info,
+        rdx: fuc,
+        fs: uc.mcontext.fs_base as usize,
+    };
+    if par::enabled() {
+        // The program runs without the token; the handler's rt_sigreturn takes it back.
+        par::leave(par::my_id());
+    }
+    // SAFETY: the frame is built; below the saved place the control stack is free for the
+    // handler's traps (`handler_top`). Only `sigreturn` comes back, through the record.
+    let restart = unsafe { context::call_program(&raw mut (*rp).jmp, &call) };
+    t.sig_top.set(r.prev);
+    t.uc.set(ucp);
+    restart as core::ffi::c_int
+}
+
+/// The program's `rt_sigreturn`, trapped (`uc` is that trap's): the end of a handler the runtime
+/// ran (see the section comment), which never returns here; or, if no handler of ours has this
+/// frame (the program built it, or its handler's record was dropped), a sigreturn of its own,
+/// done here: the frame's registers become this trap's, its mask and alternate stack the
+/// kernel's.
+fn sigreturn(uc: &mut Ucontext) -> isize {
+    let t = cur();
+    let fuc_at = uc.mcontext.rsp as usize;
+    let Ok(f) = read_user::<Ucontext>(fuc_at) else {
+        writeback();
+        die(SIGSEGV)
+    };
+    let frame = fuc_at.wrapping_sub(8);
+    let mut r = t.sig_top.get();
+    // SAFETY: the chain's records are live (`handler_top` dropped the dead ones).
+    while r != 0 && unsafe { rec(r) }.frame != frame {
+        r = unsafe { rec(r) }.prev;
+    }
+    let fs = uc.mcontext.fs_base;
+    if r == 0 {
+        let fp_len = if f.mcontext.fpregs != 0 && user(f.mcontext.fpregs, 512) {
+            // SAFETY: checked (the legacy part; the copy is bounded by the trap's own size).
+            unsafe { fpstate_len(f.mcontext.fpregs) }
+        } else {
+            0
+        };
+        let fp_len = if user(f.mcontext.fpregs, fp_len) { fp_len } else { 0 };
+        restore_registers(uc, &f, fp_len);
+        uc.mcontext.fs_base = fs;
+        const SIG_SETMASK: usize = 2;
+        lkl_call(l::__lkl__NR_rt_sigprocmask, [SIG_SETMASK, &f.sigmask as *const u64 as usize, 0, 8, 0, 0]);
+        lkl_call(l::__lkl__NR_sigaltstack, [&f.stack as *const StackT as usize, 0, 0, 0, 0, 0]);
+        return f.mcontext.rax as isize;
+    }
+    // SAFETY: found in the chain: live, its trap below it on this stack.
+    let x = unsafe { rec(r) };
+    // SAFETY: the interrupted trap's frame, live under `signal_handler`.
+    let orig = unsafe { &mut *(x.uc as *mut Ucontext) };
+    let fp_len = if user(f.mcontext.fpregs, x.fp_len) { x.fp_len } else { 0 };
+    restore_registers(orig, &f, fp_len);
+    // The FS base isn't in a signal frame: it stays as the handler left it.
+    orig.mcontext.fs_base = fs;
+    // SAFETY: the kernel's, for the op's duration (which this is inside of).
+    unsafe {
+        *x.mask = f.sigmask;
+        *x.stack = f.stack;
+    }
+    t.sig_top.set(r);
+    let moved = orig.mcontext.rip != x.rip;
+    // SAFETY: the record's call is active below this frame, on this stack.
+    unsafe { context::jump(&x.jmp, if moved { 0 } else { 1 }) }
+}
+
+/// A signal frame's registers into the trap `to` will resume (`restore_sigcontext`): the general
+/// ones, rip and the flags a program may set; and `fp_len` bytes of FPU state over the trap's
+/// own, if both have one. Not the segment selectors, nor the FS base (not in a frame).
+fn restore_registers(to: &mut Ucontext, f: &Ucontext, fp_len: usize) {
+    let (d, m) = (&mut to.mcontext, &f.mcontext);
+    (d.r8, d.r9, d.r10, d.r11, d.r12, d.r13, d.r14, d.r15) = (m.r8, m.r9, m.r10, m.r11, m.r12, m.r13, m.r14, m.r15);
+    (d.rdi, d.rsi, d.rbp, d.rbx, d.rdx, d.rax, d.rcx, d.rsp, d.rip) =
+        (m.rdi, m.rsi, m.rbp, m.rbx, m.rdx, m.rax, m.rcx, m.rsp, m.rip);
+    // Linux's FIX_EFLAGS: AC, OF, DF, TF, SF, ZF, AF, PF, CF, RF.
+    const FIX_EFLAGS: u64 = 0x4_0000 | 0x800 | 0x400 | 0x100 | 0x80 | 0x40 | 0x10 | 0x4 | 0x1 | 0x1_0000;
+    d.eflags = (d.eflags & !FIX_EFLAGS) | (m.eflags & FIX_EFLAGS);
+    if fp_len != 0 && d.fpregs != 0 && m.fpregs != 0 {
+        // SAFETY: the trap's xsave area is as large as it says (the kernel's frame); the
+        // program's was checked by the caller.
+        unsafe {
+            let room = fpstate_len(d.fpregs);
+            core::ptr::copy_nonoverlapping(m.fpregs as *const u8, d.fpregs as *mut u8, fp_len.min(room));
+        }
+    }
+}
+
+/// The guest's process died of `sig` (its default action): so does the sandbox, as the program
+/// would natively (a shell sees `abort`'s SIGABRT). The filter allows `kill` of this process
+/// only, with a signal; the host's dispositions are the defaults but for SIGSYS (the trap's) and
+/// SIGPIPE (ignored, so a closed stdout is EPIPE): SIGSYS comes from the filter itself (a call
+/// it kills: any number with the x32 bit), SIGPIPE can't, and ends as 128 + 13, a shell's
+/// number for it. The same if a death by signal fails (the filter's `--deny=errno`, or before
+/// any filter).
+fn die(sig: i32) -> ! {
+    match sig {
+        SIGSYS => {
+            // SAFETY: the filter kills the process for it.
+            unsafe { trap::gate(0x4000_0000 | 39, 0, 0, 0, 0, 0, 0) };
+        }
+        SIGPIPE => {}
+        _ => {
+            // SAFETY: a signal to this process, whose default action ends it: in coroutine mode at
+            // this call's return; in threaded mode on the thread the kernel picks, which ends the
+            // rest (the wait below, until then).
+            unsafe { trap::gate(filter::NR_KILL as usize, S.host_pid.get() as usize, sig as usize, 0, 0, 0, 0) };
+            let _ = trap::ppoll(None, Some(&xabi::Timespec { tv_sec: 1, tv_nsec: 0 }));
+        }
+    }
+    finish(128 + sig)
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -807,13 +1222,17 @@ fn user_cstr(p: usize, max: usize) -> Result<&'static [u8], Errno> {
 
 /// STOPGAP(item 10, exec's kernel half): `/proc/self/exe` is init's `/init` in the guest, so ld.so
 /// can't find `$ORIGIN` (RUNPATHs like the fixtures'); the dispatcher answers `readlink` of it
-/// with the path exec loaded, made absolute.
+/// with the path exec loaded, made absolute. `new_exec` doesn't change it: it doesn't set the
+/// task's `mm->exe_file` (`set_mm_exe_file`, from the file the host loaded), and every host task
+/// shares init's stub mm, so one link would be every process's. What the kernel needs: new_exec
+/// given the file (or opening `path` itself) and an exe link per process (its own mm, as fork
+/// mode's processes will need anyway, or the link kept on the task for `proc_exe_link`).
 fn set_exe(path: &[u8]) {
     // SAFETY: only exec and readlink use it, never at once.
     let exe = unsafe { EXE.get() };
     let mut n = 0;
     if path.first() != Some(&b'/') {
-        let r = lkl_call(l::__lkl__NR_getcwd, [exe.as_mut_ptr() as usize, exe.len(), 0, 0, 0, 0]);
+        let r = lkl_quiet(l::__lkl__NR_getcwd, [exe.as_mut_ptr() as usize, exe.len(), 0, 0, 0, 0]);
         if r > 0 {
             n = r as usize - 1; // without its NUL
             if n > 1 && n < exe.len() {
@@ -846,8 +1265,9 @@ fn readlink_exe(path: usize, buf: usize, size: usize) -> Option<isize> {
 
 /// `execve(path, argv, envp)` inside the guest: the new image replaces the old one in the arena
 /// and the calling thread resumes at its start. Errors before the point of no return leave the old
-/// image as it was. Not yet: the kernel's half (close-on-exec fds, handlers reset: item 10) and
-/// ending the process's other threads.
+/// image as it was. The kernel's half (the other threads ended, close-on-exec files, handlers
+/// reset: item 10) is `new_exec`, in `load`. Handlers the runtime was running for this thread
+/// are gone with the image (an exec from a handler).
 fn execve(uc: &mut Ucontext, path: usize, argv: usize, envp: usize) -> Result<usize, Errno> {
     // SAFETY: the guest's execve runs one at a time (nothing in it suspends while these are
     // being filled: user memory is read directly).
@@ -918,14 +1338,23 @@ fn target(uc: &Ucontext) -> usize {
     } else {
         SCHED.stack()
     };
-    if size == 0 {
+    let top = if size == 0 {
         // The root: the host thread's own stack, whose extent the scheduler doesn't know.
         let top = S.root_top.get();
         // The program runs on the arena; anything else is runtime code on the root's stack.
-        let program = top != 0 && (S.arena_lo.get()..S.arena_hi.get()).contains(&sp);
-        return if program { top } else { trap::below_red_zone(uc) };
-    }
-    if (lo..lo + size).contains(&sp) { trap::below_red_zone(uc) } else { lo + size }
+        if top == 0 || !(S.arena_lo.get()..S.arena_hi.get()).contains(&sp) {
+            return trap::below_red_zone(uc);
+        }
+        top
+    } else {
+        if (lo..lo + size).contains(&sp) {
+            return trap::below_red_zone(uc);
+        }
+        lo + size
+    };
+    // A program trap: while a handler the runtime runs for this thread is live, the control
+    // stack above its saved place is in use.
+    handler_top(uc).unwrap_or(top)
 }
 
 /// The dispatcher (`trap::Dispatch`).
@@ -937,13 +1366,11 @@ fn dispatch(uc: &mut Ucontext) {
         // scheduler; the exit paths end the host thread holding it. Program code runs in parallel
         // outside the token, so no fairness yield is needed.
         let id = par::enter();
-        let r = serve(uc, nr, a);
-        uc.set_return(r);
+        served(uc, nr, a);
         par::leave(id);
         return;
     }
-    let r = serve(uc, nr, a);
-    uc.set_return(r);
+    served(uc, nr, a);
     // No preemption here: a thread whose calls never block (a poll with timeout 0 in a loop)
     // would keep every other coroutine from running, a new thread among them (it isn't the
     // kernel's to schedule until its first call attaches it). So every so many calls, the others
@@ -956,12 +1383,19 @@ fn dispatch(uc: &mut Ucontext) {
 }
 
 
+/// One trap served: the call, its result, the program's mask back if the runtime's own calls
+/// blocked signals ([`unquiet`]: what came meanwhile is delivered then). `uc` is the thread's
+/// innermost trap meanwhile, which a handler interrupts.
+fn served(uc: &mut Ucontext, nr: usize, a: [usize; 6]) {
+    let t = cur();
+    let outer = t.uc.replace(uc as *mut Ucontext as usize);
+    let r = serve(uc, nr, a);
+    uc.set_return(r);
+    unquiet(t);
+    t.uc.set(outer);
+}
+
 fn serve(uc: &mut Ucontext, nr: usize, a: [usize; 6]) -> isize {
-    if matches!(nr, NR_KILL | NR_TKILL | NR_TGKILL)
-        && let Some(r) = self_signal(nr, a)
-    {
-        return r;
-    }
     // STOPGAP(item 10): readlink, readlinkat(AT_FDCWD) of /proc/self/exe.
     let exe = match nr {
         NR_READLINK => readlink_exe(a[0], a[1], a[2]),
@@ -972,6 +1406,11 @@ fn serve(uc: &mut Ucontext, nr: usize, a: [usize; 6]) -> isize {
         return r;
     }
     match sysmap::route(nr) {
+        Route::Lkl(n) if sends_signal(nr) => {
+            let r = lkl_call(n as c_long, a);
+            SCHED.interrupt_waits();
+            r
+        }
         Route::Lkl(n) => lkl_call(n as c_long, a),
         Route::Rewrite(rw) => rewrite(rw, a),
         Route::Emulate(e) => emulate(uc, e, nr, a),
@@ -1078,7 +1517,16 @@ fn rewrite(rw: Rewrite, a: [usize; 6]) -> isize {
             );
             if r < 0 { r } else { xabi::alarm_remaining(&old) as isize }
         }
-        Rewrite::Pause => lkl_call(lkl::PPOLL as c_long, [0; 6]),
+        Rewrite::Pause => {
+            // rt_sigsuspend with the mask as it is: sleeps until a handler has run, then EINTR.
+            let mut m = 0u64;
+            const SIG_BLOCK: usize = 0;
+            let r = lkl_call(l::__lkl__NR_rt_sigprocmask, [SIG_BLOCK, 0, &mut m as *mut u64 as usize, 8, 0, 0]);
+            if r < 0 {
+                return r;
+            }
+            lkl_call(l::__lkl__NR_rt_sigsuspend, [&m as *const u64 as usize, 8, 0, 0, 0, 0])
+        }
         Rewrite::Uname => {
             if !user(a[0], xabi::UTS_SIZE) {
                 return -(Errno::FAULT.raw_os_error() as isize);
@@ -1114,16 +1562,20 @@ fn sigaction(a: [usize; 6]) -> isize {
     let mut old = LklSigaction::default();
     let np = new.as_ref().map_or(0, |(n, _)| n as *const LklSigaction as usize);
     let op = if oldp != 0 { &mut old as *mut LklSigaction as usize } else { 0 };
+    // The restorer is recorded first: the signal may be delivered at this very call's return
+    // (pending and now caught), its handler returning through it. Put back if LKL refuses.
+    let slot = S.restorers.get(sig).filter(|_| sig != 0);
+    let prev = slot.map_or(0, Cell::get);
+    if let (Some(slot), Some((_, restorer))) = (slot, new) {
+        slot.set(restorer);
+    }
     let r = lkl_call(lkl::RT_SIGACTION as c_long, [sig, np, op, 8, 0, 0]);
-    // LKL checked `sig` (1..=64): the table is safe to index now.
-    if r == 0 {
-        let slot = &S.restorers[sig];
-        if oldp != 0 {
-            let _ = write_user(oldp, xabi::sigaction_to_x86(&old, slot.get()));
+    match slot {
+        Some(slot) if r != 0 => slot.set(prev),
+        Some(_) if oldp != 0 => {
+            let _ = write_user(oldp, xabi::sigaction_to_x86(&old, prev));
         }
-        if let Some((_, restorer)) = new {
-            slot.set(restorer);
-        }
+        _ => {}
     }
     r
 }
@@ -1246,14 +1698,12 @@ fn emulate(uc: &mut Ucontext, e: Emulate, nr: usize, a: [usize; 6]) -> isize {
                 _ => -(Errno::INVAL.raw_os_error() as isize),
             }
         }
-        // TODO: the guest's own execve (argv and envp copied out before the old image goes).
         E::Execve if !program => -(Errno::NOSYS.raw_os_error() as isize),
         E::Execve => ret(execve(uc, a[0], a[1], a[2])),
         // execveat(dfd, path, argv, envp, flags): from the working directory only, so far.
         E::Execveat if program && a[0] as i32 == k::AT_FDCWD && a[4] == 0 => ret(execve(uc, a[1], a[2], a[3])),
         E::Execveat => -(Errno::NOSYS.raw_os_error() as isize),
-        // TODO(item 8): no handler is run, so there is nothing to return from.
-        E::SigReturn => -(Errno::NOSYS.raw_os_error() as isize),
+        E::SigReturn => sigreturn(uc),
         E::Prctl => {
             const PR_SET_MM: usize = 35;
             const PR_SET_VMA: usize = 0x5356_4d41;
@@ -1279,6 +1729,35 @@ fn futex_call(a: [usize; 6]) -> isize {
             Err(e) => return -(e.raw_os_error() as isize),
         }
     }
-    // SAFETY: uaddr is program memory (checked).
-    ret(unsafe { futexes().futex(&SCHED, uaddr as *const u32, op, val, ts.as_ref(), val3) })
+    loop {
+        // A wait of the runtime's own, not the kernel's: a group exit, an exec's kill or a signal
+        // can't reach it, so `SCHED.interrupt_waits` wakes it (Interrupted: EINTR here) to ask.
+        SCHED.set_interruptible(true);
+        // SAFETY: uaddr is program memory (checked).
+        let r = unsafe { futexes().futex(&SCHED, uaddr as *const u32, op, val, ts.as_ref(), val3) };
+        SCHED.set_interruptible(false);
+        if r != Err(Errno::INTR) {
+            return ret(r);
+        }
+        // Ask the kernel: one call, at whose start a killed task ends (the task_exit host op) and
+        // at whose return a caught signal's handler runs. Neither: nothing for this thread, and an
+        // untimed wait on an unchanged word waits again (the wake is invisible); otherwise a
+        // wakeup for nothing, which a futex wait may return (0). A handler ran: EINTR, as Linux's
+        // (or the wait again, for an untimed wait under SA_RESTART: Linux's -ERESTARTSYS).
+        let t = cur();
+        let before = t.handled.get();
+        lkl_call(l::__lkl__NR_getpid, [0; 6]);
+        if t.handled.get() == before {
+            // SAFETY: program memory (checked), 4-aligned (futex checked), read atomically.
+            let now = unsafe { core::sync::atomic::AtomicU32::from_ptr(uaddr as *mut u32) }
+                .load(core::sync::atomic::Ordering::SeqCst);
+            if ts.is_none() && now == val {
+                continue;
+            }
+            return 0;
+        }
+        if !(t.handled_restart.get() && ts.is_none()) {
+            return -(Errno::INTR.raw_os_error() as isize);
+        }
+    }
 }

@@ -17,9 +17,18 @@ pub fn spawn_bounded(
 ) -> Result<(ExitStatus, Duration, String, String), Failed> {
     let mut child = cmd.spawn().map_err(|e| format!("spawn {cmd:?}: {e}"))?;
     let pid = child.id() as libc::pid_t;
-    if let (Some(input), Some(mut w)) = (stdin, child.stdin.take()) {
-        thread::spawn(move || w.write_all(input.as_bytes()));
-    }
+    // With input, written and closed; with none, a piped stdin is held open (and silent) until the
+    // child has ended: `take` in the pattern dropped it at once, and a reader the case meant to
+    // block saw EOF.
+    let held = match stdin {
+        Some(input) => {
+            if let Some(mut w) = child.stdin.take() {
+                thread::spawn(move || w.write_all(input.as_bytes()));
+            }
+            None
+        }
+        None => child.stdin.take(),
+    };
     let drain = |r: Option<Box<dyn Read + Send>>| {
         thread::spawn(move || {
             let mut s = String::new();
@@ -54,6 +63,7 @@ pub fn spawn_bounded(
         }
         thread::sleep(Duration::from_millis(2));
     };
+    drop(held);
     let cpu = |t: libc::timeval| Duration::new(t.tv_sec as u64, t.tv_usec as u32 * 1000);
     let used = cpu(ru.ru_utime) + cpu(ru.ru_stime);
     let (stdout, stderr) = (out.join().unwrap(), err.join().unwrap());
