@@ -9,10 +9,12 @@
 //! - **Timers** ([`Cx::sleep_until`]) are deadlines on the scheduler's clock (CLOCK_MONOTONIC).
 //! - **Host fds** ([`Cx::readable`], [`poll_fd`]): fds the hooks hold (exobox's `HeldFd`), checked
 //!   with a `ppoll` of timeout 0 through the gate; one that isn't ready is watched by the
-//!   scheduler's idle wait (`host::SysHost::idle`: one `ppoll` over up to eight fds, which the
-//!   filter allows), and, while the program keeps the CPU busy and idle never runs, by
-//!   [`busy_poll`] from the dispatcher's turn-taking. Passed fds the guest polls (`tsi`'s
-//!   `hostfd_poll`) are watched the same way; when one is ready the executor tells the kernel
+//!   scheduler's idle wait (`host::SysHost::idle`, threaded mode's idler in `par`: one `ppoll`
+//!   over up to eight fds, which the filter allows), and, while the program keeps the CPU busy
+//!   and idle never runs, by [`busy_poll`] from the dispatcher's turn-taking (threaded mode: the
+//!   idler between hand-offs). Passed fds the guest polls (`tsi`'s `hostfd_poll`) or reads or
+//!   writes nonblocking (`host::hostfd_rw`'s EAGAIN) are watched the same way ([`HOSTFDS`], shared
+//!   by fork mode's processes); when one is ready the executor tells the kernel
 //!   (`lkl_hostfd_ready`).
 //!
 //! **Modes.** Coroutine mode: one host thread, so the queues are plain cells. The ready queue
@@ -80,9 +82,8 @@ struct Exec {
     timers: RefCell<Vec<Timer>>,
     next_timer: Cell<u64>,
     watches: RefCell<Vec<Watch>>,
-    /// Passed fds the guest polls and the host fd isn't ready for: (fd, events).
-    hostfds: RefCell<Vec<(i32, i16)>>,
-    /// Of those, the ones found ready: the kernel is told by the executor's coroutine.
+    /// Of the passed fds watched ([`HOSTFDS`]), the ones found ready: the kernel is told by the
+    /// executor's coroutine.
     hostfds_ready: RefCell<Vec<i32>>,
     last_busy_poll: Cell<u64>,
     /// The host-thread slot the executor's coroutine is bound to (`u16::MAX`: none, it runs
@@ -128,12 +129,32 @@ static E: Exec = Exec {
     timers: RefCell::new(Vec::new()),
     next_timer: Cell::new(0),
     watches: RefCell::new(Vec::new()),
-    hostfds: RefCell::new(Vec::new()),
     hostfds_ready: RefCell::new(Vec::new()),
     last_busy_poll: Cell::new(0),
     home: Cell::new(u16::MAX),
     drainer: Cell::new(None),
 };
+
+/// Passed fds the guest polls (or reads or writes nonblocking) and the host fd isn't ready for:
+/// (fd, events; events 0: a free entry), one entry per fd. In the shared section, not the
+/// executor's own memory: in fork mode a forked process's guest files are watched too, by init's
+/// process, whose idle wait (threaded mode's idler) polls them and whose executor tells the
+/// kernel. Touched only with the CPU token held. Entries go when they fire; a watch past the
+/// table's end is dropped (one per host fd: there are as many as the sandbox was given).
+#[unsafe(link_section = "exobox_shared")]
+static HOSTFDS: HostFds = HostFds([const { Cell::new((0, 0)) }; 16]);
+struct HostFds([Cell<(i32, i16)>; 16]);
+// SAFETY: touched with the CPU token held (one host thread at a time).
+unsafe impl Sync for HostFds {}
+
+impl HostFds {
+    fn each(&self) -> impl Iterator<Item = (i32, i16)> + '_ {
+        self.0.iter().map(Cell::get).filter(|x| x.1 != 0)
+    }
+    fn is_empty(&self) -> bool {
+        self.each().next().is_none()
+    }
+}
 
 /// Bind the executor's coroutine to host-thread slot `home` (fork mode: init's kernel thread).
 /// Before it starts.
@@ -427,14 +448,23 @@ impl Future for FdReady {
 /// A passed fd the guest polls whose host fd isn't ready: watched until it is, then the kernel
 /// is told (`tsi`'s `hostfd_poll`).
 pub fn watch_hostfd(fd: i32, events: i16) {
-    {
-        let mut h = E.hostfds.borrow_mut();
-        match h.iter_mut().find(|x| x.0 == fd) {
-            Some(x) => x.1 |= events,
-            None => h.push((fd, events)),
-        }
+    let h = &HOSTFDS.0;
+    match h.iter().find(|x| x.get().1 != 0 && x.get().0 == fd).or_else(|| h.iter().find(|x| x.get().1 == 0)) {
+        Some(x) => x.set((fd, x.get().1 | events)),
+        None => return,
     }
-    start();
+    // A forked process's watch is init's process's to poll and tell (its idle wait, its
+    // executor): this process's copy of the executor is no executor.
+    if !crate::par::forked() {
+        start();
+    }
+}
+
+/// Whether the idle wait has fds of the executor's to watch (threaded mode's idler is then handed
+/// the CPU token, `par`'s `give`). In a forked process the tasks' watches are a stale copy of
+/// init's: at worst the idler is handed the token for nothing.
+pub fn watching() -> bool {
+    !HOSTFDS.is_empty() || E.watches.try_borrow().map_or(true, |w| !w.is_empty())
 }
 
 /// The fds the idle wait should watch, after the ones it watches itself: up to `out.len()`,
@@ -449,13 +479,13 @@ pub fn idle_fds(out: &mut [PollFd]) -> usize {
             n += 1;
         }
     };
-    if let (Ok(w), Ok(h)) = (E.watches.try_borrow(), E.hostfds.try_borrow()) {
+    if let Ok(w) = E.watches.try_borrow() {
         for x in w.iter() {
             add(x.fd, x.events);
         }
-        for &(fd, events) in h.iter() {
-            add(fd, events);
-        }
+    }
+    for (fd, events) in HOSTFDS.each() {
+        add(fd, events);
     }
     n
 }
@@ -486,22 +516,19 @@ fn fd_fired(fd: i32, revents: i16) {
         w.wake();
     }
     let mut fired = false;
-    if let (Ok(mut h), Ok(mut r)) = (E.hostfds.try_borrow_mut(), E.hostfds_ready.try_borrow_mut()) {
-        h.retain(|x| {
-            if x.0 == fd && x.1 & any != 0 {
+    if let Ok(mut r) = E.hostfds_ready.try_borrow_mut() {
+        for x in &HOSTFDS.0 {
+            let (xfd, events) = x.get();
+            if events != 0 && xfd == fd && events & any != 0 {
+                x.set((0, 0));
                 r.push(fd);
                 fired = true;
-                false
-            } else {
-                true
             }
-        });
+        }
     }
-    if fired
-        && E.parked.get()
-        && let Some(t) = E.tid.get()
-    {
-        sched().wake(t);
+    // Woken if it waits, made if it never ran (a forked process's watch is the first).
+    if fired {
+        start();
     }
 }
 
@@ -512,9 +539,8 @@ fn poll_watches() {
         // In batches: more fds than one ppoll takes are polled in several.
         let all: Vec<(i32, i16)> = {
             let w = E.watches.borrow();
-            let h = E.hostfds.borrow();
             let mut all: Vec<(i32, i16)> = Vec::new();
-            for (fd, ev) in w.iter().map(|x| (x.fd, x.events)).chain(h.iter().copied()) {
+            for (fd, ev) in w.iter().map(|x| (x.fd, x.events)).chain(HOSTFDS.each()) {
                 match all.iter_mut().find(|a| a.0 == fd) {
                     Some(a) => a.1 |= ev,
                     None => all.push((fd, ev)),
@@ -563,7 +589,7 @@ pub fn busy_poll() {
         return;
     }
     E.last_busy_poll.set(now);
-    if E.watches.try_borrow().is_ok_and(|w| w.is_empty()) && E.hostfds.try_borrow().is_ok_and(|h| h.is_empty()) {
+    if E.watches.try_borrow().is_ok_and(|w| w.is_empty()) && HOSTFDS.is_empty() {
         return;
     }
     poll_watches();

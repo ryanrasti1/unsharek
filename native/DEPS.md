@@ -100,6 +100,14 @@ Nothing new from crates.io. What it costs:
 | lkl-sys (path) | `lkl_host_operations` and its types, filled in by `host`; the kernel for the boot test | library | the kernel build at build time; ~5.9 MB in a binary that boots it |
 | rustix 1, + `time`, `event` | `clock_gettime` (vDSO) for the scheduler's clocks; `ppoll` with no fds as the idle wait | library | a few hundred bytes of code |
 
+## Host fd writes in pieces (2026-11-18): rustix `fs`, `termios` in exobox-rt
+No new crates. `host::note_host_fds` looks at the guest's host fds before lockdown (`fstat`,
+`isatty`): a pipe's or a socket's writes go in pieces that can't block, a regular file's whole.
+
+| Crate | For | Where | Cost noted |
+|---|---|---|---|
+| rustix 1, + `fs`, `termios` | `fstat` and `isatty` of the host fds, once before lockdown | library | two small wrappers linked (only the calls used are); the features' modules add well under a second to a cold build |
+
 ## exobox's store (2026-11-18): closures and the image cache (native/exobox/src/store.rs)
 No new crates: exobox now depends on exobox-erofs (in the workspace; brings object and memchr,
 already measured above, ~3 KB in a binary). `nix-store` (Nix itself, on the host) is run once per

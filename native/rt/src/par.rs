@@ -27,9 +27,12 @@
 //!
 //! - **Timers and idle.** A dedicated kernel host thread ([`KERNEL`]) is the idler: when it holds
 //!   the token with nothing runnable it `ppoll`s to the next timer deadline on its own eventfd
-//!   (woken early by a hand-off or a newly-armed timer), fires due timers, and hands the token to
-//!   a runnable coroutine's home. A host thread returning to user mode hands the token to the
-//!   kernel thread when a timer is pending, so deadlines are always serviced.
+//!   (woken early by a hand-off or a newly-armed timer) and the host fds coroutines wait for
+//!   (`host::idle_fds`: a read or write of a host fd, the guest's poll of one, the hooks'), fires
+//!   due timers, wakes the fds' waiters, and hands the token to a runnable coroutine's home. A
+//!   host thread returning to user mode hands the token to the kernel thread when a timer is
+//!   pending or an fd is waited for, so deadlines and fds are always serviced. (It watched only its
+//!   eventfd once: a program that polled its full stdout pipe, xz, waited for good.)
 //!
 //! - **Lazy threads.** A trapped `clone` ([`guest`]) takes a free slot and makes a host thread
 //!   through the gate ([`trap::clone_thread`]); the slot frees when the host kernel clears its tid
@@ -358,16 +361,16 @@ fn pop_waiter() -> Option<u16> {
 }
 
 /// Give up the token. A directed hand-off (a runnable coroutine bound to another host) takes
-/// priority, then an acquire-waiter; otherwise the kernel thread when a timer is pending (so it is
-/// serviced) or `allow_none` is false, else the token is left free. Returns the slot it went to
-/// (or [`NONE_SLOT`]).
+/// priority, then an acquire-waiter; otherwise the kernel thread when a timer is pending or a host
+/// fd is waited for (so it is serviced: [`idle_watching`]) or `allow_none` is false, else the
+/// token is left free. Returns the slot it went to (or [`NONE_SLOT`]).
 fn give(id: u16, allow_none: bool) -> u32 {
     lock();
     let target = if let Some(home) = sched().par_bound_elsewhere(id) {
         home as u32
     } else if let Some(w) = pop_waiter() {
         w as u32
-    } else if !allow_none || sched().par_next_deadline().is_some() {
+    } else if !allow_none || sched().par_next_deadline().is_some() || idle_watching() {
         KERNEL as u32
     } else {
         NONE_SLOT
@@ -418,7 +421,20 @@ fn sched_loop(arg: usize) -> usize {
             continue;
         }
         // The kernel/idler thread. Hand off to a runnable coroutine's home or an acquire-waiter;
-        // else idle.
+        // else idle. The idle wait watches the host fds coroutines wait on and the hooks'
+        // executor's ([`host::idle_fds`]); a program busy enough that it never idles has them
+        // looked at between hand-offs, at most once a millisecond (as coroutine mode's
+        // `executor::busy_poll`).
+        let mut fds = [PollFd::default(); crate::filter::PPOLL_FDS as usize];
+        if idle_watching() && s.now().saturating_sub(LAST_LOOK.0.get()) >= BUSY_LOOK_NS {
+            // (a wake makes a coroutine runnable: the hand-off below runs it)
+            LAST_LOOK.0.set(s.now());
+            let n = crate::host::idle_fds(&mut fds);
+            let zero = Timespec { tv_sec: 0, tv_nsec: 0 };
+            if n > 0 && trap::ppoll_fds(&mut fds[..n], Some(&zero)).is_ok_and(|r| r > 0) {
+                crate::host::idle_ready(&fds[..n]);
+            }
+        }
         lock();
         let target = s.par_bound_elsewhere(id).map(|h| h as u32).or_else(|| pop_waiter().map(|w| w as u32));
         if let Some(t) = target {
@@ -428,30 +444,49 @@ fn sched_loop(arg: usize) -> usize {
             wait_token(id);
             continue;
         }
-        match s.par_next_deadline() {
-            None => {
-                // No timers: leave the token free and sleep until handed it (a new timer will be
-                // armed under the token and handed here on the arming thread's release).
-                PAR.owner.store(NONE_SLOT, Ordering::Release);
-                unlock();
-                wait_token(id);
+        let deadline = s.par_next_deadline();
+        if deadline.is_none() && !idle_watching() {
+            // Nothing to wait for but a hand-off: leave the token free and sleep until handed it
+            // (a new timer or fd wait is made under the token, and handed here on that thread's
+            // release).
+            PAR.owner.store(NONE_SLOT, Ordering::Release);
+            unlock();
+            wait_token(id);
+            continue;
+        }
+        // Keep the token and ppoll to the deadline on our eventfd (woken early by an acquirer's
+        // poke) and the watched fds. On return, loop: fire due timers, run what an fd woke.
+        unlock();
+        fds[0] = PollFd { fd: h.efd as i32, events: POLLIN, revents: 0 };
+        let n = 1 + crate::host::idle_fds(&mut fds[1..]);
+        let ts = deadline.map(|d| {
+            let ns = d.saturating_sub(s.now());
+            Timespec { tv_sec: (ns / 1_000_000_000) as i64, tv_nsec: (ns % 1_000_000_000) as i64 }
+        });
+        if trap::ppoll_fds(&mut fds[..n], ts.as_ref()).is_ok_and(|r| r > 0) {
+            if fds[0].revents != 0 {
+                let _ = trap::eventfd_read(h.efd);
             }
-            Some(d) => {
-                // Keep the token and ppoll to the deadline on our eventfd (woken early by an
-                // acquirer's poke). On return, loop: fire due timers.
-                unlock();
-                let now = s.now();
-                let ns = d.saturating_sub(now);
-                let ts = Timespec { tv_sec: (ns / 1_000_000_000) as i64, tv_nsec: (ns % 1_000_000_000) as i64 };
-                let mut p = PollFd { fd: h.efd as i32, events: POLLIN, revents: 0 };
-                let _ = trap::ppoll(Some(&mut p), Some(&ts));
-                if p.revents != 0 {
-                    let _ = trap::eventfd_read(h.efd);
-                }
-            }
+            LAST_LOOK.0.set(s.now());
+            crate::host::idle_ready(&fds[1..n]);
         }
     }
 }
+
+/// Whether the idler has host fds to watch: a coroutine waits on one (`host::hostfd_rw`), or the
+/// hooks' executor does, or the guest polls one (`executor::watching`).
+fn idle_watching() -> bool {
+    crate::host::fd_waiting() || (crate::executor::installed() && crate::executor::watching())
+}
+
+/// How often the idler looks at the watched fds at most while the program keeps it from idling.
+const BUSY_LOOK_NS: u64 = 1_000_000;
+
+/// When the idler last looked at the watched fds (the kernel thread's, which only it touches).
+static LAST_LOOK: LastLook = LastLook(Cell::new(0));
+struct LastLook(Cell<u64>);
+// SAFETY: only the kernel thread touches it.
+unsafe impl Sync for LastLook {}
 
 /// The kernel/idler host thread. Set up before lockdown, then loops as the scheduler coroutine of
 /// slot [`KERNEL`]. Never returns.

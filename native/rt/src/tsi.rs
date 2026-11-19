@@ -413,14 +413,15 @@ pub unsafe extern "C" fn net_ready(obj: *mut c_void) {
 }
 
 /// A guest file of a passed host fd, polled: what the host fd has ready now; the rest is watched
-/// (`executor::watch_hostfd`), and the kernel told when it may be ready.
+/// (`executor::watch_hostfd`), and the kernel told when it may be ready. In a forked process too:
+/// the watch is shared, init's process polls it.
 ///
 /// # Safety
 /// A host op: called by the kernel, with its pointers valid for the call.
 pub unsafe extern "C" fn hostfd_poll(fd: c_int, events: c_uint) -> c_uint {
     let events = events as i16 & (executor::POLLIN | executor::POLLOUT);
     let ready = executor::fd_ready(fd, events);
-    if ready & events != events && executor::installed() && !elsewhere() {
+    if ready & events != events && executor::installed() {
         executor::watch_hostfd(fd, events & !ready);
     }
     ready as u16 as c_uint

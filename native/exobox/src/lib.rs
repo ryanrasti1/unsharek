@@ -909,6 +909,11 @@ impl Sandbox {
         if threads != expected {
             return Err(Error::Threads(threads, expected));
         }
+        // How the runtime writes the guest's host fds (a pipe's in pieces that can't block, a
+        // regular file's whole): looked at now, as they are for this run (after lockdown nothing
+        // may fstat them).
+        let stdio = [0, 1, 2];
+        exobox_rt::host::note_host_fds(&stdio.iter().chain(&self.host_fds).copied().collect::<Vec<_>>());
         // Compiled now, on the host: lockdown must not allocate after the filter goes in.
         let prog = Box::leak(Box::new(filter::Program::new()));
         let conds: Vec<[filter::Cond; 1]> =

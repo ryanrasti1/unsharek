@@ -11,7 +11,7 @@ publish = false
 # thread: prctl(PR_SET_NO_NEW_PRIVS) before installing the filter; mm: mprotect for the
 # coroutine stacks' guard pages (sched); time: the clocks (vDSO), event: ppoll as the idle wait
 # (host)
-rustix = { workspace = true, features = ["thread", "mm", "time", "event"] }
+rustix = { workspace = true, features = ["thread", "mm", "time", "event", "fs", "termios"] }
 # The kernel and its host-operations table, which `host` fills in
 lkl-sys = { path = "../lkl-sys" }
 # exec: the ELF file and program headers, read in place from fixed buffers (no allocation)
