@@ -61,6 +61,8 @@ const NR_PRCTL: usize = 157;
 /// CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM | CLONE_CHILD_CLEARTID`.
 /// The child-cleared tid word is how the runtime learns a thread's slot is free.
 pub const CLONE_HOST_THREAD: u64 = 0x100 | 0x200 | 0x400 | 0x800 | 0x1_0000 | 0x4_0000 | 0x20_0000;
+/// The most pollfds one `ppoll` from the gate may pass (the idle wait: see `HOST`).
+pub const PPOLL_FDS: u64 = 8;
 /// `SIGCHLD` (arch/x86/include/uapi/asm/signal.h): clone's flags for a plain fork.
 pub const SIGCHLD: u64 = 17;
 /// `MADV_DONTNEED` (include/uapi/asm-generic/mman-common.h).
@@ -259,9 +261,14 @@ const HOST: &[Entry] = &[
     // Ending the process, including a fatal signal the program sends itself.
     Entry { modes: ALL, nr: NR_EXIT_GROUP, conds: &[] },
     // The one wait: idle to the next timer (coroutine), a thread's timed sleep on its eventfd
-    // (threaded), the program's nanosleep. At most one pollfd and no signal mask (a mask would
-    // let the gate change the host's blocked signals, SIGSYS among them).
-    Entry { modes: ALL, nr: NR_PPOLL, conds: &[(1, Is::In(0, 1)), (3, Is::Eq(0))] },
+    // (threaded), the program's nanosleep; and the fds it waits for: stdin, the fds the hooks
+    // hold and passed fds the guest polls (`executor`). Up to PPOLL_FDS pollfds and no signal
+    // mask (a mask would let the gate change the host's blocked signals, SIGSYS among them).
+    // Which fds can't be pinned (they are in memory the filter doesn't see), and needn't be:
+    // ppoll only waits and reports readiness, it reads or writes no fd's data, so polling any of
+    // the process's fds tells a compromised program nothing it couldn't learn by timing the
+    // reads the filter does allow, and changes nothing.
+    Entry { modes: ALL, nr: NR_PPOLL, conds: &[(1, Is::In(0, PPOLL_FDS)), (3, Is::Eq(0))] },
     // Freed arena pages back to the host: arena addresses only, one chunk at a time (the
     // reservation's padding keeps address + length inside it), only MADV_DONTNEED. Only with one
     // host thread: madvise concurrent with page faults on other threads is the Dirty-COW race

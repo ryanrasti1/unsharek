@@ -20,8 +20,21 @@ lkl-sys = { path = "../lkl-sys" }
 # Host setup before the routing filter: reserving memory, mapping images, the auxiliary vector,
 # host entropy; and the guest's constants
 libc.workspace = true
+# Errno, the runtime's error type, in the hooks' adapters
+rustix.workspace = true
 syscalls.workspace = true
 thiserror.workspace = true
+# The global allocator after lockdown (src/alloc.rs): the hooks' and the executor's allocations,
+# from a region reserved before it
+talc = { version = "5", default-features = false }
+# The hooks' stream traits (futures-io's AsyncRead/AsyncWrite, futures-core's Stream)
+futures-io = "0.3"
+futures-core = "0.3"
+# tokio's AsyncRead/AsyncWrite too, for providers built on them (capnweb-rs's channel)
+tokio = { version = "1", default-features = false, optional = true }
+
+[features]
+tokio = ["dep:tokio"]
 
 # build.rs: the C compiler's PIE start files, for the binary's non-PIE link
 [build-dependencies]
@@ -40,6 +53,12 @@ harness = false
 # The library's layers (Guest alone, Sandbox), each in a child process of its own.
 [[test]]
 name = "guest"
+harness = false
+
+# The program's network through the hooks (a provider over one held fd), and a passed fd's
+# readiness; each case a sandbox in a child process.
+[[test]]
+name = "net"
 harness = false
 
 # The performance budgets (./test --perf).

@@ -175,3 +175,19 @@ at once (from 19.3 MB and 9.9 MB anonymous; the debug build `./test --perf` meas
 | Crate | For | Where | Cost noted |
 |---|---|---|---|
 | cc 1 | the C compiler's `-print-file-name` for the PIE start files (`Scrt1.o`, `crtbeginS.o`, ...) | exobox's build.rs | build only; already in the tree |
+
+## Pluggable networking (2026-11-18): the hooks, their executor and allocator (native/exobox/src/net.rs, alloc.rs; native/rt/src/tsi.rs, executor.rs, dns.rs)
+The release `exobox` binary: 9,724,816 / 8,491,168 bytes (unstripped / stripped), ~+90 KB stripped
+over the last measurement (the kernel's tsi.c and host fd poll, the runtime's executor, resolver and
+copy loop, the adapters; talc itself is ~2.7 KB of symbols). The three new crates build in ~0.4 s
+cold (release), in parallel with the rest. The allocator's region (256 MiB, `MAP_NORESERVE`) costs
+what the hooks touch after lockdown; the executor's coroutine is one of the sandbox's, started only
+when a hook or a passed fd's poll first needs it.
+
+| Crate | For | Where | Cost noted |
+|---|---|---|---|
+| talc 5 (no default features) | the global allocator after lockdown: the hooks' and the executor's allocations, from a region reserved before (glibc's malloc can't grow then); its lock a spin lock of exobox's (no futex) | library | ~2.7 KB; pulls lock_api and allocator-api2 (no std) |
+| futures-io 0.3 | `AsyncRead`/`AsyncWrite`: the hooks' streams, `HeldFd`, `GuestSocket` | library | traits only |
+| futures-core 0.3 | `Stream`: `on_listen`'s inbound connections | library | traits only |
+| tokio 1 (optional, feature `tokio`, no default features) | tokio's `AsyncRead`/`AsyncWrite` for hooks' streams and `HeldFd`/`GuestSocket` (capnweb-rs's channel) | library | off by default; with it, tokio's io traits only (no runtime) |
+| rustix (workspace) | `Errno`, the runtime's error type, in the adapters | library | already in the tree |

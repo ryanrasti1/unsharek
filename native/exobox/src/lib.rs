@@ -9,12 +9,19 @@
 //! 3. [`Sandbox`]: a `Guest` whose closure runs the caller's setup and then installs the mode's
 //!    filter. [`run`] (the CLI's path) is a `Sandbox` for a [`Config`].
 //!
+//! What runs in the guest is given as [`Hooks`]: `pre_exec` (setup, as init, before the program)
+//! and the network's ([`net`]: connects, listens and name lookups beyond loopback).
+//!
 //! The process becomes the sandbox: one guest per process, booted from the thread that will run
 //! it, and setup is single-threaded (the closure's threads would be host threads the guest can't
 //! route). Coroutine mode only so far.
 
+pub mod alloc;
+pub mod net;
 pub mod setup;
 pub mod store;
+
+pub use net::{Cx, GuestSocket, HeldFd, Hooks, NetError, OnConnect, OnListen, OnResolve, PreExec};
 
 use std::convert::Infallible;
 use std::ffi::{CString, OsString};
@@ -278,6 +285,8 @@ impl Guest {
         // PR_SET_DUMPABLE 0, which would also hide /proc/<pid>/smaps_rollup (perf.rs's PSS) from
         // its owner. A piped core_pattern (systemd-coredump) is still started, sees the limit and
         // stops reading.
+        // The allocator's region for after lockdown (`alloc`): reserved now, while mmap is the host's.
+        alloc::reserve().map_err(Error::io("the allocator's region"))?;
         let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
         // SAFETY: sets a limit of this process.
         unsafe { libc::setrlimit(libc::RLIMIT_CORE, &none) };
@@ -396,21 +405,42 @@ impl Guest {
         Some(at)
     }
 
-    /// Install the routing filter, run `before_exec` as the guest's init (every syscall it makes
-    /// is the guest's: host data must be read before), then exec `argv[0]` inside the guest with
-    /// `argv` and `env` (each `NAME=value`). Never returns on success; on failure the routing
-    /// filter is in, so the caller can only report the error and exit (both work: through the
-    /// guest, to the host's stderr and exit).
-    pub fn run<F, E>(self, argv: &[OsString], env: &[OsString], before_exec: F) -> Result<Infallible, Error>
-    where
-        F: FnOnce() -> Result<(), E>,
-        E: Into<Error>,
-    {
+    /// Hold host fd `fd` for the hooks (a provider's connection, made before `run`): made
+    /// nonblocking and kept open for the sandbox's life. Under a [`Sandbox`] the filter allows
+    /// `read` and `write` on exactly it ([`Sandbox::hold_fd`]).
+    pub fn hold_fd(&mut self, fd: OwnedFd) -> Result<HeldFd, Error> {
+        use std::os::fd::IntoRawFd;
+        let fd = fd.into_raw_fd();
+        // SAFETY: fcntl on our own fd.
+        let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        // SAFETY: as above.
+        if fl < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) } < 0 {
+            return Err(Error::io("holding an fd")(std::io::Error::last_os_error()));
+        }
+        Ok(HeldFd { fd })
+    }
+
+    /// Install the routing filter and the network hooks, run `hooks.pre_exec` as the guest's init
+    /// (every syscall it makes is the guest's: host data must be read before), then exec
+    /// `argv[0]` inside the guest with `argv` and `env` (each `NAME=value`). With an `on_resolve`
+    /// hook, the guest's `/etc/resolv.conf` and `/etc/hosts` are written first (`pre_exec` may
+    /// replace them). Never returns on success; on failure the routing filter is in, so the
+    /// caller can only report the error and exit (both work: through the guest, to the host's
+    /// stderr and exit).
+    pub fn run(self, hooks: Hooks, argv: &[OsString], env: &[OsString]) -> Result<Infallible, Error> {
         let path = argv.first().ok_or(Error::NoProgram)?;
         let args: Vec<&[u8]> = argv.iter().map(|a| a.as_bytes()).collect();
         let envs: Vec<&[u8]> = env.iter().map(|a| a.as_bytes()).collect();
+        let (pre_exec, resolves) = hooks.install();
         guest::route()?;
-        before_exec().map_err(Into::into)?;
+        if resolves {
+            setup::resolver().map_err(Error::io("the guest's resolver"))?;
+        }
+        if let Some(f) = pre_exec.0 {
+            f()?;
+        }
+        // From here on the program's memory is the arena's: allocations are the region's.
+        alloc::lockdown();
         let errno = guest::exec(path.as_bytes(), &args, &envs, self.aux);
         Err(Error::Exec { path: PathBuf::from(path), errno: std::io::Error::from_raw_os_error(errno.raw_os_error()) })
     }
@@ -473,10 +503,9 @@ impl Sandbox {
     /// Give the guest host fd `fd` as its fd `guest` (e.g. a channel to the orchestrator at 1000):
     /// a guest file whose reads and writes the runtime does on `fd` (as fds 0-2 are), installed
     /// before the setup closure runs; the filter is widened to `read` and `write` on exactly that
-    /// host fd. A guest read waits for the host fd without holding the guest's CPU. `fd` stays
-    /// open for the sandbox's life. Readiness for the guest's `poll`/`epoll` on it isn't there yet
-    /// (the kernel's host-fd files have no poll; README plan item 9's readiness work): use blocking
-    /// reads.
+    /// host fd. A guest read waits for the host fd without holding the guest's CPU, and the
+    /// guest's `poll`/`epoll` on it see the host fd's readiness (the kernel asks the runtime,
+    /// whose idle wait watches the fd). `fd` stays open for the sandbox's life.
     pub fn pass_fd(&mut self, fd: OwnedFd, guest: i32) -> &mut Self {
         use std::os::fd::IntoRawFd;
         let host = fd.into_raw_fd();
@@ -487,17 +516,22 @@ impl Sandbox {
         self
     }
 
+    /// [`Guest::hold_fd`], and the filter widened to `read` and `write` on exactly that fd.
+    pub fn hold_fd(&mut self, fd: OwnedFd) -> Result<HeldFd, Error> {
+        let held = self.guest.hold_fd(fd)?;
+        for sysno in [Sysno::read, Sysno::write] {
+            self.rules.push(Rule { sysno, args: vec![ArgRange { index: 0, lo: held.fd as u64, hi: held.fd as u64 }] });
+        }
+        Ok(held)
+    }
+
     /// [`Guest::map_image`].
     pub fn map_image<'a>(&mut self, source: impl Into<ImageSource<'a>>) -> Result<Image, Error> {
         self.guest.map_image(source)
     }
 
-    /// [`Guest::run`], its closure `setup` and then the mode's filter.
-    pub fn run<F, E>(self, argv: &[OsString], env: &[OsString], setup: F) -> Result<Infallible, Error>
-    where
-        F: FnOnce() -> Result<(), E>,
-        E: Into<Error>,
-    {
+    /// [`Guest::run`], its `pre_exec` the caller's and then the mode's filter.
+    pub fn run(self, mut hooks: Hooks, argv: &[OsString], env: &[OsString]) -> Result<Infallible, Error> {
         // Compiled now, on the host: the closure must not allocate after the filter goes in.
         let prog = Box::leak(Box::new(filter::Program::new()));
         let conds: Vec<Vec<filter::Cond>> = self
@@ -532,17 +566,23 @@ impl Sandbox {
         // Threaded mode: sync the mode filter to every host thread (the kernel idler, and the
         // program's threads made lazily inherit it). SECCOMP_FILTER_FLAG_TSYNC = 1.
         let flags: u32 = if self.mode == Mode::Coroutine { 0 } else { 1 };
-        self.guest.run(argv, env, move || {
+        let setup = hooks.pre_exec.0.take();
+        hooks.pre_exec = PreExec::new(move || {
             for (host, guest) in fds {
                 setup::host_fd(host, guest).map_err(Error::io("passing a host fd"))?;
             }
-            setup().map_err(Into::into)?;
+            if let Some(f) = setup {
+                f()?;
+            }
+            // The mode's filter allows no host memory call: allocations are the region's.
+            alloc::lockdown();
             // The mode's list allows no host memory calls: setup code that still makes one gets
             // ENOMEM (mmap) or nothing done, not the filter's verdict.
             guest::host_memory(false);
             filter::install(prog, flags)
                 .map_err(|e| Error::io("installing the filter")(std::io::Error::from_raw_os_error(e.raw_os_error())))
-        })
+        });
+        self.guest.run(hooks, argv, env)
     }
 }
 
@@ -635,7 +675,8 @@ pub fn run(config: Config) -> Result<Infallible, Error> {
     // The program's path as the host resolves it: the guest's working directory is `/`.
     let mut argv = config.argv.clone();
     argv[0] = std::path::absolute(&argv[0]).map_err(Error::io("the program's path"))?.into_os_string();
-    sb.run(&argv, &config.env, move || setup::mount_closure(&mounts))
+    let hooks = Hooks { pre_exec: PreExec::new(move || setup::mount_closure(&mounts)), ..Default::default() };
+    sb.run(hooks, &argv, &config.env)
 }
 
 /// A booted kernel with no program, forked once per sandbox: each child loads its own program,

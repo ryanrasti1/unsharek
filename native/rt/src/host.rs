@@ -314,6 +314,12 @@ pub static HOST_OPS: HostOps = HostOps(UnsafeCell::new(lkl_host_operations {
     // the modes that use them.
     signal_handler: None,
     fork: None,
+    // The kernel's socket impersonation and passed fds' readiness: `tsi`.
+    net_connect: Some(crate::tsi::net_connect),
+    net_listen: Some(crate::tsi::net_listen),
+    net_sendto: Some(crate::tsi::net_sendto),
+    net_ready: Some(crate::tsi::net_ready),
+    hostfd_poll: Some(crate::tsi::hostfd_poll),
 }));
 
 // ---- print and panic ----
@@ -707,20 +713,25 @@ impl Host for SysHost {
         };
         let ts = timeout.map(|t| crate::xabi::Timespec { tv_sec: t.tv_sec, tv_nsec: t.tv_nsec });
         // Through the gate (the filter's one wait; rustix's poll would trap once the routing
-        // filter is in), watching the host fd a coroutine waits for, if any. EINTR (a signal) is
-        // a wake-up like any other.
-        match FD_WAIT.0.get() {
-            Some((fd, events, tid)) => {
-                let mut p = crate::trap::PollFd { fd, events, revents: 0 };
-                if let Ok(n) = crate::trap::ppoll(Some(&mut p), ts.as_ref())
-                    && n > 0
-                {
-                    sched().wake(tid);
-                }
+        // filter is in), watching the host fd a coroutine waits for, if any, and the fds the
+        // hooks' executor waits on (`executor::idle_fds`). EINTR (a signal) is a wake-up like any
+        // other.
+        let mut fds = [crate::trap::PollFd::default(); crate::filter::PPOLL_FDS as usize];
+        let own = FD_WAIT.0.get();
+        let first = usize::from(own.is_some());
+        if let Some((fd, events, _)) = own {
+            fds[0] = crate::trap::PollFd { fd, events, revents: 0 };
+        }
+        let n = first + crate::executor::idle_fds(&mut fds[first..]);
+        if let Ok(ready) = crate::trap::ppoll_fds(&mut fds[..n], ts.as_ref())
+            && ready > 0
+        {
+            if let Some((_, _, tid)) = own
+                && fds[0].revents != 0
+            {
+                sched().wake(tid);
             }
-            None => {
-                let _ = crate::trap::ppoll(None, ts.as_ref());
-            }
+            crate::executor::idle_ready(&fds[first..n]);
         }
     }
 }
