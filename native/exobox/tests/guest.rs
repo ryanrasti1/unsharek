@@ -192,7 +192,10 @@ fn template(m: Mode) -> exobox::Error {
         std::fs::create_dir_all("/etc").unwrap();
         std::fs::write("/etc/template", "shared").unwrap();
     }
-    let runs: [(&str, &[&str]); 4] = [("creds", &[]), ("creds", &[]), ("hello", &[]), ("exit_status", &["exit42"])];
+    // The last dies of SIGABRT: a child's death by a signal is its own (its pid, not the
+    // template's, is the one the runtime and the filter's `kill` name).
+    let runs: [(&str, &[&str]); 5] =
+        [("creds", &[]), ("creds", &[]), ("hello", &[]), ("exit_status", &["exit42"]), ("exit_status", &["abort"])];
     for (n, (fixture, args)) in runs.iter().enumerate() {
         let child = sb
             .spawn(move |mut sb| {
@@ -209,7 +212,8 @@ fn template(m: Mode) -> exobox::Error {
             })
             .unwrap();
         let st = child.wait().unwrap();
-        println!("CHILD {n} {fixture} status {:?}", st.code());
+        use std::os::unix::process::ExitStatusExt;
+        println!("CHILD {n} {fixture} status {:?} signal {:?}", st.code(), st.signal());
     }
     std::process::exit(0)
 }
@@ -361,13 +365,14 @@ fn main() {
             let (st, out, err) = run("template", "-", mode, &[])?;
             let statuses: Vec<&str> = out.lines().filter(|l| l.starts_with("CHILD ")).collect();
             let want = [
-                "CHILD 0 creds status Some(0)",
-                "CHILD 1 creds status Some(0)",
-                "CHILD 2 hello status Some(0)",
-                "CHILD 3 exit_status status Some(42)",
+                "CHILD 0 creds status Some(0) signal None",
+                "CHILD 1 creds status Some(0) signal None",
+                "CHILD 2 hello status Some(0) signal None",
+                "CHILD 3 exit_status status Some(42) signal None",
+                "CHILD 4 exit_status status None signal Some(6)",
             ];
             if st.code() != Some(0) || statuses != want || !out.contains("HELLO_OK") {
-                return fail(st, &out, &err, "wanted four children, their statuses theirs");
+                return fail(st, &out, &err, "wanted five children, their statuses theirs");
             }
             let random: Vec<&str> = out.lines().filter(|l| l.starts_with("RANDOM ")).collect();
             if random.len() != 2 || random[0] == random[1] {
