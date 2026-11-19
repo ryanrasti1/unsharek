@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["native/erofs", "native/exobox", "native/fixtures", "native/lkl-sys", "native/rt"]
+members = ["examples", "native/erofs", "native/exobox", "native/fixtures", "native/lkl-sys", "native/rt"]
 
 [workspace.package]
 edition = "2024"
