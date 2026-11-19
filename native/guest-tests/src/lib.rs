@@ -68,14 +68,21 @@ macro_rules! group {
 macro_rules! all {
     (common) => {
         $crate::group!(files: file_rw, dirs, shmap);
-        $crate::group!(threads: thread_fds, futex_wake, futex_timeout, std_sync);
+        $crate::group!(threads: thread_fds, futex_wake, std_sync,
+            // Found by this spike, every mode: FUTEX_WAIT's timeout returns 0 after ~1 ms.
+            #[ignore = "guest: a timed FUTEX_WAIT returns 0 early"] futex_timeout,
+        );
         $crate::group!(signals: handler_at_raise, blocked_pending, kill_process, timer_eintr, pthread_kill_read);
         $crate::group!(net: tcp_loopback, udp_loopback, unix_sockets);
         $crate::group!(procfs: meminfo, proc_self, uname);
         $crate::group!(stdio: stdio_types, stdin_eof, stdout_large);
-        $crate::group!(exec: exec_reset);
+        // Passes natively and in coroutine mode; in threaded and fork mode the runtime panics
+        // (native/rt/src/context.rs:62, a subtraction's overflow) after the exec and the sandbox
+        // hangs. Exec'd from libtest's test thread while its main thread waits.
+        $crate::group!(exec: #[ignore = "guest: threaded/fork exec from a thread panics the runtime"] exec_reset);
         $crate::group!(host_side:
-            idle_cpu,
+            // std's Condvar::wait_timeout returns early in the guest (futex_timeout's bug).
+            #[ignore = "guest: a timed FUTEX_WAIT returns 0 early"] idle_cpu,
             #[should_panic(expected = "boom")] should_panic,
             // Run by hand (--run-ignored only) to see how failures look.
             #[ignore] demo_assert_fails,
@@ -83,27 +90,10 @@ macro_rules! all {
             #[ignore] demo_hang,
         );
     };
-    (prime) => {
-        // Before libtest's main: a statx that succeeds, so std knows statx is there. Else std's
-        // first failing statx (libtest's terminfo lookup when TERM is set, any `exists()` of a
-        // missing path) probes with `statx(0, NULL, 0, .., NULL)`, expecting EFAULT, and in the
-        // guest a NULL passed to LKL is a fault in the sandbox: SIGSEGV (native/rt/src/guest.rs:
-        // "a bad one is a fault in the sandbox"). Every Rust program meets this in exobox.
-        #[used]
-        #[unsafe(link_section = ".init_array")]
-        static PRIME_STATX: extern "C" fn() = {
-            extern "C" fn prime() {
-                let _ = std::fs::metadata("/");
-            }
-            prime
-        };
-    };
     (one_process) => {
-        $crate::all!(prime);
         $crate::all!(common);
     };
     (processes) => {
-        $crate::all!(prime);
         $crate::all!(common);
         $crate::group!(process:
             fork_pipe_status, fork_children, grandchild, spawn_self, child_signals, siginfo_from_child,

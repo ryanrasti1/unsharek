@@ -97,16 +97,24 @@ pub fn std_sync() {
 /// absolute on CLOCK_MONOTONIC, FUTEX_WAIT_BITSET, std's Condvar::wait_timeout's call).
 pub fn futex_timeout() {
     let w = AtomicU32::new(0);
-    let t0 = std::time::Instant::now();
-    let rel = libc::timespec { tv_sec: 0, tv_nsec: 60_000_000 };
-    // SAFETY: a futex wait on a local word, with a timeout.
-    let r = unsafe {
-        libc::syscall(libc::SYS_futex, w.as_ptr(), libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG, 0, &rel, 0usize, 0)
-    };
-    let e = crate::errno();
-    let took = t0.elapsed();
-    assert_eq!((r, e.raw_os_error()), (-1, Some(libc::ETIMEDOUT)), "FUTEX_WAIT after {took:?}");
-    assert!(took >= Duration::from_millis(60), "FUTEX_WAIT timed out after {took:?}");
+    // Three in a row, all reported: whether an early return is the first wait's only.
+    let tries: Vec<_> = (0..3)
+        .map(|_| {
+            let t0 = std::time::Instant::now();
+            let rel = libc::timespec { tv_sec: 0, tv_nsec: 60_000_000 };
+            // SAFETY: a futex wait on a local word, with a timeout.
+            let r = unsafe {
+                libc::syscall(libc::SYS_futex, w.as_ptr(), libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG, 0, &rel, 0usize, 0)
+            };
+            (r, crate::errno().raw_os_error().unwrap_or(0), t0.elapsed())
+        })
+        .collect();
+    for &(r, e, took) in &tries {
+        assert!(
+            r == -1 && e == libc::ETIMEDOUT && took >= Duration::from_millis(60),
+            "FUTEX_WAIT for 60 ms, nobody waking it: (return, errno, after) {tries:?}"
+        );
+    }
 
     // SAFETY: as above, with an absolute deadline.
     let (r, e, took) = unsafe {
