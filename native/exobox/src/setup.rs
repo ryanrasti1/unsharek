@@ -1,4 +1,4 @@
-//! Helpers for setup inside an intercept guard (`exobox::Sandbox::intercept`), written as
+//! Helpers for setup inside a setup closure (`exobox::Guest::run` before lockdown), written as
 //! ordinary Rust: inside one every syscall of the thread is the guest's, so `std::fs` and friends
 //! work on the guest's files. Anything else the guest kernel does is a syscall away there too
 //! (`setresuid`, `sethostname`, an `/etc/passwd` written with `std::fs::write`): exobox doesn't
@@ -63,7 +63,7 @@ pub struct Mount {
 /// `store.rs` lists them. A store path that is a file or a symlink ([`Kind::Entry`]) is shown as
 /// it is: its image is mounted at a mount point of its own (`/dev/exobox/<name>.d`), the file
 /// bind-mounted from there onto the store path (a file onto a file: nothing is copied) or the
-/// symlink made, and the image's own mount detached again. Inside a guard.
+/// symlink made, and the image's own mount detached again. Inside a setup closure.
 ///
 /// [`Kind::Entry`]: crate::store::Kind::Entry
 pub fn mount_closure(images: &[Mount]) -> io::Result<()> {
@@ -111,7 +111,7 @@ fn mount_entry(image: &Image, at: &Path) -> io::Result<()> {
     shown.map_err(ctx(what()))
 }
 
-/// A guest syscall from host code outside a guard (generic numbers, made on the guest directly: a
+/// A guest syscall from host code outside a setup closure (generic numbers, made on the guest directly: a
 /// plain `std::fs` call there is the host's).
 fn sys(nr: std::ffi::c_long, a: [usize; 6]) -> io::Result<usize> {
     let r = guest::syscall(nr, a);
@@ -164,11 +164,11 @@ fn close(fd: usize) {
 pub const NAMESERVER: &str = "10.0.2.3";
 
 /// The guest's `/etc/resolv.conf` (naming [`NAMESERVER`]) and `/etc/hosts` (localhost: no query
-/// for it), root's, 0644. Written by `exobox::Builder::build` when names resolve
+/// for it), root's, 0644. Written by `exobox::Guest::on_connect` or `on_resolve` when names first resolve
 /// (an `on_resolve` or `on_connect` hook), as init at boot, before any guard: a guard may then
-/// change them or chown them, and nothing is written for them after the guards, whose
+/// change them or chown them, and nothing is written for them after setup, whose
 /// credentials (a `setresuid` to a build user) it would have had (it failed with EACCES).
-/// Direct guest calls: outside a guard or in one.
+/// Direct guest calls: outside a setup closure or in one.
 pub fn resolver() -> io::Result<()> {
     mkdir(c"/etc", 0o755)?;
     // One attempt, two seconds: the answer is local, a lost one isn't coming.
@@ -197,7 +197,7 @@ fn write_file(path: &CStr, mut data: &[u8]) -> io::Result<()> {
 /// Host fd `host` as guest fd `guest`: a guest file whose reads and writes the runtime does on
 /// the host's fd (`host_fd`, the kernel series' item 11), as fds 0-2 are. Host code (it calls the
 /// guest directly); under a `exobox::Sandbox`,
-/// `exobox::Sandbox::pass_fd` does this and widens the filter to the host fd,
+/// `exobox::Guest::pass_fd` does this, and its lockdown grants the host fd,
 /// which calling this alone doesn't.
 pub fn host_fd(host: RawFd, guest: RawFd) -> io::Result<()> {
     let fd = sys(l::__lkl__NR_host_fd, [host as usize, libc::O_RDWR as usize, 0, 0, 0, 0])?;

@@ -15,7 +15,7 @@
 //!   objects precede the kernel's in the link). So the binary's `exobox_shared` starts and ends on
 //!   a page and holds exactly the shared state; [`remap`] maps it shared, its contents kept.
 //! - **The kernel's pool and the coroutine stacks** are reserved shared (anonymous `MAP_SHARED`)
-//!   in fork mode, by exobox's `Guest::boot` (its inventory).
+//!   in fork mode, by exobox's `Guest::boot`.
 //!
 //! In coroutine and threaded mode nothing is remapped: the section is ordinary data.
 

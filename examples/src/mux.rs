@@ -1,5 +1,5 @@
 //! A tiny multiplexing protocol for `net-policy`: every connect and lookup of a sandbox over ONE
-//! host fd (a socketpair end the sandbox holds as "net", `Sandbox::hold_fd_as`, which the hooks
+//! host fd (a socketpair end the sandbox holds as "net", `Guest::hold_fd_as`, which the hooks
 //! find with `cx.held`), to a proxy process at its other end. After
 //! `native/exobox/tests/net.rs`'s test provider.
 //!
@@ -248,7 +248,7 @@ fn session(cx: Cx) -> Shared {
     })
 }
 
-/// For `Builder::on_start`: the session up at lockdown, before the program's first connect.
+/// For `Guest::on_start`: the session up at lockdown, before the program's first connect.
 pub async fn start(cx: Cx) {
     session(cx);
 }

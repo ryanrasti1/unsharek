@@ -2,7 +2,7 @@
 //!
 //! A sandbox takes its process over (`run` never returns, and the process ends with the
 //! program's status), so an example that wants to watch or talk to a sandbox forks it off as a
-//! template's child (`Sandbox::spawn`: `channel`, `net-policy`) and stays the parent. One that
+//! template's child (`Guest::spawn`: `channel`, `net-policy`) and stays the parent. One that
 //! wants sandboxes of different configurations (one guest per process: `escape`, `threads`), or
 //! a cold one measured from outside (`nix-program`), re-runs itself as a child in a "role"
 //! ([`role`], [`self_command`]).
@@ -60,8 +60,8 @@ pub fn quick() -> bool {
     std::env::var_os("EXOBOX_EXAMPLE_QUICK").is_some()
 }
 
-/// After `run` failed: before the program started, so the error is ours to report. (The routing
-/// filter is in: stderr and exit still work, through the guest.)
+/// After a sandbox's start failed: before the program started, so the error is ours to report.
+/// (After lockdown, stderr and exit still work, through the guest.)
 pub fn fail(e: exobox::Error) -> ! {
     eprintln!("exobox: {e}");
     std::process::exit(125)

@@ -8,12 +8,15 @@
 //! coroutine of its own whose control stack (the coroutine's stack) holds its trap frames and the
 //! dispatcher's calls; the program runs on its own stack, in the arena.
 //!
-//! **Phases.** [`Phase::Setup`]: after the routing filter (`route`), the host code that runs as
-//! init before exec (`exobox::Guest::run`'s closure): its syscalls trap and are served here, by
-//! the guest; its memory (host `mmap` and friends, made by the host's libc) stays the host's, so
-//! the memory calls are passed through the gate to the host, until [`host_memory`]`(false)` says
-//! the security filter (which allows none of them) is about to go in. [`Phase::Program`]: after
-//! [`exec`], the program's memory is the arena's.
+//! **Phases.** [`Phase::Setup`]: host code that runs as init. Before lockdown, between
+//! [`setup_begin`] and [`setup_end`] (`exobox::Guest::run`'s closure), on the boot thread, whose
+//! syscalls trap by syscall user dispatch (`trap::sud_on`, switched by its selector: free) and
+//! are served here, by the guest; its memory (host `mmap` and friends, made by the host's libc)
+//! stays the host's, so the memory calls are passed through the gate to the host, until
+//! [`host_memory`]`(false)` says the filter (which allows none of them) is about to go in. After
+//! lockdown ([`locked_down`]) until the program starts, the same, the trap seccomp's. Outside
+//! both (`Phase::Booted`), host code runs natively: nothing traps. [`Phase::Program`]: after
+//! [`exec`] or in [`run_fn`], the program's memory is the arena's.
 //!
 //! **What the dispatcher does with each route** (`sysmap`): `Lkl` is `lkl_syscall` on the current
 //! coroutine's guest task (a new thread's first call is `attach_thread`, item 5); `Rewrite` as
@@ -108,14 +111,11 @@ static ALTSTACK: Local<[u8; trap::ALTSTACK_SIZE]> = Local::new([0; trap::ALTSTAC
 /// Where the guest is: what its trapped syscalls are served as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
-    /// Booted, no filter: nothing traps yet.
+    /// Booted, between setups: nothing traps (host code runs natively).
     Booted,
-    /// The routing filter is in; host code runs as init (see the module comment), on the thread
-    /// that began it ([`intercept_begin`]): other threads' calls pass through.
+    /// Host code runs as init (see the module comment): a setup closure before lockdown, on the
+    /// boot thread, or the runtime's own code after lockdown, before the program.
     Setup,
-    /// The routing filter is in, no setup runs: every trapped call is re-issued on the host
-    /// (`passthrough`), until the next [`intercept_begin`] or the exec.
-    Passthrough,
     /// The program runs.
     Program,
 }
@@ -184,10 +184,11 @@ struct State {
     /// The sandbox's host pid ([`die`]: the one `kill` the filter allows). A host fork's child
     /// finds it isn't its own ([`forked`]).
     host_pid: Cell<u32>,
-    /// The host thread whose calls the setup phase routes to the guest ([`intercept_begin`]).
-    setup_tid: Cell<u32>,
-    /// Whether the routing filter is in ([`route`]).
-    routed: Cell<bool>,
+    /// The host pid syscall user dispatch was switched on in (0: none): a host fork's child
+    /// (a template's instance) doesn't inherit it, and switches it on again.
+    sud_pid: Cell<u32>,
+    /// Lockdown has happened ([`locked_down`]): the loader runs only after it.
+    locked: Cell<bool>,
     /// The host's auxiliary vector values, for every exec.
     aux: Cell<Aux>,
     /// The running program's absolute path (STOPGAP(item 10): `/proc/self/exe`).
@@ -228,8 +229,8 @@ static S: State = State {
     restorers: [const { Cell::new(0) }; 65],
     served: Cell::new(0),
     host_pid: Cell::new(0),
-    setup_tid: Cell::new(0),
-    routed: Cell::new(false),
+    sud_pid: Cell::new(0),
+    locked: Cell::new(false),
     aux: Cell::new(Aux { hwcap: 0, hwcap2: 0, sysinfo_ehdr: 0, minsigstksz: 0 }),
     exe_len: Cell::new(0),
     cpus: [const { Cell::new(0) }; CPU_WORDS],
@@ -275,7 +276,7 @@ fn err(what: &'static str) -> impl Fn(Errno) -> Error {
 }
 
 /// Boot the guest on the calling host thread, which becomes the scheduler's root coroutine and
-/// init's thread. Once per process. Nothing traps until [`route`].
+/// init's thread. Once per process. Nothing traps until [`setup_begin`].
 ///
 /// # Safety
 /// The regions in `b` are this guest's from now on, as `Boot` describes them; the calling thread
@@ -329,53 +330,62 @@ pub unsafe fn boot(b: Boot) -> Result<(), Error> {
     Ok(())
 }
 
-/// Install the routing filter (`route`) on the calling thread (and the threads it makes from now
-/// on): from now on every syscall of its not from the gate traps, and is served by the guest in
-/// the setup phase ([`intercept_begin`]) or re-issued on the host otherwise (`passthrough`). Once;
-/// the phase becomes [`Phase::Passthrough`].
-pub fn route() -> Result<(), Error> {
-    if S.routed.get() {
-        return Ok(());
-    }
-    // The calling thread only, in every mode: other host threads of the process stay unrouted
-    // until the security filter is synced to them at lockdown (the kernel idler makes only gate
-    // calls). Routed with TSYNC, another thread's calls would have trapped during setup.
-    crate::route::install().map_err(err("installing the routing filter"))?;
-    S.routed.set(true);
-    S.phase.set(Phase::Passthrough);
-    Ok(())
+/// Syscall user dispatch's selector for the boot thread: [`trap::SUD_BLOCK`] while a setup runs.
+static SELECTOR: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(trap::SUD_ALLOW);
+
+/// This process's host pid (getpid, through the gate).
+fn host_pid() -> u32 {
+    // SAFETY: getpid.
+    unsafe { trap::gate(39, 0, 0, 0, 0, 0, 0) as u32 }
 }
 
-/// The host thread's id (gettid, through the gate).
-fn host_tid() -> u32 {
-    // SAFETY: gettid.
-    unsafe { trap::gate(186, 0, 0, 0, 0, 0, 0) as u32 }
-}
-
-/// Begin a setup phase: from now on the calling thread's trapped calls are the guest's, as init
-/// (the routing filter must be in: [`route`]). The thread is the boot thread (the root
-/// coroutine's); its alternate signal stack is the runtime's again, in case host code changed it
-/// in passthrough.
-pub fn intercept_begin() -> Result<(), Error> {
-    if !S.routed.get() {
-        return Err(Error { what: "intercept before the routing filter", errno: Errno::INVAL });
+/// Begin a setup: from now on the calling thread's syscalls (all but the gate's) trap and are the
+/// guest's, as init, until [`setup_end`]. The thread is the boot thread (the root coroutine's).
+/// Syscall user dispatch is switched on the first time in this process (a template's instance is
+/// a fork, which doesn't inherit it), and from then on only its selector changes: no syscall. The
+/// root's alternate signal stack is the runtime's again, in case host code changed it. Before
+/// lockdown.
+pub fn setup_begin() -> Result<(), Error> {
+    if S.locked.get() {
+        return Err(Error { what: "a setup after lockdown", errno: Errno::INVAL });
     }
-    if par::enabled() {
-        par::rearm_altstack();
-    } else {
-        // SAFETY: the root's static alternate stack, this (the boot) thread's.
-        unsafe { trap::set_altstack(ALTSTACK.get().as_mut_ptr(), trap::ALTSTACK_SIZE) }.map_err(err("sigaltstack"))?;
+    // SAFETY: the root's static alternate stack, this (the boot) thread's.
+    unsafe { trap::set_altstack(ALTSTACK.get().as_mut_ptr(), trap::ALTSTACK_SIZE) }.map_err(err("sigaltstack"))?;
+    let pid = host_pid();
+    if S.sud_pid.get() != pid {
+        // SAFETY: a static selector, valid for the process's life.
+        unsafe { trap::sud_on(SELECTOR.as_ptr()) }.map_err(err("syscall user dispatch"))?;
+        S.sud_pid.set(pid);
     }
-    S.setup_tid.set(host_tid());
     S.phase.set(Phase::Setup);
+    SELECTOR.store(trap::SUD_BLOCK, core::sync::atomic::Ordering::SeqCst);
     Ok(())
 }
 
-/// End a setup phase: trapped calls pass through to the host again ([`Phase::Passthrough`]).
-pub fn intercept_end() {
+/// End a setup: the thread's syscalls are the host's again (the selector: no syscall).
+pub fn setup_end() {
+    SELECTOR.store(trap::SUD_ALLOW, core::sync::atomic::Ordering::SeqCst);
     if S.phase.get() == Phase::Setup {
-        S.phase.set(Phase::Passthrough);
+        S.phase.set(Phase::Booted);
     }
+}
+
+/// Switch syscall user dispatch off (at lockdown: seccomp's trap takes over). Outside a setup.
+pub fn sud_off() -> Result<(), Error> {
+    if S.sud_pid.get() == host_pid() {
+        trap::sud_off().map_err(err("syscall user dispatch"))?;
+    }
+    S.sud_pid.set(0);
+    Ok(())
+}
+
+/// Lockdown has happened (the caller's, exobox's, after the filter went in): from now on the
+/// boot thread's trapped calls are init's (the setup phase) until the program starts, and the
+/// loader ([`exec`]) runs. A misuse guard, not the TCB's: the loader refuses before it, so a
+/// program is never started without the filter.
+pub fn locked_down() {
+    S.locked.set(true);
+    S.phase.set(Phase::Setup);
 }
 
 /// Whether this process is a host fork's child that hasn't taken the guest over yet
@@ -386,59 +396,35 @@ pub fn forked() -> bool {
     S.host_pid.get() != 0 && pid != S.host_pid.get()
 }
 
-/// Before a host fork of the sandbox's process (a template's): in threaded mode the CPU token
-/// is taken, so the fork copies the kernel at rest (not mid-timer on the idler thread). Returns
-/// what [`fork_parent`] needs. Host code, outside a setup phase.
-pub fn fork_prepare() -> Option<u16> {
-    par::enabled().then(par::enter)
+/// A host fork's child (a template's instance, forked before lockdown) takes the guest over: the
+/// guest's pid is this process's (the filter's `kill` and [`die`]). Templates fork before
+/// threaded mode is switched on (at lockdown) and before any host thread but the boot thread
+/// exists, so nothing else needs making again. The guest's RNG is the caller's to reseed (its
+/// state is the parent's copy).
+pub fn fork_child() {
+    S.host_pid.set(host_pid());
 }
 
-/// The parent's side after the fork: the token given back.
-pub fn fork_parent(token: Option<u16>) {
-    if let Some(id) = token {
-        par::leave(id);
-    }
-}
-
-/// A host fork's child takes the guest over: the guest's pid is this process's (the filter's
-/// `kill` and [`die`]), and in threaded mode the host-thread state the fork didn't copy is made
-/// again (`par::after_fork`; the CPU-token eventfds, which a fork shares with the parent, the
-/// caller has made again first; the kernel idler thread, which the fork doesn't copy,
-/// `spawn_idler` starts). Then
-/// `token`, if [`fork_prepare`] took it, is given back. The guest's RNG is the caller's to reseed
-/// (its state is the parent's copy).
-pub fn fork_child(token: Option<u16>, spawn_idler: impl FnOnce()) -> Result<(), Error> {
-    // SAFETY: getpid.
-    S.host_pid.set(unsafe { trap::gate(39, 0, 0, 0, 0, 0, 0) } as u32);
-    if par::enabled() {
-        par::after_fork(&SCHED).map_err(err("threaded mode after a fork"))?;
-        spawn_idler();
-        par::wait_kernel_ready();
-        par::leave(token.unwrap_or(0));
-    }
-    Ok(())
-}
-
-/// Switch the runtime to threaded mode (a host thread per program thread): bind the main thread
-/// and install the scheduler driver. The CPU-token eventfds are the caller's to make first, at
-/// `par::EFD_BASE + slot` for each of `par::N_SLOTS` slots. Call once, after [`boot`] and before
-/// [`route`], on the main thread. The caller must also start the kernel idler host thread on
-/// [`threaded_kernel_main`].
+/// Switch the runtime to threaded mode (a host thread per program thread): the CPU tokens'
+/// eventfds made (fresh, kernel-numbered: [`token_fds`] says which), the main thread bound, the
+/// scheduler driver installed. Once, at lockdown (before the filter: it maps and makes fds), on
+/// the main thread. [`start_kernel_thread`] after the filter starts the kernel idler.
 pub fn enable_threaded() -> Result<(), Error> {
     // SAFETY: once, on the main (boot) thread, before lockdown.
     unsafe { par::enable(&SCHED, SCHED.current()) }.map_err(err("enabling threaded mode"))
 }
 
-/// The body of threaded mode's kernel idler host thread (the caller spawns it before [`route`]).
-/// Never returns.
-pub fn threaded_kernel_main() -> ! {
-    par::kernel_main()
+/// The CPU tokens' eventfds ([`enable_threaded`] made them), for the caller's lockdown to keep.
+pub fn token_fds() -> impl Iterator<Item = i32> {
+    par::token_fds()
 }
 
-/// Wait until the kernel idler host thread has installed its signal stack: the main thread calls
-/// this after spawning it and before [`route`] (whose filter is synced to every thread).
-pub fn threaded_wait_ready() {
-    par::wait_kernel_ready()
+/// Threaded mode's kernel idler host thread, started after lockdown (so lockdown saw one thread;
+/// it inherits the filter), through the filter's one `clone`, and waited for.
+pub fn start_kernel_thread() -> Result<(), Error> {
+    par::start_kernel().map_err(err("the kernel idler thread"))?;
+    par::wait_kernel_ready();
+    Ok(())
 }
 
 /// `[lo, hi)` of the image zone is writable on the host (an ELF's writable segments in its slot;
@@ -495,8 +481,11 @@ pub struct Aux {
 
 /// Load `path` from the guest's files into the arena, build its stack and start it on this
 /// (the root) coroutine, as init. Returns only if the program can't be loaded, with the errno an
-/// `execve` would give. From the setup phase (after [`route`]), on the root.
+/// `execve` would give (EPERM before lockdown: [`locked_down`]). After lockdown, on the root.
 pub fn exec(path: &[u8], argv: &[&[u8]], envp: &[&[u8]], aux: Aux) -> Errno {
+    if !S.locked.get() {
+        return Errno::PERM;
+    }
     S.aux.set(aux);
     // The loader's calls are the kernel's: in threaded mode with the CPU token (not a trap's
     // dispatch, which takes it itself), given up as the program starts.
@@ -529,8 +518,7 @@ pub fn exec(path: &[u8], argv: &[&[u8]], envp: &[&[u8]], aux: Aux) -> Errno {
 /// Run `f` as the program, on this (the root) coroutine, as init: from now on its syscalls are
 /// served as an exec'd program's are (the program phase: memory from the arena, signals, the
 /// guest's files), and its return value is the program's exit status, by its `exit_group`, a
-/// trapped call as any program's. After lockdown, from the setup phase (after [`route`]), on the
-/// root. The root's trap frames go below the trapping stack pointer (the program runs on the host
+/// trapped call as any program's. After lockdown ([`locked_down`]), on the root. The root's trap frames go below the trapping stack pointer (the program runs on the host
 /// thread's own stack here, not on one in the arena: `target`'s root case).
 pub fn run_fn(f: impl FnOnce() -> i32) -> ! {
     S.phase.set(Phase::Program);
@@ -559,7 +547,7 @@ fn load(path: &[u8], argv: &[&[u8]], envp: &[&[u8]], replace: bool) -> Result<Re
         return Err(Errno::IO);
     }
     // The program's credentials are init's as they are now (setup may have changed them:
-    // setresuid in a guard), as Linux's exec takes the task's.
+    // setresuid in a setup closure), as Linux's exec takes the task's.
     let id = |nr| lkl_quiet(nr, [0; 6]) as u32;
     let p = StackParams {
         execfn: path,
@@ -1562,8 +1550,7 @@ fn ret(r: Result<usize, Errno>) -> isize {
 /// phase, on the root's stack).
 fn target(uc: &Ucontext) -> usize {
     let sp = uc.mcontext.rsp as usize;
-    // Before the program: host code (the setup phase's, or any thread's in passthrough) on its
-    // own stack; no coroutine's control stack is the trapping thread's (the current coroutine may
+    // Before the program: host code (the setup phase's) on its own stack; no coroutine's control stack is the trapping thread's (the current coroutine may
     // be a kernel thread's, borrowed by setup's LKL call, and another thread may trap meanwhile).
     if S.phase.get() != Phase::Program {
         return trap::below_red_zone(uc);
@@ -1597,11 +1584,10 @@ fn target(uc: &Ucontext) -> usize {
 
 /// The dispatcher (`trap::Dispatch`).
 fn dispatch(uc: &mut Ucontext) {
-    match S.phase.get() {
-        Phase::Program => {}
-        Phase::Setup if host_tid() == S.setup_tid.get() => {}
-        // No setup phase, or another thread's call during one: the host's.
-        _ => return crate::passthrough::serve(uc),
+    // Outside setup and the program nothing traps (dispatch is off, no filter yet): a trap here
+    // is a bug of the runtime's, whose next host call would be served by nobody.
+    if S.phase.get() == Phase::Booted {
+        runtime_panic(&"a trapped syscall outside setup and the program");
     }
     let (nr, a) = uc.syscall();
     let s = crate::stats::syscall(nr);
@@ -1670,7 +1656,7 @@ fn serve(uc: &mut Ucontext, nr: usize, a: [usize; 6]) -> isize {
     if let Some(r) = exe {
         return r;
     }
-    // A guard is the guest's init, the machine's administrator: it names the machine
+    // Setup is the guest's init, the machine's administrator: it names the machine
     // (sethostname, setdomainname: the kernel's 161, 162) and sets its clock (settimeofday,
     // clock_settime: 170, 112; their structs are x86-64's). The program gets sysmap's EPERM for
     // them, as a machine's administration.
@@ -1891,7 +1877,7 @@ fn sigaction(a: [usize; 6]) -> isize {
 /// A memory call in the setup phase: host code's own memory, the host's (see the module comment).
 fn host_memory_call(nr: usize, a: [usize; 6]) -> isize {
     if S.host_memory.get() {
-        // SAFETY: the host code's own call, as it made it; the routing filter allows it.
+        // SAFETY: the host code's own call, as it made it, before lockdown.
         return unsafe { trap::gate(nr, a[0], a[1], a[2], a[3], a[4], a[5]) };
     }
     match nr {

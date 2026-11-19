@@ -26,12 +26,12 @@ futures-io = "0.3"
 futures-core = "0.3"
 # tokio's AsyncRead/AsyncWrite too, for providers built on them (capnweb-rs's channel)
 tokio = { version = "1", default-features = false, optional = true }
-# The TCB's constants and the API's host calls before lockdown (the auxiliary vector, entropy,
-# setrlimit, fcntl, fork)
+# The API's host calls before lockdown (the auxiliary vector, entropy, the reservations, fcntl,
+# fork, the pidfd)
 libc.workspace = true
 thiserror.workspace = true
-# The security filter's allowlist, compiled to classic BPF (src/tcb/filter.rs): Firecracker's
-seccompiler = "0.5"
+# The TCB: lockdown's checks and the filter (tcb/ at the repository's root)
+exobox-tcb = { path = "../../tcb" }
 [features]
 tokio = ["dep:tokio"]
 # The runtime's measurement counters, printed at the sandbox's end (exobox-rt's src/stats.rs).

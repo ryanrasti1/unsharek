@@ -229,12 +229,12 @@ dependencies = [
  "exobox-erofs",
  "exobox-fixtures",
  "exobox-rt",
+ "exobox-tcb",
  "futures-core",
  "futures-io",
  "libc",
  "libtest-mimic",
  "rustix",
- "seccompiler",
  "syscalls",
  "talc",
  "tempfile",
@@ -289,6 +289,14 @@ dependencies = [
  "object",
  "proptest",
  "rustix",
+]
+
+[[package]]
+name = "exobox-tcb"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "seccompiler",
 ]
 
 [[package]]

@@ -1,4 +1,4 @@
-//! The security filter as it was before seccompiler (exobox-rt's `filter.rs`, unchanged but for
+//! The filter as it was before seccompiler (exobox-rt's `filter.rs`, unchanged but for
 //! this line and the tests' module): kept as the oracle the new filter is checked against
 //! (`tests.rs`'s `same_as_the_old_filter`), test-only.
 //!

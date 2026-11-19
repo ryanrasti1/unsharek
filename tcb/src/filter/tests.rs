@@ -1,9 +1,10 @@
-//! The security filter, checked three ways: an interpreter for classic BPF run over every
-//! syscall number and every rule's argument edges; the same verdicts as the filter it replaced
-//! (`old`, the hand-written compiler), for every number, every argument edge of either, from the
-//! gate and elsewhere; and real installs in forked children.
+//! The filter, checked three ways: an interpreter for classic BPF run over every syscall number
+//! and every rule's argument edges; the same verdicts as the filter it replaced (`old`, the
+//! hand-written compiler), for every number, every argument edge of either, from the gate and
+//! elsewhere; and real installs in forked children (`tests/lockdown.rs` has the whole lockdown's).
 
 use super::*;
+use crate::{Access, Deny, Mode};
 use old::{Cond as OldCond, Params, Policy, Rule as OldRule};
 
 const GATE: u64 = 0x0000_7f12_3456_7890;
@@ -77,8 +78,28 @@ fn run(prog: &[SockFilter], d: &Data) -> u32 {
     }
 }
 
-fn pins(fds: &[RawFd]) -> Pins {
-    Pins { pid: PID, tokens: Some(TOKENS), fds: fds.to_vec() }
+/// The old filter's inputs: the pid, the token range (threaded and fork mode), and the passed
+/// and held fds. Stdio was implicit there; here it is the caller's grant.
+#[derive(Clone, Debug)]
+struct OldPins {
+    pid: u32,
+    tokens: Option<(RawFd, RawFd)>,
+    fds: Vec<RawFd>,
+}
+
+/// What exobox grants for those: stdin read, stdout and stderr write, each passed or held fd
+/// read and write, and the guest's token eventfds (read and write, as the guest's).
+fn pins_of(p: &OldPins) -> Pins {
+    let mut fds = vec![(0, Access::Read), (1, Access::Write), (2, Access::Write)];
+    fds.extend(p.fds.iter().map(|&fd| (fd, Access::ReadWrite)));
+    if let Some((lo, hi)) = p.tokens {
+        fds.extend((lo..=hi).map(|fd| (fd, Access::ReadWrite)));
+    }
+    Pins { pid: p.pid, fds }
+}
+
+fn pins(fds: &[RawFd]) -> OldPins {
+    OldPins { pid: PID, tokens: Some(TOKENS), fds: fds.to_vec() }
 }
 
 fn build_with(mode: Mode, deny: Deny, fds: &[RawFd]) -> Vec<SockFilter> {
@@ -86,7 +107,7 @@ fn build_with(mode: Mode, deny: Deny, fds: &[RawFd]) -> Vec<SockFilter> {
     if mode == Mode::Coroutine {
         p.tokens = None;
     }
-    security(mode, deny, &p, GATE).unwrap()
+    filter(mode, deny, &pins_of(&p), GATE).unwrap()
 }
 
 fn build(mode: Mode, deny: Deny) -> Vec<SockFilter> {
@@ -131,11 +152,11 @@ fn tok() -> (u64, u64) {
     (TOKENS.0 as u64, TOKENS.1 as u64)
 }
 
-/// The prologue's verdicts are KILL and TRAP only: whatever it decides, nothing it passes on is
+/// The gate check's verdicts are KILL and TRAP only: whatever it decides, nothing it passes on is
 /// allowed but by the allowlist after it.
 #[test]
-fn prologue_never_allows() {
-    for ins in prologue(GATE) {
+fn gate_check_never_allows() {
+    for ins in gate_check(GATE) {
         if ins.code == RET_K {
             assert!(ins.k == RET_KILL_PROCESS || ins.k == RET_TRAP, "{ins:?}");
         }
@@ -292,12 +313,24 @@ fn clone_and_exit() {
     }
 }
 
-/// The runtime makes its threads with the flags the filter pins (a mismatch would be a sandbox
-/// killed at its first thread, never a wider filter: this says which to fix).
+/// Grants: read-only is `read` only, write-only `write` only, and runs of consecutive fds are
+/// one rule (the edges of each run exact).
 #[test]
-fn the_runtimes_shapes() {
-    assert_eq!(CLONE_THREAD_FLAGS, exobox_rt::trap::CLONE_HOST_THREAD);
-    assert_eq!(PPOLL_FDS, exobox_rt::trap::PPOLL_FDS);
+fn access_is_real() {
+    let fds = vec![(5, Access::Read), (6, Access::Write), (7, Access::ReadWrite), (8, Access::ReadWrite), (9, Access::ReadWrite)];
+    let prog = filter(Mode::Coroutine, Deny::Errno, &Pins { pid: PID, fds }, GATE).unwrap();
+    let verdict = |nr, fd: u64| check(&prog, gate(nr, [fd, 0, 0, 0, 0, 0]));
+    for (fd, r, w) in [(4, false, false), (5, true, false), (6, false, true), (7, true, true), (9, true, true), (10, false, false)] {
+        let want = |ok| if ok { RET_ALLOW } else { EPERM_RET };
+        assert_eq!(verdict(NR_READ, fd), want(r), "read {fd}");
+        assert_eq!(verdict(NR_WRITE, fd), want(w), "write {fd}");
+    }
+    // Nothing granted: no read, no write, even on stdio.
+    let prog = filter(Mode::Coroutine, Deny::Errno, &Pins { pid: PID, fds: vec![] }, GATE).unwrap();
+    for fd in 0..4 {
+        assert_eq!(check(&prog, gate(NR_READ, [fd, 0, 0, 0, 0, 0])), EPERM_RET);
+        assert_eq!(check(&prog, gate(NR_WRITE, [fd, 0, 0, 0, 0, 0])), EPERM_RET);
+    }
 }
 
 #[test]
@@ -347,20 +380,22 @@ fn deny_kill_or_errno() {
 
 #[test]
 fn restriction_prologue_jumps_to_the_program() {
-    let user = [SockFilter { code: 0x06, jt: 0, jf: 0, k: 0 }];
-    let p = restriction(&user, 0x1234_5678_9abc);
-    // Every not-taken branch of the prologue lands on the caller's first instruction.
-    let start = p.len() - 1;
-    assert_eq!(2 + 1 + p[2].jf as usize, start);
-    assert_eq!(4 + 1 + p[4].jf as usize, start);
-    assert_eq!(6 + 1 + p[6].jf as usize, start);
-    assert_eq!(1 + 1 + p[1].jt as usize, 3);
+    // The caller's program: KILL everything.
+    let user = [SockFilter { code: 0x06, jt: 0, jf: 0, k: RET_KILL_PROCESS }];
+    let p = restriction(&user);
+    // seccomp (lockdown's next call) passes; everything else reaches the caller's program.
+    for ip in [GATE, 0] {
+        assert_eq!(run(&p, &Data { nr: libc::SYS_seccomp as u32, arch: AUDIT_ARCH_X86_64, ip, args: [0; 6] }), RET_ALLOW);
+        for nr in [0, 1, 157 /* prctl */, 316, 318] {
+            assert_eq!(run(&p, &Data { nr, arch: AUDIT_ARCH_X86_64, ip, args: [0; 6] }), RET_KILL_PROCESS);
+        }
+    }
 }
 
 // ------------------------------------------------------------------------------------------------
 // The same verdicts as the filter this one replaced.
 
-fn old_program(mode: Mode, deny: Deny, p: &Pins) -> Vec<SockFilter> {
+fn old_program(mode: Mode, deny: Deny, p: &OldPins) -> Vec<SockFilter> {
     let conds: Vec<[OldCond; 1]> = p.fds.iter().map(|&fd| [OldCond { arg: 0, lo: fd as u64, hi: fd as u64 }]).collect();
     let extra: Vec<OldRule> = conds
         .iter()
@@ -395,9 +430,9 @@ fn old_program(mode: Mode, deny: Deny, p: &Pins) -> Vec<SockFilter> {
 #[test]
 fn same_as_the_old_filter() {
     let pin_sets = [
-        Pins { pid: PID, tokens: Some(TOKENS), fds: vec![] },
-        Pins { pid: 1, tokens: Some((300, 428)), fds: vec![3, 1000, 255, 385] },
-        Pins { pid: 0x7fff_fffe, tokens: Some((256, 256)), fds: vec![0x7fff_ffff] },
+        OldPins { pid: PID, tokens: Some(TOKENS), fds: vec![] },
+        OldPins { pid: 1, tokens: Some((300, 428)), fds: vec![3, 1000, 255, 385] },
+        OldPins { pid: 0x7fff_fffe, tokens: Some((256, 256)), fds: vec![0x7fff_ffff] },
     ];
     let mut checked = 0u64;
     for mode in MODES {
@@ -407,7 +442,7 @@ fn same_as_the_old_filter() {
                 if mode == Mode::Coroutine {
                     p.tokens = None;
                 }
-                let new = security(mode, deny, &p, GATE).unwrap();
+                let new = filter(mode, deny, &pins_of(&p), GATE).unwrap();
                 let old = old_program(mode, deny, &p);
                 let (lo, hi) = p.tokens.unwrap_or((0, 0));
                 let mut ranges = vec![
@@ -494,51 +529,56 @@ fn same_as_the_old_filter() {
     eprintln!("{checked} cases, the same verdict each");
 }
 
-/// The routing filter (exobox-rt's, hand-written) against the old compiler's routing-only one.
-#[test]
-fn routing_same_as_the_old() {
-    let params = Params { policy: Policy::RouteOnly, deny: old::Deny::Kill, gate_ip: GATE, token_fds: (0, 0), pid: 0, extra: &[] };
-    let mut prog = old::Program::new();
-    old::compile(&params, &mut prog).unwrap();
-    let old: Vec<SockFilter> = prog.as_slice().iter().map(|f| SockFilter { code: f.code, jt: f.jt, jf: f.jf, k: f.k }).collect();
-    let new: Vec<SockFilter> =
-        exobox_rt::route::program(GATE).iter().map(|f| SockFilter { code: f.code, jt: f.jt, jf: f.jf, k: f.k }).collect();
-    for nr in (0..=500).chain([X32_SYSCALL_BIT, u32::MAX]) {
-        for arch in [AUDIT_ARCH_X86_64, 0x4000_0003] {
-            for ip in [GATE, GATE + 2, GATE ^ (1 << 40), 0] {
-                for args in [[0; 6], [u64::MAX; 6]] {
-                    let d = Data { nr, arch, ip, args };
-                    assert_eq!(run(&new, &d), run(&old, &d), "{d:x?}");
-                }
-            }
-        }
-    }
-}
-
 // ------------------------------------------------------------------------------------------------
 // The real kernel.
 
-/// Each mode's filter (deny = errno), stacked on the routing one as the sandbox does, in a forked
-/// child: through the gate a permitted write succeeds, getppid and a write to fd 3 are EPERM, and
-/// with TSYNC the install covers the thread made before it. The child makes no syscall outside
-/// the gate after the routing filter (it has no SIGSYS handler) and reports through its status.
+/// A gate for the tests: a `syscall` whose return address is [`test_gate_ip`].
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn test_gate(nr: usize, a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
+    core::arch::naked_asm!(
+        "mov rax, rdi",
+        "mov rdi, rsi",
+        "mov rsi, rdx",
+        "mov rdx, rcx",
+        "mov r10, r8",
+        "mov r8, r9",
+        "mov r9, [rsp + 8]",
+        "syscall",
+        ".globl exobox_tcb_filter_test_gate_ret",
+        "exobox_tcb_filter_test_gate_ret:",
+        "ret",
+    )
+}
+
+unsafe extern "C" {
+    static exobox_tcb_filter_test_gate_ret: u8;
+}
+
+fn test_gate_ip() -> u64 {
+    &raw const exobox_tcb_filter_test_gate_ret as u64
+}
+
+/// Each mode's filter (deny = errno) installed in a forked child: through the gate a granted
+/// write succeeds, getppid and a write to fd 3 are EPERM. The child makes no syscall outside the
+/// gate after the install (it has no SIGSYS handler: it would die of the trap) and reports
+/// through its status.
 #[test]
 fn installs_in_the_kernel() {
-    let gate_ip = exobox_rt::trap::gate_ip();
+    let gate_ip = test_gate_ip();
     for mode in MODES {
         let mut p = pins(&[]);
         // SAFETY: getpid.
         p.pid = unsafe { libc::getpid() } as u32;
-        if mode == Mode::Coroutine {
-            p.tokens = None;
-        }
-        let prog = security(mode, Deny::Errno, &p, gate_ip).unwrap();
-        let g = |nr: u32, a0: usize| unsafe { exobox_rt::trap::gate(nr as usize, a0, b"".as_ptr() as usize, 0, 0, 0, 0) };
+        p.tokens = None;
+        let prog = filter(mode, Deny::Errno, &pins_of(&p), gate_ip).unwrap();
+        // SAFETY: gate calls with a valid (empty) buffer.
+        let g = |nr: u32, a0: usize| unsafe { test_gate(nr as usize, a0, b"".as_ptr() as usize, 0, 0, 0, 0) };
         // SAFETY: the child only installs and calls the gate, then exits through it.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0);
         if pid == 0 {
-            let status = if exobox_rt::route::install().is_err() {
+            // SAFETY: prctl, then the install's own syscalls; nothing after but gate calls.
+            let status = if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
                 10
             } else if super::super::lockdown::install(&prog, true).is_err() {
                 11
@@ -555,6 +595,7 @@ fn installs_in_the_kernel() {
             unreachable!();
         }
         let mut status = 0;
+        // SAFETY: waitpid into a local.
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
         assert!(libc::WIFEXITED(status), "{mode:?}: child status {status:#x}");
         assert_eq!(libc::WEXITSTATUS(status), 0, "{mode:?}");

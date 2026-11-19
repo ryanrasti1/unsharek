@@ -1,14 +1,14 @@
-//! The host filter at work: a closure run as the sandbox's program (`Sandbox::run_fn`) tries to
+//! The host filter at work: a closure run as the sandbox's program (`Locked::run`) tries to
 //! reach the host, as a compromised program would. Run three ways:
 //!
 //! 1. as a sandbox is: its first forbidden host call kills the sandbox (SIGSYS);
 //! 2. with `.deny(Deny::Errno)`, a debugging knob the escape tests use: each forbidden call fails
 //!    with EPERM, and it lives to say so;
-//! 3. with a restriction on top (`Builder::restrict`, a seccomp program of the caller's, stacked
-//!    with the security filter) that kills `getppid` from anywhere: the program's own `getppid`,
+//! 3. with a restriction on top (`tcb::Config::restrict`, a seccomp program of the caller's,
+//!    stacked with the filter) that kills `getppid` from anywhere: the program's own `getppid`,
 //!    the guest's until now, kills it. A restriction sees the program's syscalls as well as the
-//!    gate's (a kill outranks the routing filter's trap; an errno doesn't, and is felt by the
-//!    gate's calls only), and only ever takes away.
+//!    gate's (a kill outranks the filter's trap; an errno doesn't, and is felt by the gate's calls
+//!    only), and only ever takes away.
 //!
 //!     cargo run -p exobox-examples --bin escape
 //!
@@ -16,12 +16,12 @@
 //! made from exobox's own syscall instruction, the "gate", which it finds by scanning the
 //! binary's code for it (it shares the address space: nothing in it is hidden from the program);
 //! a host file through the gate; and a host fd the process had open before lockdown (closed at
-//! lockdown: it isn't in the sandbox's inventory). The gate's address check only routes; what the
-//! gate may do is the security filter's short list, each argument pinned.
+//! lockdown: it wasn't granted). The gate's address check only routes; what the gate may do is the
+//! filter's short list, each argument pinned.
 
 use std::os::fd::AsRawFd;
 
-use exobox::{Deny, Mode, Sandbox, SockFilter};
+use exobox::{Deny, Guest, GuestConfig, SockFilter};
 use exobox_examples as ex;
 
 /// The gate's last instructions: `mov r9, [rsp + 8]; syscall; ret` (exobox-rt's `trap::gate`).
@@ -89,26 +89,28 @@ fn hostile(secret_fd: i32) -> i32 {
 
 fn sandbox(how: &str) -> ! {
     let run = || -> Result<std::convert::Infallible, exobox::Error> {
-        let b = Sandbox::builder().mode(Mode::Coroutine);
-        let b = match how {
-            "errno" => b.deny(Deny::Errno),
-            // Classic BPF over `struct seccomp_data`: the number, and getppid's is a kill
-            // (seccompiler or libseccomp would write the same program).
-            "restrict" => b.deny(Deny::Errno).restrict([
-                SockFilter { code: 0x20, jt: 0, jf: 0, k: 0 }, // load the syscall number
-                SockFilter { code: 0x15, jt: 0, jf: 1, k: libc::SYS_getppid as u32 },
-                SockFilter { code: 0x06, jt: 0, jf: 0, k: 0x8000_0000 }, // KILL_PROCESS
-                SockFilter { code: 0x06, jt: 0, jf: 0, k: 0x7fff_0000 }, // ALLOW
-            ]),
-            _ => b, // a sandbox as it is: the filter kills
-        };
-        let sb = b.build()?;
+        let g = Guest::boot(GuestConfig::default())?;
         // A host file opened before lockdown (here, this program's own binary), its fd number
         // kept for the closure: what a program might have inherited.
         let secret = std::fs::File::open(std::env::current_exe()?)?;
         let fd = secret.as_raw_fd();
         std::mem::forget(secret);
-        sb.run_fn(move || hostile(fd))
+        let locked = g.lockdown(|s| {
+            match how {
+                "errno" => drop(s.deny(Deny::Errno)),
+                // Classic BPF over `struct seccomp_data`: the number, and getppid's is a kill
+                // (seccompiler or libseccomp would write the same program).
+                "restrict" => drop(s.deny(Deny::Errno).restrict([
+                    SockFilter { code: 0x20, jt: 0, jf: 0, k: 0 }, // load the syscall number
+                    SockFilter { code: 0x15, jt: 0, jf: 1, k: libc::SYS_getppid as u32 },
+                    SockFilter { code: 0x06, jt: 0, jf: 0, k: 0x8000_0000 }, // KILL_PROCESS
+                    SockFilter { code: 0x06, jt: 0, jf: 0, k: 0x7fff_0000 }, // ALLOW
+                ])),
+                _ => {} // a sandbox as it is: the filter kills
+            }
+            exobox::stdio(s)
+        })?;
+        locked.run(move || hostile(fd))
     };
     let Err(e) = run();
     ex::fail(e)
@@ -121,8 +123,8 @@ fn main() {
     println!("this process (the sandbox's host parent) is pid {}", std::process::id());
     for (how, what) in [
         ("kill", "a sandbox as it is"),
-        ("errno", ".deny(Deny::Errno)"),
-        ("restrict", ".deny(Deny::Errno).restrict(getppid: kill)"),
+        ("errno", "s.deny(Deny::Errno)"),
+        ("restrict", "s.deny(Deny::Errno).restrict(getppid: kill)"),
     ] {
         println!("\n{what}");
         let out = ex::self_command(how).output().expect("spawn");

@@ -26,9 +26,11 @@ int main(int argc, char **argv)
 	CHECK(r == -EPERM, "openat via gate -> %ld", r);
 	r = gate(SYS_socket, 2, 1, 0, 0, 0, 0);
 	CHECK(r == -EPERM, "socket via gate -> %ld", r);
-	r = gate(SYS_write, 7, (long)"x", 1, 0, 0, 0);
-	CHECK(r == -EPERM, "write(7) via gate -> %ld", r);
-	printf("openat, socket, write(7) via gate -> EPERM\n");
+	/* An fd nobody was given (the low ones are the guest's CPU-token eventfds in threaded and
+	 * fork mode: kernel-numbered at lockdown, 3 and up). */
+	r = gate(SYS_write, 4001, (long)"x", 1, 0, 0, 0);
+	CHECK(r == -EPERM, "write(4001) via gate -> %ld", r);
+	printf("openat, socket, write(4001) via gate -> EPERM\n");
 
 	/* A new host process from anywhere: guest fork in fork mode, refused otherwise. */
 	if (!mode_is("fork")) {

@@ -2,7 +2,7 @@
 //!
 //! The program's AF_INET sockets are its own for loopback (127.0.0.0/8, 0.0.0.0): connects, binds
 //! and listens there are the guest kernel's, as always. Everything else goes to the hooks given
-//! to the sandbox's builder (`exobox::Builder::on_connect` and the rest):
+//! to the guest (`exobox::Guest::on_connect` and the rest):
 //!
 //! - **`on_connect(cx, pid, addr)`**: a program's `connect` to `addr`. `Ok(stream)`: the program's
 //!   connect succeeds, and exobox copies both ways between its socket and `stream` (who closes
@@ -22,14 +22,14 @@
 //!   that exobox picks (10.64.0.0/10, one per name, for the sandbox's life), and `on_connect`
 //!   learns which name an address came from with [`Cx::name_of`]: name-based policy with no
 //!   resolver of the provider's. (With an `on_resolve`, `name_of` names its addresses too.)
-//! - **`on_start(cx)`** (`exobox::Builder::on_start`): a task started at
+//! - **`on_start(cx)`** (`exobox::Guest::on_start`): a task started at
 //!   lockdown, before the program: a provider's session, up before the first connect.
 //!
 //! With no hook, everything but loopback is unreachable (`ENETUNREACH`, and lookups fail).
 //!
 //! **Templates.** The hooks are given at build, once for every instance a template forks; each
 //! instance holds its own provider's fd under a name
-//! (`exobox::Sandbox::hold_fd_as`), which a hook finds with [`Cx::held`].
+//! (`exobox::Guest::hold_fd_as`), which a hook finds with [`Cx::held`].
 //!
 //! **Errors** ([`NetError`]), as the program sees them: for a connect, `Denied` EACCES,
 //! `Refused` ECONNREFUSED, `Unreachable` ENETUNREACH, `Timeout` ETIMEDOUT, `NoName` ENETUNREACH,
@@ -55,7 +55,7 @@
 //! on one of its coroutines. A compromised program can read and write their memory, skip any
 //! check they make, and drive whatever connection a provider holds (a [`HeldFd`]) as it likes.
 //! None of this module is exobox's trusted computing base: the network's only part of that is
-//! the held fds themselves (which ones the sandbox holds, and the security filter allowing
+//! the held fds themselves (which ones the sandbox holds, and the filter allowing
 //! `read` and `write` on exactly those). So a held connection must carry no more authority than
 //! the program's own channel would: policy (which addresses, which names) is enforced at its far
 //! end, in the provider's own process, which exobox leaves agnostic, never in a hook. A hook is
@@ -63,7 +63,7 @@
 //!
 //! What the hooks may do: compute, allocate (exobox's allocator serves the sandbox after
 //! lockdown), spawn tasks ([`Cx::spawn`]), wait on time and on the host fds held for them
-//! (`exobox::Sandbox::hold_fd`, [`Cx::readable`]), and use streams opened
+//! (`exobox::Guest::hold_fd`, [`Cx::readable`]), and use streams opened
 //! before lockdown (a `TcpStream` connected before `run`, held). Not: make syscalls (they would
 //! be the guest's, as init's: a thread of the program's process, which an exec waits for), open
 //! host sockets or files (no host syscall is left for that), or block (the executor is one of
@@ -464,7 +464,7 @@ where
 pub struct Cx;
 
 impl Cx {
-    /// The fd held under `name` (`exobox::Sandbox::hold_fd_as`).
+    /// The fd held under `name` (`exobox::Guest::hold_fd_as`).
     pub fn held(&self, name: &str) -> Option<HeldFd> {
         names().held.iter().find(|(k, _)| k == name).map(|&(_, fd)| fd)
     }
@@ -515,7 +515,7 @@ impl Cx {
     }
 }
 
-/// A host fd held for the hooks (`exobox::Sandbox::hold_fd`): a provider's
+/// A host fd held for the hooks (`exobox::Guest::hold_fd`): a provider's
 /// connection, made before lockdown. Nonblocking; read and written through the runtime's gate,
 /// the filter allowing `read` and `write` on exactly this fd; waited on by the executor
 /// ([`Cx::readable`]). As `AsyncRead + AsyncWrite` it is a provider's stream. Open for the
@@ -536,7 +536,7 @@ fn io_err(e: Errno) -> io::Error {
 }
 
 impl HeldFd {
-    /// The handle of a host fd the sandbox's inventory holds (exobox's `Sandbox::hold_fd`).
+    /// The handle of a host fd the sandbox holds (exobox's `Guest::hold_fd`).
     #[doc(hidden)]
     pub fn from_raw(fd: RawFd) -> HeldFd {
         HeldFd { fd }

@@ -84,6 +84,8 @@ let
           ../Cargo.toml
           ../Cargo.lock
           (fs.difference ../native (fs.fileFilter (f: f.hasExt "md") ../native))
+          # exobox-tcb, the TCB (its own repository to be)
+          (fs.difference ../tcb (fs.fileFilter (f: f.hasExt "md") ../tcb))
           # A workspace member: cargo loads every member's manifest, built or not (the
           # package failed to build without it).
           (fs.difference ../examples (fs.fileFilter (f: f.hasExt "md") ../examples))
@@ -98,15 +100,16 @@ let
 
       # The hermetic tests only, with nextest (lkl-sys's boot test needs a process per test, as
       # in ./test): lkl-sys's (the given kernel boots, answers syscalls and halts; lkl.o has no
-      # relaxable relocations; the shim), and exobox's (the security filter's among them)
-      # and exobox-erofs's unit tests. Not the
+      # relaxable relocations; the shim), exobox-tcb's (the filter against the old compiler,
+      # lockdown and each of its refusals in forked children), and exobox's and exobox-erofs's
+      # unit tests. Not the
       # suite, the store test, erofs's image tests or exobox-rt's: they need the devshell's
       # programs (EXOBOX_TEST_*, fsck.erofs), the host's nix-store, or a kernel checkout.
       useNextest = true;
       # No spaces in an argument: the hook splits the flags on whitespace.
       cargoTestFlags = [
-        "-p" "lkl-sys" "-p" "exobox" "-p" "exobox-erofs"
-        "-E" "package(lkl-sys)|kind(lib)"
+        "-p" "lkl-sys" "-p" "exobox-tcb" "-p" "exobox" "-p" "exobox-erofs"
+        "-E" "package(lkl-sys)|package(exobox-tcb)|kind(lib)"
       ];
 
       passthru = { inherit kernel; };

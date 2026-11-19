@@ -1,24 +1,21 @@
-//! The security filter: which host syscalls the process may make after lockdown, each argument
-//! pinned. Built per mode from the authority inventory ([`super::inventory`]), compiled by
-//! seccompiler (Firecracker's), installed by [`super::lockdown`].
+//! The filter: which host syscalls the process may make after lockdown, each argument pinned.
+//! Built per mode from the grants and the guest's own fds, compiled by seccompiler (Firecracker's),
+//! installed by [`crate::lockdown`].
 //!
-//! **Shape.** A short hand-written prologue, then seccompiler's allowlist:
+//! **Shape.** A short hand-written gate check, then seccompiler's allowlist:
 //! 1. arch is not x86-64, or the x32 bit is set: KILL_PROCESS (the allowlist knows only x86-64
 //!    numbers, and must not judge another ABI's);
-//! 2. the instruction pointer is not the gate's (`exobox_rt::trap::gate_ip`): TRAP, the program's
-//!    call, served in-process by the guest kernel;
+//! 2. the instruction pointer is not the gate's ([`crate::Confined::gate_ip`]): TRAP, the
+//!    program's call, served in-process by the runtime's SIGSYS handler. Every thread and process
+//!    made after lockdown inherits the filter, so this is how all of them are served;
 //! 3. seccompiler's program over [`rules`]: a call that matches a rule is ALLOW, anything else
-//!    the deny action (KILL_PROCESS, or ERRNO(EPERM) for the CLI's hidden `--deny=errno`).
+//!    the deny action (KILL_PROCESS, or ERRNO(EPERM) for [`crate::Deny::Errno`]).
 //!
-//! **Why the prologue has a gate test.** The kernel runs every stacked filter and takes the
-//! strictest answer (KILL > TRAP > ERRNO > ALLOW). The routing filter under this one already
-//! traps every call not from the gate, but a plain allowlist whose default is KILL would outrank
-//! that TRAP: every program call not on the list (`openat`, `mmap`, ...) would kill the sandbox.
-//! So step 2 sends non-gate calls back to the guest itself. It is not trusted for isolation: its
-//! only verdicts are TRAP and KILL, never ALLOW, so whatever it decides, the host makes only
-//! calls the allowlist allows. The gate's address is the runtime's value, and needn't be trusted
-//! for the same reason. A reviewer checks the twelve instructions of [`prologue`] return nothing
-//! but TRAP and KILL, and then reads [`rules`].
+//! **Why the gate check is not trusted.** Its only verdicts are TRAP and KILL, never ALLOW: so
+//! whatever it decides, and whatever the gate's address (the guest's value, which a reviewer
+//! needn't trust), the host makes only calls the allowlist allows. A reviewer checks the twelve
+//! instructions of [`gate_check`] return nothing but TRAP and KILL, and then reads [`rules`].
+//! There is one filter; no `prctl`, `seccomp` or syscall-user-dispatch rule is in it.
 
 use std::collections::BTreeMap;
 use std::os::fd::RawFd;
@@ -27,6 +24,8 @@ use seccompiler::{
     BpfProgram, SeccompAction, SeccompCmpArgLen as Len, SeccompCmpOp as Op, SeccompCondition as Cond,
     SeccompFilter, SeccompRule, TargetArch,
 };
+
+use crate::{Access, Deny, Mode};
 
 /// One classic-BPF instruction (`struct sock_filter`, include/uapi/linux/filter.h).
 #[repr(C)]
@@ -38,32 +37,14 @@ pub struct SockFilter {
     pub k: u32,
 }
 
-/// How the threads and processes run: each mode's list is a superset of the one before.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Mode {
-    Coroutine,
-    Threaded,
-    Fork,
-}
-
-/// What a refused call from the gate gets.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Deny {
-    Kill,
-    /// EPERM: the escape tests' probes.
-    Errno,
-}
-
-/// The authority the filter pins, all of it the inventory's: values the host made, never the
-/// runtime's.
+/// What the filter pins: this process's pid, and every fd `read` or `write` may reach.
 #[derive(Clone, Debug)]
 pub(crate) struct Pins {
     /// The sandbox's own host pid: the one process `kill` may signal.
     pub pid: u32,
-    /// The CPU-token eventfds, an inclusive range of fds the inventory made (threaded and fork).
-    pub tokens: Option<(RawFd, RawFd)>,
-    /// Passed and held host fds: `read` and `write` on exactly these.
-    pub fds: Vec<RawFd>,
+    /// Each fd and what may be done on it (the caller's grants, and the guest's fds, read and
+    /// write). One entry per fd.
+    pub fds: Vec<(RawFd, Access)>,
 }
 
 // Syscall numbers (arch/x86/entry/syscalls/syscall_64.tbl), from libc.
@@ -71,7 +52,7 @@ const READ: i64 = libc::SYS_read;
 const WRITE: i64 = libc::SYS_write;
 
 /// The flags of a host thread's `clone`: a thread of this process, its tid cleared at its end.
-pub(crate) const CLONE_THREAD_FLAGS: u64 = (libc::CLONE_VM
+pub const CLONE_THREAD_FLAGS: u64 = (libc::CLONE_VM
     | libc::CLONE_FS
     | libc::CLONE_FILES
     | libc::CLONE_SIGHAND
@@ -79,7 +60,7 @@ pub(crate) const CLONE_THREAD_FLAGS: u64 = (libc::CLONE_VM
     | libc::CLONE_SYSVSEM
     | libc::CLONE_CHILD_CLEARTID) as u64;
 /// The most pollfds one `ppoll` may pass.
-pub(crate) const PPOLL_FDS: u64 = 8;
+pub const PPOLL_FDS: u64 = 8;
 
 fn eq(arg: u8, v: u64) -> Cond {
     Cond::new(arg, Len::Qword, Op::Eq, v).expect("an argument index below 6")
@@ -94,6 +75,27 @@ fn rule(conds: Vec<Cond>) -> SeccompRule {
     SeccompRule::new(conds).expect("a rule with conditions")
 }
 
+/// The fds `access` allows `nr` on (`read` for [`Access::Read`] and [`Access::ReadWrite`], `write`
+/// for the other two), as inclusive runs of consecutive fds: one rule per run, so a guest's 129
+/// token eventfds (made one after the other) are one comparison pair, not 129.
+fn runs(fds: &[(RawFd, Access)], write: bool) -> Vec<(u64, u64)> {
+    let mut v: Vec<u64> = fds
+        .iter()
+        .filter(|(fd, a)| *fd >= 0 && if write { a.writes() } else { a.reads() })
+        .map(|&(fd, _)| fd as u64)
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    let mut out: Vec<(u64, u64)> = vec![];
+    for fd in v {
+        match out.last_mut() {
+            Some((_, hi)) if *hi + 1 == fd => *hi = fd,
+            _ => out.push((fd, fd)),
+        }
+    }
+    out
+}
+
 /// The allowlist: syscall number to the rules any one of which allows it (a rule's conditions
 /// all hold; no rules: the number alone). Everything a mode's runtime makes and nothing else;
 /// each entry widens what a compromised program can do through the gate, so each says why.
@@ -101,17 +103,18 @@ pub(crate) fn rules(mode: Mode, pins: &Pins) -> BTreeMap<i64, Vec<SeccompRule>> 
     let threads = mode != Mode::Coroutine;
     let mut r: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
     // The SIGSYS handler's return (the runtime's restorer jumps to the gate's `syscall`), and a
-    // new host thread's start (`trap::clone_thread`'s frame).
+    // new host thread's start (its frame, built from a trapped `clone`'s).
     r.insert(libc::SYS_rt_sigreturn, vec![]);
     // Ending the process.
     r.insert(libc::SYS_exit_group, vec![]);
-    // The program's stdout and stderr, written by the runtime on its behalf; stdin, read.
-    r.entry(WRITE).or_default().push(rule(within(0, 1, 2)));
-    r.entry(READ).or_default().push(rule(vec![eq(0, 0)]));
-    // Passed and held fds (`pass_fd`, `hold_fd`): read and write on exactly each.
-    for &fd in &pins.fds {
-        r.entry(WRITE).or_default().push(rule(vec![eq(0, fd as u64)]));
-        r.entry(READ).or_default().push(rule(vec![eq(0, fd as u64)]));
+    // The granted fds and the guest's own: `read` and `write` on exactly those the access allows
+    // (stdio among them, as the caller granted it: the program's stdin read, stdout and stderr
+    // written by the runtime on its behalf; the CPU tokens' eventfds, blocked on and handed over).
+    for (write, nr) in [(false, READ), (true, WRITE)] {
+        for (lo, hi) in runs(&pins.fds, write) {
+            let conds = if lo == hi { vec![eq(0, lo)] } else { within(0, lo, hi) };
+            r.entry(nr).or_default().push(rule(conds));
+        }
     }
     // Ending it by a signal: the guest's process died of one (its default action), and the
     // sandbox dies of the same, as the program would natively. Only this process, only a signal
@@ -131,10 +134,6 @@ pub(crate) fn rules(mode: Mode, pins: &Pins) -> BTreeMap<i64, Vec<SeccompRule>> 
     // No memory call in any mode (no mmap, no madvise): the program's memory is the arena,
     // reserved before; madvise beside other threads' page faults is the Dirty-COW race class.
     if threads {
-        // Block on (read) and hand over (write) the CPU token: the eventfds, made by the inventory.
-        let (lo, hi) = pins.tokens.expect("the token eventfds, in threaded and fork mode");
-        r.entry(READ).or_default().push(rule(within(0, lo as u64, hi as u64)));
-        r.entry(WRITE).or_default().push(rule(within(0, lo as u64, hi as u64)));
         // A host thread per program thread: exactly one flag set, all 64 bits (no namespaces, no
         // CLONE_SETTLS, no vfork, no unknown high bits).
         r.entry(libc::SYS_clone).or_default().push(rule(vec![eq(0, CLONE_THREAD_FLAGS)]));
@@ -167,7 +166,7 @@ const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
 const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
 /// Steps 1 and 2 of the module comment. Verdicts: KILL_PROCESS and TRAP only.
-pub(crate) fn prologue(gate_ip: u64) -> [SockFilter; 12] {
+pub(crate) fn gate_check(gate_ip: u64) -> [SockFilter; 12] {
     let i = |code, jt, jf, k| SockFilter { code, jt, jf, k };
     [
         i(LD_W_ABS, 0, 0, 4), // arch
@@ -185,34 +184,29 @@ pub(crate) fn prologue(gate_ip: u64) -> [SockFilter; 12] {
     ]
 }
 
-/// The security filter for `mode`: the prologue, then the allowlist compiled by seccompiler.
-/// Classic BPF jumps are relative and forward, so the two concatenate as they are.
-pub(crate) fn security(mode: Mode, deny: Deny, pins: &Pins, gate_ip: u64) -> Result<Vec<SockFilter>, seccompiler::Error> {
+/// The filter for `mode`: the gate check, then the allowlist compiled by seccompiler. Classic
+/// BPF jumps are relative and forward, so the two concatenate as they are.
+pub(crate) fn filter(mode: Mode, deny: Deny, pins: &Pins, gate_ip: u64) -> Result<Vec<SockFilter>, seccompiler::Error> {
     let deny = match deny {
         Deny::Kill => SeccompAction::KillProcess,
         Deny::Errno => SeccompAction::Errno(libc::EPERM as u32),
     };
     let filter = SeccompFilter::new(rules(mode, pins), deny, SeccompAction::Allow, TargetArch::x86_64)?;
     let body: BpfProgram = filter.try_into()?;
-    let mut p = prologue(gate_ip).to_vec();
+    let mut p = gate_check(gate_ip).to_vec();
     p.extend(body.iter().map(|f| SockFilter { code: f.code, jt: f.jt, jf: f.jf, k: f.k }));
     Ok(p)
 }
 
-/// A caller's restriction as installed: its program after a prologue that lets exobox's own
-/// `prctl` and `seccomp` from the gate through (the security filter is installed after the
-/// restrictions, and refuses both). The prologue's ALLOW can't widen anything: ALLOW is the
-/// weakest verdict, and the security filter judges the same calls.
-pub(crate) fn restriction(insns: &[SockFilter], gate_ip: u64) -> Vec<SockFilter> {
+/// A caller's restriction as installed: its program after a prologue that lets the one
+/// `seccomp` lockdown makes after it through (the filter, installed after the restrictions). The
+/// prologue's ALLOW can't widen anything: ALLOW is the weakest verdict, and the filter, stacked
+/// on top, judges every call after it (and refuses `seccomp` from the gate, traps it elsewhere).
+pub(crate) fn restriction(insns: &[SockFilter]) -> Vec<SockFilter> {
     let i = |code, jt, jf, k| SockFilter { code, jt, jf, k };
     let mut p = vec![
-        i(LD_W_ABS, 0, 0, 0),                          // nr
-        i(JEQ_K, 1, 0, libc::SYS_prctl as u32),        // -> 3
-        i(JEQ_K, 0, 5, libc::SYS_seccomp as u32),      // else -> 8
-        i(LD_W_ABS, 0, 0, 8),                          // instruction_pointer, low half
-        i(JEQ_K, 0, 3, gate_ip as u32),                // else -> 8
-        i(LD_W_ABS, 0, 0, 12),                         // high half
-        i(JEQ_K, 0, 1, (gate_ip >> 32) as u32),        // else -> 8
+        i(LD_W_ABS, 0, 0, 0),                     // nr
+        i(JEQ_K, 0, 1, libc::SYS_seccomp as u32), // else -> the caller's
         i(RET_K, 0, 0, RET_ALLOW),
     ];
     p.extend_from_slice(insns);

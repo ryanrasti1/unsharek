@@ -14,7 +14,7 @@ use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use exobox::{Mode, Sandbox, setup, store};
+use exobox::{Guest, GuestConfig, setup, store};
 use exobox_examples as ex;
 
 /// The sandbox, in a child process of its own: `run` takes the process over.
@@ -23,15 +23,15 @@ fn sandbox(argv: Vec<OsString>) -> ! {
     // 1. Host work, before anything is locked down. The closure (every store path the program
     //    references, transitively, from `nix-store`) and an erofs image per store path, both
     //    cached: only the first run of a program builds anything.
-    //    (`Sandbox::map_closure` is these steps and the next in one call.)
+    //    (`Guest::map_closure` is these steps and the next in one call.)
     let cache = store::Cache::open_default().unwrap_or_else(|e| ex::fail(e.into()));
     let images = cache.store(Path::new(&argv[0]), &[]).unwrap_or_else(|e| ex::fail(e.into()));
     let closure_t = t.elapsed();
     // 2. Boot the guest kernel in this process (default mode: coroutines on this one thread).
-    let mut sb = Sandbox::builder().mode(Mode::Coroutine).build().unwrap_or_else(|e| ex::fail(e));
+    let mut g = Guest::boot(GuestConfig::default()).unwrap_or_else(|e| ex::fail(e));
     // 3. Map each image: a host mmap now, a read-only block device in the guest. After lockdown
     //    there is no host `open` or `mmap` left to do it with.
-    let mounts = sb.map_store(&images).unwrap_or_else(|e| ex::fail(e));
+    let mounts = g.map_store(&images).unwrap_or_else(|e| ex::fail(e));
     eprintln!(
         "[sandbox] {} store paths ({} images built): {:?} for the closure, {:?} to boot and map",
         mounts.len(),
@@ -39,15 +39,13 @@ fn sandbox(argv: Vec<OsString>) -> ! {
         closure_t,
         t.elapsed() - closure_t,
     );
-    // 4. In a guard this thread's syscalls are the guest's, as its init: the mounts happen inside.
-    {
-        let _g = sb.intercept().unwrap_or_else(|e| ex::fail(e));
-        setup::mount_closure(&mounts).unwrap_or_else(|e| ex::fail(e.into()));
-    }
-    // 5. The program is exec'd from the guest's files, behind the mode's filter. `run` returns
-    //    only if the program couldn't be started.
+    // 4. In a `run` closure this thread's syscalls are the guest's, as its init: the mounts
+    //    happen inside.
+    g.run(|| setup::mount_closure(&mounts)).unwrap_or_else(|e| ex::fail(e)).unwrap_or_else(|e| ex::fail(e.into()));
+    // 5. Lockdown (the program's stdio granted), then the program exec'd from the guest's files,
+    //    behind the mode's filter. `exec` returns only if the program couldn't be started.
     let env = ex::os(&["PATH=/bin", "LANG=C.UTF-8"]);
-    let Err(e) = sb.run(&argv, &env);
+    let Err(e) = g.lockdown(exobox::stdio).and_then(|l| l.exec(&argv, &env));
     ex::fail(e)
 }
 

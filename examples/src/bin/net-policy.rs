@@ -1,13 +1,13 @@
 //! Pluggable networking with a policy. Three processes:
 //!
 //! - this one: starts a local HTTP server and the proxy, builds the sandbox and forks it off
-//!   (`Sandbox::spawn`), the proxy and the sandbox joined by a socketpair;
+//!   (`Guest::spawn`), the proxy and the sandbox joined by a socketpair;
 //! - the proxy (this example re-run, started before the sandbox's first guard: after it, the
 //!   process can't exec): holds the real network and the policy, an allowlist of names and
 //!   ports, and logs every attempt with the guest pid that made it;
 //! - the sandbox: Python's `urllib` fetching an allowed URL and some refused ones. Its network
 //!   hooks (`OnConnect`, `OnResolve`) send every connect and lookup over its one held fd
-//!   (`Sandbox::hold_fd_as`, found by the hooks with `cx.held`) to the proxy
+//!   (`Guest::hold_fd_as`, found by the hooks with `cx.held`) to the proxy
 //!   (`exobox_examples::mux`: a tiny framing), a session started at lockdown (`on_start`). A
 //!   connect carries the name its address was resolved from (`cx.name_of`).
 //!
@@ -27,7 +27,7 @@ use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
-use exobox::{Mode, NetError, Sandbox, setup};
+use exobox::{Guest, GuestConfig, NetError, setup};
 use exobox_examples::{self as ex, mux};
 
 const CLIENT: &str = r#"
@@ -86,23 +86,18 @@ fn refuse(pid: i32, addr: SocketAddrV4, why: &str) -> Result<TcpStream, NetError
 fn sandbox(sock: UnixStream, urls: Vec<String>) -> Result<exobox::Child, exobox::Error> {
     let python = ex::nix_program("EXOBOX_TEST_PYTHON");
     let (on_connect, on_resolve) = mux::hooks();
-    let mut sb = Sandbox::builder()
-        .mode(Mode::Coroutine)
-        .on_connect(on_connect)
-        .on_resolve(on_resolve)
-        .on_start(mux::start)
-        .build()?;
-    sb.hold_fd_as("net", sock.into())?;
-    let store = sb.map_closure(&python, &[])?;
-    {
-        let _g = sb.intercept()?;
-        setup::mount_closure(&store)?;
-    }
+    let mut g = Guest::boot(GuestConfig::default())?;
+    g.on_connect(on_connect)?;
+    g.on_resolve(on_resolve)?;
+    g.on_start(mux::start);
+    g.hold_fd_as("net", sock.into())?;
+    let store = g.map_closure(&python, &[])?;
+    g.run(|| setup::mount_closure(&store))??;
     let mut argv = vec![python.display().to_string(), "-c".into(), CLIENT.into()];
     argv.extend(urls);
     let argv: Vec<_> = argv.into_iter().map(Into::into).collect();
     let env = ex::os(&["PYTHONUNBUFFERED=1"]); // its lines in order with the proxy's
-    sb.spawn(move |sb| sb.run(&argv, &env))
+    g.spawn(move |g| g.lockdown(exobox::stdio)?.exec(&argv, &env))
 }
 
 fn main() {

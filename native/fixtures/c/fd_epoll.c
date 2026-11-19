@@ -1,4 +1,4 @@
-// A passed host fd (Sandbox::pass_fd, at 1000) the guest epolls, as tokio would: not readable
+// A passed host fd (Guest::pass_fd, at 1000) the guest epolls, as tokio would: not readable
 // until the host writes (the host fd file's poll asks the host: the kernel's hostfd_poll), then
 // epoll_wait wakes (lkl_hostfd_ready from the runtime's idle wait). Prints FD_EPOLL_OK.
 #include "exobox_test.h"

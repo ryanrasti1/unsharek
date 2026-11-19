@@ -204,7 +204,7 @@ fn cases() -> Vec<Case> {
         // The filter.
         fixture("escape", ALL).args(vec![Arg::Secret]).flags(&["--deny=errno"]).native(None),
         fixture("escape_gate", ALL).flags(&["--deny=errno"]).native(None),
-        // A restriction (Builder::restrict) on top of the mode's list: tests/guest.rs.
+        // A restriction (tcb::Config::restrict) on top of the mode's list: tests/guest.rs.
         case(
             "escape_kill",
             Prog::Fixture("escape_kill"),

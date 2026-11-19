@@ -154,9 +154,12 @@ fn to_control(uc: &Ucontext) -> usize {
 /// The runtime's FS as `install` captured it (the child's, before lockdown).
 static RUNTIME: AtomicUsize = AtomicUsize::new(0);
 
-/// Install the handler on this (child) thread and the routing filter: every call not from the
-/// gate traps. (Which gate calls the host allows is the security filter's, exobox's TCB, tested
-/// there.)
+/// The selector syscall user dispatch reads: blocked, from `lockdown` on.
+static SELECTOR: u8 = SUD_BLOCK;
+
+/// Install the handler on this (child) thread and switch syscall user dispatch on: every call
+/// not from the gate traps, as setup's do before lockdown (and the program's after, by seccomp:
+/// the same entry; which gate calls the host allows is exobox-tcb's filter, tested there).
 fn lockdown(dispatch: Dispatch, target: Target) {
     RUNTIME.store(context::read_fs(), Ordering::Relaxed);
     // SAFETY: the child's own alternate stack; the dispatchers keep to the contract.
@@ -164,7 +167,8 @@ fn lockdown(dispatch: Dispatch, target: Target) {
         set_altstack(&raw mut ALT as *mut u8, ALTSTACK_SIZE).unwrap();
         install(dispatch, target).unwrap();
     }
-    crate::route::install().unwrap();
+    // SAFETY: a static selector, valid for the process's life.
+    unsafe { sud_on(&SELECTOR) }.unwrap();
 }
 
 /// A syscall *not* from the gate: after lockdown it traps.
@@ -283,7 +287,7 @@ fn traps_and_the_gate() {
         // A trap from inside the dispatcher: its frame lands below the outer one.
         check!(raw(NR_NESTED, args) == ((NR_NESTED - 1) * 1000 + 7 + 1) as isize, 7);
 
-        // Through the gate: the host's (routing allows every gate call).
+        // Through the gate: the host's (exempt from syscall user dispatch).
         // SAFETY: write of nothing; getppid.
         check!(unsafe { gate(1, 1, b"".as_ptr() as usize, 0, 0, 0, 0) } == 0, 10);
         check!(unsafe { gate(110, 0, 0, 0, 0, 0, 0) } > 0, 11);

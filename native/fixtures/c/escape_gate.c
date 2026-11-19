@@ -119,7 +119,10 @@ int main(void)
 	       gate(SYS_madvise, (long)getauxval(AT_SYSINFO_EHDR) & ~4095L, 4096, MADV_DONTNEED, 0, 0, 0), 0);
 	expect("write(1, \"\") via gate", gate(SYS_write, 1, (long)"", 0, 0, 0, 0), 1);
 	expect("read(1) via gate", gate(SYS_read, 1, (long)buf, 1, 0, 0, 0), 0);
-	expect("write(5) via gate", gate(SYS_write, 5, (long)"x", 1, 0, 0, 0), 0);
+	/* Not a low number: in threaded and fork mode the guest's CPU-token eventfds are fresh fds the
+	 * kernel numbered at lockdown (3 and up, as many as there are host-thread slots), granted read
+	 * and write. 4000 is open nowhere. */
+	expect("write(4000) via gate", gate(SYS_write, 4000, (long)"x", 1, 0, 0, 0), 0);
 	expect("write(1099) via gate", gate(SYS_write, 1099, (long)"x", 1, 0, 0, 0), 0);
 	expect("writev(2) via gate", gate(SYS_writev, 2, 0, 0, 0, 0, 0), 0);
 

@@ -239,12 +239,9 @@ fn mem_standalone(mode: Mode) -> Result<(), Failed> {
 fn template_process(mode: &str) -> ! {
     let m = if mode == "threaded" { exobox::Mode::Threaded } else { exobox::Mode::Coroutine };
     let prog = fx::bin("ready_idle");
-    let mut sb = exobox::Sandbox::builder().mode(m).build().unwrap();
-    let mounts = sb.map_closure(&prog, &[fx::bin_dir()]).unwrap();
-    {
-        let _g = sb.intercept().unwrap();
-        exobox::setup::mount_closure(&mounts).unwrap();
-    }
+    let mut g = exobox::Guest::boot(exobox::GuestConfig { mode: m, ..Default::default() }).unwrap();
+    let mounts = g.map_closure(&prog, &[fx::bin_dir()]).unwrap();
+    g.run(|| exobox::setup::mount_closure(&mounts)).unwrap().unwrap();
     let argv = [OsString::from(&prog)];
     let mut kids = vec![];
     // SAFETY: fd 3 is the control pipe the parent gave this process.
@@ -252,7 +249,15 @@ fn template_process(mode: &str) -> ! {
     let mut line = String::new();
     while ctl.read_line(&mut line).is_ok_and(|n| n > 0) {
         line.clear();
-        let child = sb.spawn(|sb| sb.run(&argv, &[])).unwrap();
+        let child = g
+            .spawn(|g| {
+                g.lockdown(|s| {
+                    s.grant(0, exobox::Access::Read).grant(1, exobox::Access::Write).grant(2, exobox::Access::Write);
+                    Ok(())
+                })?
+                .exec(&argv, &[])
+            })
+            .unwrap();
         println!("PID {}", child.pid());
         kids.push(child);
     }

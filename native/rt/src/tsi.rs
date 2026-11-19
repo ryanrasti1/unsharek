@@ -154,7 +154,7 @@ unsafe impl Sync for Registry {}
 
 static R: Registry = Registry { hooks: RefCell::new(Hooks { connect: None, listen: None, resolve: None }), objs: RefCell::new(Vec::new()) };
 
-/// Install the hooks (exobox's `Sandbox::run`, before the program starts).
+/// Install the hooks (exobox's `Guest::lockdown`, before the program starts).
 pub fn set_hooks(h: Hooks) {
     *R.hooks.borrow_mut() = h;
 }

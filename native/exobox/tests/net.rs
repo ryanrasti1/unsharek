@@ -378,43 +378,51 @@ fn provider() -> (OnConnect, OnResolve, OnListen) {
 }
 
 /// The child: a sandbox for argv (`ARGV`), with the provider (`provider`; `provider_user`: and
-/// the guard drops init to uid/gid 1000), the name-based one (`named`), or fd 3 passed as fd 1000
+/// the setup drops init to uid/gid 1000), the name-based one (`named`), or fd 3 passed as fd 1000
 /// (`passfd`). (A sandbox with no hooks is the CLI's: its unreachable network and loopback are
 /// guest-tests' net::unreachable and net::tcp_loopback.)
 fn child(kind: &str) -> ! {
     let argv: Vec<OsString> = std::env::var(ARGV).unwrap().split('\x1f').map(OsString::from).collect();
-    let mut b = exobox::Sandbox::builder();
+    let mut g = exobox::Guest::boot(exobox::GuestConfig::default()).unwrap();
     match kind {
         "provider" | "provider_syscall" | "provider_user" => {
             STRAY_SYSCALL.store(kind == "provider_syscall", std::sync::atomic::Ordering::Relaxed);
             let (connect, resolve, listen) = provider();
             // The session up before the program: no first hook has to start it.
-            b = b.on_connect(connect).on_resolve(resolve).on_listen(listen).on_start(|cx| async move {
+            g.on_connect(connect).unwrap();
+            g.on_resolve(resolve).unwrap();
+            g.on_listen(listen);
+            g.on_start(|cx| async move {
                 let _ = session(cx, net_fd(&cx));
             });
         }
-        "named" => b = b.on_connect(connect_hook(|name| name.as_deref() == Some("web.test"))),
+        "named" => g.on_connect(connect_hook(|name| name.as_deref() == Some("web.test"))).unwrap(),
         _ => {}
     }
-    let mut sb = b.build().unwrap();
     // SAFETY: fd 3 is this process's, from the parent, and nothing else owns it.
     let fd3 = unsafe { OwnedFd::from_raw_fd(3) };
     match kind {
-        "provider" | "provider_syscall" | "provider_user" | "named" => drop(sb.hold_fd_as("net", fd3).unwrap()),
-        "passfd" => sb.pass_fd(fd3, 1000).unwrap(),
+        "provider" | "provider_syscall" | "provider_user" | "named" => drop(g.hold_fd_as("net", fd3).unwrap()),
+        "passfd" => g.pass_fd(fd3, 1000).unwrap(),
         _ => drop(fd3),
     }
-    let mounts = sb.map_closure(Path::new(&argv[0]), &[fx::bin_dir()]).unwrap();
-    {
-        let _g = sb.intercept().unwrap();
+    let mounts = g.map_closure(Path::new(&argv[0]), &[fx::bin_dir()]).unwrap();
+    g.run(|| {
         exobox::setup::mount_closure(&mounts).unwrap();
         if kind == "provider_user" {
             // SAFETY: the guest's init dropping to uid/gid 1000 (a build user, as capnix's).
             unsafe { assert!(libc::setresgid(1000, 1000, 1000) == 0 && libc::setresuid(1000, 1000, 1000) == 0) };
         }
-    }
+    })
+    .unwrap();
     let env: Vec<OsString> = vec!["EXOBOX_TEST_MODE=coroutine".into()];
-    let e = sb.run(&argv, &env).unwrap_err();
+    let locked = g
+        .lockdown(|s| {
+            s.grant(0, exobox::Access::Read).grant(1, exobox::Access::Write).grant(2, exobox::Access::Write);
+            Ok(())
+        })
+        .unwrap();
+    let e = locked.exec(&argv, &env).unwrap_err();
     eprintln!("exobox: {e}");
     std::process::exit(125)
 }
@@ -625,8 +633,9 @@ fn main() {
         net("resolve", &["echo.test", "10.0.0.1", "nx.test", "denied.test"]),
         "NET_RESOLVE_OK",
     );
-    // The resolver's files are exobox's, written before the guards: a guard's setresuid doesn't
-    // keep them from being written (`run` wrote them after the guards, as uid 1000: EACCES).
+    // The resolver's files are exobox's, written when the hook is set, before the setup closures:
+    // a setup's setresuid doesn't keep them from being written (they were once written after
+    // setup, as uid 1000: EACCES).
     case(
         "net_resolve_user",
         "provider_user",

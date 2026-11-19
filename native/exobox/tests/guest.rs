@@ -1,22 +1,21 @@
 //! The library below the CLI, each case in a process of its own (a guest takes its process over):
 //! this binary re-runs itself as the child, which builds a guest or sandbox and runs a fixture.
 //!
-//! - Layer 1, `Guest` with only the routing filter: a program runs and its syscalls are the
-//!   guest's (hello: files, TCP, threads, memory), and the gate is not filtered (escape_kill's
-//!   `openat` through it reaches the host and succeeds).
-//! - Layer 3, `Sandbox`: the same gate call is refused once the mode's filter is stacked on the
-//!   routing one (deny=errno: EPERM, the program survives to say so).
-//! - `Sandbox::pass_fd`: a host socket as guest fd 1000 (fd_echo answers on it); and a thread
+//! - `Guest`, set up in a `run` closure, locked down, exec'd: a program runs and its syscalls are
+//!   the guest's (hello: files, TCP, threads, memory); the loader refuses before lockdown (a
+//!   `run` closure's exec is EPERM); and the gate is filtered (escape_kill's `openat` through it
+//!   is refused: deny=errno's EPERM, the program survives to say so).
+//! - `Guest::pass_fd`: a host socket as guest fd 1000 (fd_echo answers on it); and a thread
 //!   blocked reading it doesn't keep its process from ending (group_exit), in each mode.
-//! - `Sandbox::intercept`: what a guard routes (getpid, files, ids, the hostname) and what the
-//!   host code between guards still does as the host's (passthrough: files, a thread, a signal
-//!   handler, the signal mask, a fork, a refused exec), several guards in a row.
-//! - `Builder::restrict`: a restriction makes a call the mode allows fail (write to fd 2, from
-//!   the gate: killed, or EPERM), and leaves the mode's own probes as they were (escape_gate).
+//! - `Guest::run` before lockdown: what a closure routes (getpid, files, ids, the hostname) and
+//!   that the host code between closures is an ordinary process's (files, a thread, a signal
+//!   handler, the signal mask, a fork, an exec), several closures in a row.
+//! - `tcb::Config::restrict`: a restriction makes a call the mode allows fail (write to fd 2,
+//!   from the gate: killed, or EPERM), and leaves the mode's own probes as they were (escape_gate).
 //! - `Cache::images` and `setup::mount_closure` with store paths that are a file and a symlink
 //!   (`store_entries`): each shown at its store path as it is.
-//! - Templates (`Sandbox::spawn`): children of one setup, each running its own fixture and its
-//!   own setup, with random bytes of their own.
+//! - Templates (`Guest::spawn`): children of one setup, each running its own fixture and its own
+//!   setup, with random bytes of their own.
 
 use std::ffi::OsString;
 use std::io::Read;
@@ -25,7 +24,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use exobox::{Deny, Mode, Sandbox, SockFilter};
+use exobox::{Access, Deny, Guest, GuestConfig, Mode, SockFilter};
 use exobox_fixtures as fx;
 use libtest_mimic::{Arguments, Failed, Trial};
 
@@ -76,6 +75,17 @@ fn no_stderr(errno: bool) -> Vec<SockFilter> {
     ]
 }
 
+/// A guest for mode `m`.
+fn boot(m: Mode) -> Guest {
+    Guest::boot(GuestConfig { mode: m, ..Default::default() }).unwrap()
+}
+
+/// The program's stdio granted (stdin read, stdout and stderr write), and `deny`.
+fn stdio(s: &mut exobox::tcb::Config, deny: Deny) -> exobox::tcb::Result<()> {
+    s.grant(0, Access::Read).grant(1, Access::Write).grant(2, Access::Write).deny(deny);
+    Ok(())
+}
+
 /// The child: `layer` set up, then fixture `name` run.
 fn child(layer: &str, name: &str) -> ! {
     let (m, _) = mode();
@@ -83,66 +93,88 @@ fn child(layer: &str, name: &str) -> ! {
     let allow = [fx::bin_dir()];
     let e = match layer {
         "guest" => {
-            let mut g = exobox::Guest::boot(exobox::GuestConfig::default()).unwrap();
+            let mut g = boot(Mode::Coroutine);
             let mounts = g.map_closure(&program, &allow).unwrap();
-            {
-                let _g = g.intercept().unwrap();
-                exobox::setup::mount_closure(&mounts).unwrap();
-            }
-            g.run(&argv(name), &env()).unwrap_err()
+            g.run(|| exobox::setup::mount_closure(&mounts)).unwrap().unwrap();
+            let (argv, env) = (argv(name), env());
+            g.lockdown(|s| stdio(s, Deny::Kill)).unwrap().exec(&argv, &env).unwrap_err()
         }
-        "intercept" => intercept(m, name),
+        "exec_before" => {
+            // The loader refuses before lockdown, in a setup closure as anywhere.
+            let mut g = boot(m);
+            let mounts = g.map_closure(&program, &allow).unwrap();
+            let e = g
+                .run(|| {
+                    exobox::setup::mount_closure(&mounts).unwrap();
+                    exobox::execve(&argv(name), &env())
+                })
+                .unwrap();
+            let refused = matches!(&e, exobox::Error::Exec { errno, .. } if errno.raw_os_error() == Some(libc::EPERM));
+            println!("EXEC_BEFORE_LOCKDOWN {}", if refused { "refused" } else { "ran" });
+            std::process::exit(0)
+        }
+        "setup" => setup_closures(m, name),
         "entries" => entries(m),
         "template" => template(m),
         "run_fn" => run_fn(m, name),
         _ => {
-            let mut b = Sandbox::builder().mode(m).deny(Deny::Errno);
-            match layer {
-                "restrict_kill" => b = Sandbox::builder().mode(m).restrict(no_stderr(false)),
-                "restrict_errno" => b = b.restrict(no_stderr(true)),
-                _ => {}
-            }
-            let mut sb = b.build().unwrap();
+            let mut g = boot(m);
             if layer == "passfd" {
                 // The parent's socketpair end, inherited at fd 3 (`run_passfd`), as guest fd 1000.
                 // SAFETY: fd 3 is this process's, from the parent, and nothing else owns it.
-                sb.pass_fd(unsafe { std::os::fd::OwnedFd::from_raw_fd(3) }, 1000).unwrap();
+                g.pass_fd(unsafe { std::os::fd::OwnedFd::from_raw_fd(3) }, 1000).unwrap();
             }
-            let mounts = sb.map_closure(&program, &allow).unwrap();
-            {
-                let _g = sb.intercept().unwrap();
-                exobox::setup::mount_closure(&mounts).unwrap();
-            }
-            sb.run(&argv(name), &env()).unwrap_err()
+            let mounts = g.map_closure(&program, &allow).unwrap();
+            g.run(|| exobox::setup::mount_closure(&mounts)).unwrap().unwrap();
+            // The program's argv and env before lockdown: after it, `getppid` (env's target) is
+            // the guest's.
+            let (argv, env) = (argv(name), env());
+            let locked = g
+                .lockdown(|s| match layer {
+                    "restrict_kill" => {
+                        s.restrict(no_stderr(false));
+                        stdio(s, Deny::Kill)
+                    }
+                    "restrict_errno" => {
+                        s.restrict(no_stderr(true));
+                        stdio(s, Deny::Errno)
+                    }
+                    _ => stdio(s, Deny::Errno),
+                })
+                .unwrap();
+            locked.exec(&argv, &env).unwrap_err()
         }
     };
     eprintln!("exobox: {e}");
     std::process::exit(125)
 }
 
-/// Guards and the host code around them, then `name` (creds) run as uid 1000 on host `box`.
-fn intercept(m: Mode, name: &str) -> exobox::Error {
+/// Setup closures and the host code around them, then `name` (creds) run as uid 1000 on host
+/// `box`.
+fn setup_closures(m: Mode, name: &str) -> exobox::Error {
     let host_file = std::env::var("EXOBOX_GUEST_TEST_FILE").unwrap();
-    let mut sb = Sandbox::builder().mode(m).build().unwrap();
-    let mounts = sb.map_closure(&fx::bin(name), &[fx::bin_dir()]).unwrap();
+    let mut g = boot(m);
+    let mounts = g.map_closure(&fx::bin(name), &[fx::bin_dir()]).unwrap();
     let pid = std::process::id();
     // SAFETY: getpid.
     let getpid = || unsafe { libc::getpid() } as u32;
     check("before: getpid is the host's", getpid() == pid);
-    {
-        let _g = sb.intercept().unwrap();
-        check("guard 1: getpid is init's", getpid() == 1);
-        check("guard 1: the host's file isn't there", !std::path::Path::new(&host_file).exists());
+    let hf = host_file.clone();
+    g.run(|| {
+        check("setup 1: getpid is init's", getpid() == 1);
+        check("setup 1: the host's file isn't there", !std::path::Path::new(&hf).exists());
         exobox::setup::mount_closure(&mounts).unwrap();
-        std::fs::write("/exobox-guard-test", "made in guard 1").unwrap();
-    }
+        std::fs::write("/exobox-guard-test", "made in setup 1").unwrap();
+    })
+    .unwrap();
     check("after 1: getpid is the host's", getpid() == pid);
     check("after 1: a host file reads", std::fs::read_to_string(&host_file).is_ok_and(|s| s == "host data"));
     check("after 1: the guest's file isn't the host's", !std::path::Path::new("/exobox-guard-test").exists());
-    // A thread made now inherits the routing filter: its calls pass through too.
-    let t = std::thread::spawn(move || std::fs::read_to_string(&host_file).ok()).join().unwrap();
+    // Between closures the process is an ordinary one: a thread (joined before lockdown, which
+    // wants one thread), a signal handler, the mask, a fork, an exec.
+    let hf = host_file.clone();
+    let t = std::thread::spawn(move || std::fs::read_to_string(&hf).ok()).join().unwrap();
     check("after 1: a thread reads a host file", t.as_deref() == Some("host data"));
-    // A host signal handler runs, and returns (its rt_sigreturn trapped and made again).
     static GOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     extern "C" fn on_usr1(_: i32) {
         GOT.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -153,7 +185,6 @@ fn intercept(m: Mode, name: &str) -> exobox::Error {
         libc::raise(libc::SIGUSR1);
     }
     check("after 1: a host signal handler ran and returned", GOT.load(std::sync::atomic::Ordering::SeqCst));
-    // The mask: blocked, read back, unblocked (the frame's mask, which the trap's return restores).
     // SAFETY: sigprocmask on local sets.
     let masked = unsafe {
         let (mut set, mut old) = (std::mem::zeroed::<libc::sigset_t>(), std::mem::zeroed::<libc::sigset_t>());
@@ -164,7 +195,6 @@ fn intercept(m: Mode, name: &str) -> exobox::Error {
         libc::sigismember(&old, libc::SIGUSR2) == 1
     };
     check("after 1: sigprocmask keeps the mask", masked);
-    // A host fork: the child returns from it as the parent does.
     // SAFETY: fork; the child only exits.
     let c = unsafe { libc::fork() };
     if c == 0 {
@@ -173,46 +203,47 @@ fn intercept(m: Mode, name: &str) -> exobox::Error {
     }
     let st = exobox::wait(c as u32).ok().and_then(|s| s.code());
     check("after 1: a host fork's child ran", st == Some(7));
-    // A host program can't start any more: the filters would follow it into the exec.
-    let spawned = Command::new("/bin/sh").arg("-c").arg("true").status();
-    check("after 1: exec is refused", spawned.is_err());
-    {
-        let _g = sb.intercept().unwrap();
-        check("guard 2: guard 1's file is still there", std::fs::read_to_string("/exobox-guard-test").is_ok_and(|s| s == "made in guard 1"));
+    // Syscall user dispatch is the thread's and exec clears it: a host program runs as ever.
+    let spawned = Command::new("/bin/sh").arg("-c").arg("exit 5").status();
+    check("after 1: a host program runs", spawned.is_ok_and(|s| s.code() == Some(5)));
+    g.run(|| {
+        check("setup 2: setup 1's file is still there", std::fs::read_to_string("/exobox-guard-test").is_ok_and(|s| s == "made in setup 1"));
         // SAFETY: the guest's init dropping to uid/gid 1000, naming its host, setting its clock
-        // (to the host's time: the vDSO's, which a guard's clock_gettime is).
+        // (to the host's time: the vDSO's, which a setup's clock_gettime is).
         unsafe {
-            check("guard 2: sethostname", libc::sethostname(c"box".as_ptr(), 3) == 0);
+            check("setup 2: sethostname", libc::sethostname(c"box".as_ptr(), 3) == 0);
             let mut ts = std::mem::zeroed::<libc::timespec>();
             libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts);
-            check("guard 2: clock_settime", libc::clock_settime(libc::CLOCK_REALTIME, &ts) == 0);
+            check("setup 2: clock_settime", libc::clock_settime(libc::CLOCK_REALTIME, &ts) == 0);
             let tv = libc::timeval { tv_sec: ts.tv_sec, tv_usec: ts.tv_nsec / 1000 };
-            check("guard 2: settimeofday", libc::settimeofday(&tv, std::ptr::null()) == 0);
-            check("guard 2: setresgid", libc::setresgid(1000, 1000, 1000) == 0);
-            check("guard 2: setresuid", libc::setresuid(1000, 1000, 1000) == 0);
+            check("setup 2: settimeofday", libc::settimeofday(&tv, std::ptr::null()) == 0);
+            check("setup 2: setresgid", libc::setresgid(1000, 1000, 1000) == 0);
+            check("setup 2: setresuid", libc::setresuid(1000, 1000, 1000) == 0);
         }
-    }
-    {
-        let _g = sb.intercept().unwrap();
+    })
+    .unwrap();
+    g.run(|| {
         // uid 1000 uses /dev's nodes (they were 0644, root's: capnix's build user couldn't write
         // /dev/null).
-        check("guard 3: uid 1000 writes /dev/null", std::fs::write("/dev/null", "x").is_ok());
+        check("setup 3: uid 1000 writes /dev/null", std::fs::write("/dev/null", "x").is_ok());
         for dev in ["/dev/zero", "/dev/urandom"] {
             let mut b = [0u8; 16];
             let read = std::fs::File::open(dev).and_then(|mut f| f.read_exact(&mut b));
-            check(&format!("guard 3: uid 1000 reads {dev}"), read.is_ok());
+            check(&format!("setup 3: uid 1000 reads {dev}"), read.is_ok());
         }
-        // A guard's clock_settime is the guest kernel's, which asks for CAP_SYS_TIME: uid 1000
+        // A setup's clock_settime is the guest kernel's, which asks for CAP_SYS_TIME: uid 1000
         // has none. (The program's gets sysmap's EPERM whoever it is: sysaudit.)
         // SAFETY: a timespec of the host's time.
         unsafe {
             let mut ts = std::mem::zeroed::<libc::timespec>();
             libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts);
-            check("guard 3: uid 1000 can't set the clock", libc::clock_settime(libc::CLOCK_REALTIME, &ts) != 0);
+            check("setup 3: uid 1000 can't set the clock", libc::clock_settime(libc::CLOCK_REALTIME, &ts) != 0);
         }
-    }
+    })
+    .unwrap();
     check("after 2: getpid is the host's", getpid() == pid);
-    sb.run(&argv(name), &env()).unwrap_err()
+    let (argv, env) = (argv(name), env());
+    g.lockdown(|s| stdio(s, Deny::Kill)).unwrap().exec(&argv, &env).unwrap_err()
 }
 
 /// Store-like paths (`ENTRIES`, in a temporary directory: the suite can't count on a store path
@@ -229,35 +260,37 @@ fn entries(m: Mode) -> exobox::Error {
     for m in &mut store.mounts {
         m.guest = std::path::Path::new("/nix/store").join(m.guest.file_name().unwrap());
     }
-    let mut sb = Sandbox::builder().mode(m).build().unwrap();
-    let mut mounts = sb.map_store(&store).unwrap();
-    mounts.extend(sb.map_closure(&fx::bin("paths"), &[fx::bin_dir()]).unwrap());
-    {
-        let _g = sb.intercept().unwrap();
-        exobox::setup::mount_closure(&mounts).unwrap();
-    }
+    let mut g = boot(m);
+    let mut mounts = g.map_store(&store).unwrap();
+    mounts.extend(g.map_closure(&fx::bin("paths"), &[fx::bin_dir()]).unwrap());
+    g.run(|| exobox::setup::mount_closure(&mounts)).unwrap().unwrap();
     let mut argv = argv("paths");
     argv.extend(ENTRIES.iter().map(|n| format!("/nix/store/{n}").into()));
-    sb.run(&argv, &env()).unwrap_err()
+    let env = env();
+    g.lockdown(|s| stdio(s, Deny::Kill)).unwrap().exec(&argv, &env).unwrap_err()
 }
 
 /// A template: one setup, then four children in turn, each with setup of its own and its own
 /// fixture. Prints each one's status; their output is theirs (stdout, in turn).
-/// `Sandbox::run_fn`: a closure run as the program, after lockdown. `ok`: its calls are the
+/// `Locked::run`: a closure run as the program, after lockdown. `ok`: its calls are the
 /// guest's (init's pid, the guest's files, no host path), a host fd from before lockdown is
 /// closed, and its return value is the status (42). `gate`: a host call from the gate is the
-/// security filter's (EPERM with deny=errno, which `ok` doesn't set: the kill is checked by
+/// filter's (EPERM with deny=errno, which `ok` doesn't set: the kill is checked by
 /// `run_fn_gate_kills`).
 fn run_fn(m: Mode, what: &str) -> exobox::Error {
     let deny = if what == "errno" { Deny::Errno } else { Deny::Kill };
-    let sb = Sandbox::builder().mode(m).deny(deny).build().unwrap();
+    let g = boot(m);
     // A host fd opened now, before lockdown: the closure finds it closed.
     let before = std::fs::File::open(env!("CARGO_MANIFEST_DIR")).unwrap();
     let before_fd = before.as_raw_fd();
     std::mem::forget(before);
     let host_path = env!("CARGO_MANIFEST_DIR");
     let what = what.to_owned();
-    let Err(e) = sb.run_fn(move || {
+    let locked = match g.lockdown(|s| stdio(s, deny)) {
+        Ok(l) => l,
+        Err(e) => return e,
+    };
+    let Err(e) = locked.run(move || {
         // SAFETY: getpid; fcntl on a number.
         check("run_fn: getpid is init's", unsafe { libc::getpid() } == 1);
         check("run_fn: the guest's files", std::fs::write("/tmp/run_fn", "x").is_ok() && std::fs::read("/tmp/run_fn").is_ok_and(|b| b == b"x"));
@@ -317,31 +350,32 @@ fn gate_call4(gate: usize, nr: i64, a: [usize; 4]) -> isize {
 }
 
 fn template(m: Mode) -> exobox::Error {
-    let mut sb = Sandbox::builder().mode(m).build().unwrap();
-    let mounts = sb.map_closure(&fx::bin("hello"), &[fx::bin_dir()]).unwrap();
-    {
-        let _g = sb.intercept().unwrap();
+    let mut g = boot(m);
+    let mounts = g.map_closure(&fx::bin("hello"), &[fx::bin_dir()]).unwrap();
+    g.run(|| {
         exobox::setup::mount_closure(&mounts).unwrap();
         std::fs::create_dir_all("/etc").unwrap();
         std::fs::write("/etc/template", "shared").unwrap();
-    }
+    })
+    .unwrap();
     // The last dies of SIGABRT: a child's death by a signal is its own (its pid, not the
     // template's, is the one the runtime and the filter's `kill` name).
     let runs: [(&str, &[&str]); 5] =
         [("creds", &[]), ("creds", &[]), ("hello", &[]), ("exit_status", &["exit42"]), ("exit_status", &["abort"])];
     for (n, (fixture, args)) in runs.iter().enumerate() {
-        let child = sb
-            .spawn(move |mut sb| {
-                {
-                    let _g = sb.intercept()?;
+        let child = g
+            .spawn(move |mut g| {
+                g.run(|| -> std::io::Result<()> {
                     let host = format!("child-{n}");
                     // SAFETY: a NUL-free name, its length.
                     unsafe { libc::sethostname(host.as_ptr().cast(), host.len()) };
                     assert_eq!(std::fs::read_to_string("/etc/template")?, "shared");
-                }
+                    Ok(())
+                })??;
                 let mut argv: Vec<OsString> = vec![fx::bin(fixture).into()];
                 argv.extend(args.iter().map(OsString::from));
-                sb.run(&argv, &env())
+                let env = env();
+                g.lockdown(|s| stdio(s, Deny::Kill))?.exec(&argv, &env)
             })
             .unwrap();
         let st = child.wait().unwrap();
@@ -426,17 +460,17 @@ fn main() {
             }
             Ok(())
         }),
-        Trial::test("guest_gate_is_unfiltered", || {
-            // Routing only: openat("/") through the gate is the host's, and succeeds.
-            let (st, out, err) = run("guest", "escape_kill", "coroutine", &[])?;
-            let fd = out.trim().strip_prefix("ESCAPE_KILL_SURVIVED ").and_then(|v| v.parse::<i64>().ok());
-            if st.code() != Some(1) || !fd.is_some_and(|fd| fd >= 0) {
-                return fail(st, &out, &err, "wanted the gate's openat to succeed");
+        Trial::test("exec_refused_before_lockdown", || {
+            // The loader is the program's start, and starts nothing unfiltered: a setup closure's
+            // exec is EPERM.
+            let (st, out, err) = run("exec_before", "hello", "coroutine", &[])?;
+            if st.code() != Some(0) || out.trim() != "EXEC_BEFORE_LOCKDOWN refused" {
+                return fail(st, &out, &err, "wanted the exec refused");
             }
             Ok(())
         }),
         Trial::test("sandbox_gate_is_filtered", || {
-            // The mode's filter stacked: the same call is EPERM (deny=errno).
+            // The filter: openat("/") through the gate is EPERM (deny=errno).
             let (st, out, err) = run("sandbox", "escape_kill", "coroutine", &[])?;
             if st.code() != Some(1) || out.trim() != "ESCAPE_KILL_SURVIVED -1" {
                 return fail(st, &out, &err, "wanted EPERM from the gate");
@@ -481,11 +515,11 @@ fn main() {
                 Ok(())
             }));
         }
-        trials.push(Trial::test(format!("intercept::{mode}"), move || {
+        trials.push(Trial::test(format!("setup_closures::{mode}"), move || {
             let dir = tempfile::tempdir()?;
             let file = dir.path().join("host-file");
             std::fs::write(&file, "host data")?;
-            let (st, out, err) = run("intercept", "creds", mode, &[("EXOBOX_GUEST_TEST_FILE", file.to_str().unwrap())])?;
+            let (st, out, err) = run("setup", "creds", mode, &[("EXOBOX_GUEST_TEST_FILE", file.to_str().unwrap())])?;
             if st.code() != Some(0) || out.contains("FAIL") || !out.contains("CREDS_OK") {
                 return fail(st, &out, &err, "a check failed");
             }

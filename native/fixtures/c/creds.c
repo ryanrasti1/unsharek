@@ -1,5 +1,5 @@
 // The program's credentials and its random bytes, for the library's tests (tests/guest.rs): a
-// setresuid/setresgid in an intercept guard must reach the exec'd program (its ids and the
+// setresuid/setresgid in a setup closure must reach the exec'd program (its ids and the
 // auxiliary vector's AT_UID/AT_EUID/AT_GID/AT_EGID come from init's credentials at exec, not
 // fixed 0s: they were, before). And getrandom's bytes, which two template children must not
 // share (a fork copies the guest's RNG). Prints `CREDS uid euid gid egid auid aeuid agid aegid`,

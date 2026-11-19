@@ -69,10 +69,6 @@ pub const N_SLOTS: usize = PROG_SLOTS + 1;
 /// No slot (the token is free): distinct from every real slot.
 pub const NONE_SLOT: u32 = u32::MAX;
 
-/// The eventfds' fixed fd range: slot `i` reads/writes `EFD_BASE + i`. The host (exobox's
-/// inventory) makes them there before [`enable`], and again in a fork's child before
-/// [`after_fork`]; its security filter pins the token `read`/`write` to the range it made.
-pub const EFD_BASE: u32 = 256;
 /// A lazy thread's first (boot) stack: `thread_start`'s frame and the `rt_sigreturn` frame, until
 /// it jumps to the program. Small; the program then runs on its own stack. Sized so a slot's
 /// stacks (alternate + boot) are a power of two: [`me`] finds the slot by a shift.
@@ -87,8 +83,10 @@ const POLLIN: i16 = 1;
 /// One host thread's record, found from the stack pointer ([`me`]); its slot index keys the token.
 pub struct HostSlot {
     id: u16,
-    /// `EFD_BASE + id`.
-    efd: u32,
+    /// Its eventfd, made by [`enable`] (plain `eventfd`, a fresh fd the kernel numbered: never
+    /// put on a chosen number, where one of the host's would have been closed for it). Fork
+    /// mode's processes share it (made before the first fork, inherited).
+    efd: Cell<u32>,
     /// The slot is in use (a live host thread).
     used: AtomicBool,
     /// Made after lockdown (a program thread), vs the main or kernel thread.
@@ -130,7 +128,7 @@ impl HostSlot {
     const fn new(id: u16) -> Self {
         HostSlot {
             id,
-            efd: EFD_BASE + id as u32,
+            efd: Cell::new(u32::MAX),
             used: AtomicBool::new(false),
             proc: AtomicU32::new(0),
             lazy: Cell::new(false),
@@ -168,7 +166,7 @@ pub struct Threaded {
     /// Acquire-waiter FIFO (slot ids), under `spin`.
     whead: Cell<u16>,
     wtail: Cell<u16>,
-    /// The kernel idler thread has set up its signal stack (before the TSYNC `route` may reach it).
+    /// The kernel idler thread has started ([`start_kernel`]).
     k_ready: AtomicBool,
     /// Next lazy slot search start.
     next: AtomicU32,
@@ -304,7 +302,7 @@ fn unlock() {
 /// Hand `id` the token: a write on its eventfd (its blocking read returns).
 fn poke(id: u16) {
     crate::stats::count(crate::stats::K::Poke, 0);
-    let _ = trap::eventfd_write(slot(id).efd, 1);
+    let _ = trap::eventfd_write(slot(id).efd.get(), 1);
 }
 
 /// Block until this host thread holds the token: assigned to it, or offered ([`hand`]) and free
@@ -380,7 +378,7 @@ fn wait_token_inner(id: u16) {
         }
         if forked() {
             let mut fds = [
-                PollFd { fd: slot(id).efd as i32, events: POLLIN, revents: 0 },
+                PollFd { fd: slot(id).efd.get() as i32, events: POLLIN, revents: 0 },
                 PollFd { fd: LOCAL.init_pidfd.load(Ordering::Relaxed), events: POLLIN, revents: 0 },
             ];
             if trap::ppoll_fds(&mut fds, None).is_ok() && fds[1].revents != 0 {
@@ -390,7 +388,7 @@ fn wait_token_inner(id: u16) {
                 continue;
             }
         }
-        let _ = trap::eventfd_read(slot(id).efd);
+        let _ = trap::eventfd_read(slot(id).efd.get());
     }
 }
 
@@ -575,9 +573,9 @@ fn sched_loop(arg: usize) -> usize {
             }
             let ns = d.saturating_sub(s.now());
             let ts = Timespec { tv_sec: (ns / 1_000_000_000) as i64, tv_nsec: (ns % 1_000_000_000) as i64 };
-            let mut p = PollFd { fd: h.efd as i32, events: POLLIN, revents: 0 };
+            let mut p = PollFd { fd: h.efd.get() as i32, events: POLLIN, revents: 0 };
             if trap::ppoll(Some(&mut p), Some(&ts)).is_ok_and(|n| n > 0) {
-                let _ = trap::eventfd_read(h.efd);
+                let _ = trap::eventfd_read(h.efd.get());
             }
             lock();
             PAR.idler_until.store(u64::MAX, Ordering::Relaxed);
@@ -604,7 +602,7 @@ fn sched_loop(arg: usize) -> usize {
         // Keep the token and ppoll to the deadline on our eventfd (woken early by an acquirer's
         // poke) and the watched fds. On return, loop: fire due timers, run what an fd woke.
         unlock();
-        fds[0] = PollFd { fd: h.efd as i32, events: POLLIN, revents: 0 };
+        fds[0] = PollFd { fd: h.efd.get() as i32, events: POLLIN, revents: 0 };
         let n = 1 + crate::host::idle_fds(&mut fds[1..]);
         let ts = deadline.map(|d| {
             let ns = d.saturating_sub(s.now());
@@ -613,7 +611,7 @@ fn sched_loop(arg: usize) -> usize {
         let polled = crate::stats::time(crate::stats::K::KernelPpoll, || trap::ppoll_fds(&mut fds[..n], ts.as_ref()));
         if polled.is_ok_and(|r| r > 0) {
             if fds[0].revents != 0 {
-                let _ = trap::eventfd_read(h.efd);
+                let _ = trap::eventfd_read(h.efd.get());
             }
             LAST_LOOK.0.set(s.now());
             crate::host::idle_ready(&fds[1..n]);
@@ -636,17 +634,15 @@ struct LastLook(Cell<u64>);
 // SAFETY: only the kernel thread touches it.
 unsafe impl Sync for LastLook {}
 
-/// The kernel/idler host thread. Set up before lockdown, then loops as the scheduler coroutine of
-/// slot [`KERNEL`]. Never returns.
-pub fn kernel_main() -> ! {
+/// The kernel/idler host thread, started after lockdown by [`start_kernel`] (its alternate stack
+/// installed by the start's frame), then the scheduler coroutine of slot [`KERNEL`]. Never
+/// returns.
+extern "C" fn kernel_main(_: usize) -> ! {
     let id = KERNEL;
-    // SAFETY: once per process, before lockdown (sigaltstack is still allowed).
-    unsafe {
-        setup_host(id, false);
-    }
+    // Not lazy (a program thread's slot), though started like one: its alternate stack is
+    // installed by the start's frame.
+    slot(id).lazy.set(false);
     slot(id).used.store(true, Ordering::Release);
-    // Signal that our signal stack is installed, so the main thread may now install the TSYNC
-    // routing filter (after which only gate calls are allowed, which is all we make).
     PAR.k_ready.store(true, Ordering::Release);
     // Wait to be handed the token (never enqueue as an acquire-waiter: the kernel thread runs only
     // when a release hands it work, chiefly a pending timer deadline).
@@ -658,12 +654,36 @@ pub fn kernel_main() -> ! {
     unreachable!("kernel sched loop returned")
 }
 
-/// Spin until the kernel idler thread has installed its signal stack (the main thread calls this
-/// after spawning it and before `route`, which would TSYNC a filter onto it).
+/// The kernel idler's host thread, made after lockdown (lockdown wants one thread) with the
+/// filter's one `clone` (`trap::clone_thread`), on its slot's boot stack: a program thread's
+/// start, from a minimal user frame (the selectors and flags `rt_sigreturn` needs; no program
+/// state to resume). Its FS base is the main thread's (no `CLONE_SETTLS`): the runtime uses no
+/// TLS. [`wait_kernel_ready`] after.
+pub fn start_kernel() -> Result<(), rustix::io::Errno> {
+    let h = slot(KERNEL);
+    let mut tmpl = trap::Ucontext::default();
+    // cs = 0x33 (user code), ss = 0x2b (user data); IF set.
+    tmpl.mcontext.csgsfs = 0x33 | (0x2b << 48);
+    tmpl.mcontext.eflags = 0x202;
+    h.tid_word.store(1, Ordering::Release);
+    // SAFETY: the kernel slot's boot and alternate stacks are its alone; the tid word is static.
+    let r = unsafe {
+        trap::clone_thread(h.boot.get() - 64, h.alt.get(), trap::ALTSTACK_SIZE, h.tid_word.as_ptr(), &tmpl, kernel_main, 0)
+    };
+    r.map(drop).inspect_err(|_| h.tid_word.store(0, Ordering::Release))
+}
+
+/// Spin until the kernel idler thread has started (the main thread calls this after
+/// [`start_kernel`]).
 pub fn wait_kernel_ready() {
     while !PAR.k_ready.load(Ordering::Acquire) {
         core::hint::spin_loop();
     }
+}
+
+/// The CPU tokens' eventfds, one per slot ([`enable`] made them).
+pub fn token_fds() -> impl Iterator<Item = i32> {
+    PAR.slots.iter().map(|h| h.efd.get() as i32)
 }
 
 // ---- host-thread setup ----
@@ -683,12 +703,22 @@ unsafe fn setup_host(id: u16, lazy: bool) {
 }
 
 /// Reserve the per-slot alternate and boot stacks (before lockdown; high-water, `NORESERVE`), make
-/// the eventfds at the fixed fds, bind the main thread (the running init coroutine) to slot 0, and
-/// install the driver. Returns the token fd range for the filter.
+/// each slot's eventfd ([`token_fds`]), bind the main thread (the running init coroutine) to slot
+/// 0, and install the driver.
 ///
 /// # Safety
-/// Called once, on the main thread, after boot and before `route`.
+/// Called once, on the main thread, after boot and before lockdown.
 pub unsafe fn enable(s: &'static Sched, root: Tid) -> Result<(), rustix::io::Errno> {
+    const NR_EVENTFD2: usize = 290;
+    const EFD_CLOEXEC: usize = 0o2000000;
+    for h in &PAR.slots {
+        // SAFETY: a fresh eventfd.
+        let fd = unsafe { trap::gate(NR_EVENTFD2, 0, EFD_CLOEXEC, 0, 0, 0, 0) };
+        if fd < 0 {
+            return Err(rustix::io::Errno::from_raw_os_error(-fd as i32));
+        }
+        h.efd.set(fd as u32);
+    }
     PAR.sched.set(Some(s));
     // Reserve alt + boot stacks for every slot in one NORESERVE region (only touched pages cost).
     let each = SLOT_STACKS;
@@ -1161,48 +1191,6 @@ pub fn take_proc() -> Option<u32> {
 /// A process number from [`take_proc`] whose fork failed.
 pub fn drop_proc() {
     PAR.live_procs.fetch_sub(1, Ordering::AcqRel);
-}
-
-/// The main thread's alternate signal stack, installed again (exobox's intercept: host code may
-/// have changed it in passthrough). Through the gate.
-pub fn rearm_altstack() {
-    // SAFETY: slot 0's alternate stack is the main thread's.
-    let _ = unsafe { trap::set_altstack(PAR.slots[0].alt.get() as *mut u8, trap::ALTSTACK_SIZE) };
-}
-
-/// A host fork's child (a template's instance), before it uses the guest: only the forking
-/// (main) thread was copied, and it holds the CPU token (exobox's fork takes it first, so the
-/// kernel was copied at rest). What the fork didn't copy, or copied as shared:
-/// - the CPU-token eventfds: a fork shares their open files with the parent, so every hand-off
-///   here would wake the parent's threads (and theirs ours). The host makes each again, at its
-///   fd, before this (exobox's inventory).
-/// - the kernel idler thread: gone. Its slot is cleared (its scheduler coroutine freed: nothing
-///   runs on it), for a new one (`kernel_main` on a thread the caller spawns, then
-///   [`wait_kernel_ready`]).
-/// - the token's lock and waiter queue: whatever state the other threads left them in is
-///   nobody's now; reset, the main thread the owner.
-///
-/// Program threads don't exist yet (setup can't make any), so no other slot is in use.
-pub fn after_fork(s: &'static Sched) -> Result<(), rustix::io::Errno> {
-    PAR.spin.store(false, Ordering::Release);
-    PAR.whead.set(u16::MAX);
-    PAR.wtail.set(u16::MAX);
-    for i in 0..N_SLOTS {
-        PAR.slots[i].wnext.set(u16::MAX);
-        PAR.slots[i].invited.store(false, Ordering::Relaxed);
-        PAR.slots[i].lost.set(false);
-    }
-    let k = slot(KERNEL);
-    let old = k.sched_co.replace(0);
-    if old != 0 {
-        s.drop_adopted(Tid::from_raw(old));
-    }
-    k.running.set(0);
-    k.used.store(false, Ordering::Release);
-    PAR.k_ready.store(false, Ordering::Release);
-    PAR.idler_until.store(u64::MAX, Ordering::Relaxed);
-    PAR.owner.store(0, Ordering::Release);
-    Ok(())
 }
 
 /// True in threaded mode after [`enable`] has run (the driver is installed).

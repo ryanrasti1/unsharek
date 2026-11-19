@@ -4,7 +4,9 @@
 //! **The gate.** After lockdown every syscall the program makes is trapped (`SECCOMP_RET_TRAP`
 //! → SIGSYS) and served in-process; the runtime's own host syscalls are allowed only from one
 //! instruction, the `syscall` in [`gate`], which the filter recognises by the address just past it
-//! ([`gate_ip`]: `route`'s and the security filter's). rustix's wrappers have `syscall` instructions of
+//! ([`gate_ip`]). Before lockdown, setup's syscalls are trapped the same way by syscall user
+//! dispatch ([`sud_on`]), whose exempt region is the gate: the handler accepts both kinds of trap
+//! (`si_code` `SYS_SECCOMP` and `SYS_USER_DISPATCH`), which differ in nothing it reads. rustix's wrappers have `syscall` instructions of
 //! their own, inlined wherever they are called: they are **not** the gate. Before lockdown they
 //! work like any syscall; after it each one traps, and the handler would serve it as if the
 //! program had made it. So the host calls made after lockdown go through [`gate`] directly, by
@@ -62,8 +64,8 @@ use crate::xabi::{SA_RESTORER, Timespec, X86Sigaction};
 
 // ------------------------------------------------------------------------------------------------
 // The host calls the runtime makes from the gate after lockdown, and the shapes it makes them in.
-// These are the runtime's own: the security filter (exobox's TCB, `native/exobox/src/tcb`) pins
-// its own copy of each and is checked against these in its tests, so a change here that the
+// These are the runtime's own: the filter (exobox-tcb's, `tcb/` at the repository's root) pins its
+// own copy of each and exobox's tests check the two agree, so a change here that the
 // filter doesn't follow is a sandbox killed by it, never a wider filter.
 
 // Syscall numbers (arch/x86/entry/syscalls/syscall_64.tbl).
@@ -91,8 +93,8 @@ pub const CLONE_PARENT: u64 = 0x8000;
 // The gate.
 
 /// The one `syscall` instruction the filter lets reach the host: `nr(a0, …, a5)`, returning the
-/// raw result (`-errno` on failure). Before lockdown it is an ordinary syscall; after, the filter
-/// decides (the routing filter allows it; the security filter allows the mode's list).
+/// raw result (`-errno` on failure). Before lockdown it is an ordinary syscall (and exempt from
+/// syscall user dispatch); after, the filter decides (the mode's list).
 ///
 /// # Safety
 /// It is a raw syscall: whatever `nr` does with the arguments (memory they point to, the process).
@@ -135,7 +137,7 @@ unsafe extern "C" {
 }
 
 /// The address just past the gate's `syscall`: what the kernel reports as a gate call's
-/// instruction pointer (the routing filter's test, `route`).
+/// instruction pointer (the filter's test, and syscall user dispatch's exempt region).
 pub fn gate_ip() -> u64 {
     &raw const exobox_rt_gate_ret as u64
 }
@@ -268,42 +270,36 @@ pub unsafe fn clone_thread(
     check(r).map(|tid| tid as u32)
 }
 
-/// Host code's `clone` with a new stack, re-issued from the gate (`passthrough`): the child must
-/// resume the trapped context, not the dispatcher's, so it starts as `clone_thread`'s does, from a
-/// `rt_sigreturn` frame built below `newsp` (free memory: a clone's stack data sits at and above
-/// it) from the trapping call's own ucontext, with `rax` 0 and `rsp` `newsp`. `altstack` is what
-/// the child's alternate stack becomes (Linux resets it for a `CLONE_VM` child that isn't a
-/// vfork's). The FPU starts in its initial state. Returns the raw result (the parent's).
+// ------------------------------------------------------------------------------------------------
+// Syscall user dispatch: the routing before lockdown.
+
+/// `PR_SET_SYSCALL_USER_DISPATCH` and its arguments (include/uapi/linux/prctl.h).
+const NR_PRCTL: usize = 157;
+const PR_SET_SYSCALL_USER_DISPATCH: usize = 59;
+const PR_SYS_DISPATCH_OFF: usize = 0;
+const PR_SYS_DISPATCH_ON: usize = 1;
+/// The selector's values: syscalls go through (`ALLOW`), or trap with SIGSYS (`BLOCK`).
+pub const SUD_ALLOW: u8 = 0;
+pub const SUD_BLOCK: u8 = 1;
+
+/// Switch syscall user dispatch on for the calling thread: while `*selector` is [`SUD_BLOCK`],
+/// every syscall the thread makes outside the gate traps (SIGSYS, `si_code` `SYS_USER_DISPATCH`)
+/// into the same entry as a seccomp trap; while it is [`SUD_ALLOW`] they run natively. The gate's
+/// `syscall` is exempt (the region is the one byte at [`gate_ip`], the address the kernel tests).
+/// Per thread: new threads and forks don't inherit it, and exec clears it.
 ///
 /// # Safety
-/// `newsp` is the top of a stack the child may use, with a few hundred bytes free below it; the
-/// flags and the other arguments are the trapping call's (a raw `clone`).
-pub unsafe fn clone_resume(flags: usize, newsp: usize, ptid: usize, ctid: usize, tls: usize, tmpl: &Ucontext, altstack: StackT) -> isize {
-    let frame = ((newsp - 8 - size_of::<Ucontext>()) & !63) - 8;
-    // SAFETY: below the child's stack top: the caller's.
-    unsafe { (frame as *mut usize).write(restorer as *const () as usize) };
-    let mut u = *tmpl;
-    u.link = 0;
-    u.stack = altstack;
-    u.mcontext.rax = 0;
-    u.mcontext.rsp = newsp as u64;
-    u.mcontext.fpregs = 0;
-    // SAFETY: inside the child's stack, aligned for a Ucontext.
-    unsafe { ((frame + 8) as *mut Ucontext).write(u) };
-    // SAFETY: the caller's; the child runs only from the prepared frame.
-    unsafe { gate(NR_CLONE as usize, flags, frame, ptid, ctid, tls, 0) }
+/// `selector` stays valid while dispatch is on (it is read by the kernel at every syscall).
+pub unsafe fn sud_on(selector: *const u8) -> Result<(), Errno> {
+    // SAFETY: the kernel reads `selector` at each syscall of this thread from now on: the caller's.
+    check(unsafe { gate(NR_PRCTL, PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_ON, gate_ip() as usize, 1, selector as usize, 0) })
+        .map(drop)
 }
 
-/// Return from a signal handler of host code's (`passthrough`): its `rt_sigreturn` trapped, so
-/// it is made again here from the gate, at the trapped `rsp` (the frame is at `rsp - 8`, where the
-/// kernel looks), with the FS base the handler ran with (`rt_sigreturn` doesn't restore it). The
-/// SIGSYS frame that brought us here is abandoned: the restored frame is the whole state.
-///
-/// # Safety
-/// `rsp` and `fs` are a trapped `rt_sigreturn`'s.
-#[unsafe(naked)]
-pub unsafe extern "C" fn sigreturn_at(rsp: usize, fs: usize) -> ! {
-    core::arch::naked_asm!("wrfsbase rsi", "mov rsp, rdi", "mov eax, 15", "jmp exobox_rt_gate_syscall", "ud2")
+/// Switch syscall user dispatch off for the calling thread.
+pub fn sud_off() -> Result<(), Errno> {
+    // SAFETY: a flag of this thread.
+    check(unsafe { gate(NR_PRCTL, PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_OFF, 0, 0, 0, 0) }).map(drop)
 }
 
 /// Wait for an eventfd's count (a CPU token): `read` of its 8 bytes, which blocks while it is 0.

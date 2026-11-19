@@ -1,4 +1,4 @@
-// A host fd given to the guest at a fixed fd (Sandbox::pass_fd; capnix's channel at 1000): read what
+// A host fd given to the guest at a fixed fd (Guest::pass_fd; capnix's channel at 1000): read what
 // the host sent on fd 1000, answer "got:<it>" on the same fd. Prints FD_ECHO_OK.
 #include "exobox_test.h"
 #include <unistd.h>

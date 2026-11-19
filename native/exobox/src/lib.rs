@@ -4,53 +4,60 @@
 //! ```no_run
 //! # fn main() -> Result<(), exobox::Error> {
 //! # let (program, argv, env): (std::path::PathBuf, Vec<std::ffi::OsString>, Vec<std::ffi::OsString>) = Default::default();
-//! use exobox::{Mode, Sandbox};
-//! let mut sb = Sandbox::builder().mode(Mode::Coroutine).build()?; // boots the guest kernel
-//! let mounts = sb.map_closure(&program, &[])?;                    // host work: images mapped
-//! {
-//!     let _g = sb.intercept()?;                  // this thread's syscalls are the guest's now
-//!     exobox::setup::mount_closure(&mounts)?;    // ordinary Rust, in the guest
-//!     std::fs::write("/etc/motd", "hi\n")?;
-//! }                                              // the host's again
-//! let Err(e) = sb.run(&argv, &env);              // lockdown, exec; never returns on success
+//! use exobox::{Access, Guest, GuestConfig, Mode};
+//! let mut g = Guest::boot(GuestConfig { mode: Mode::Coroutine, ..Default::default() })?; // the kernel
+//! let mounts = g.map_closure(&program, &[])?;          // host work: images mapped
+//! g.run(|| -> std::io::Result<()> {                    // this thread's syscalls are the guest's
+//!     exobox::setup::mount_closure(&mounts)?;          // ordinary Rust, in the guest, as init
+//!     std::fs::write("/etc/motd", "hi\n")
+//! })??;                                                // and the host's again
+//! let g = g.lockdown(|s| {                             // the TCB's lockdown, the caller's grants
+//!     s.grant(0, Access::Read).grant(1, Access::Write).grant(2, Access::Write);
+//!     Ok(())
+//! })?;
+//! let Err(e) = g.exec(&argv, &env);                    // the program; never returns on success
 //! # Err(e) }
 //! ```
 //!
-//! **Where isolation is.** This crate is exobox's trusted computing base plus a thin API. The
-//! TCB is `src/tcb` alone (`TCB.md` beside Cargo.toml: what's in it, what isn't and why, and a
-//! review checklist): the authority inventory (every host fd, mapping and thread the sandbox
-//! keeps past lockdown, made and recorded there), the security filter built from it
-//! (seccompiler), and lockdown (threads checked, every other fd closed, the filters installed
-//! with TSYNC, before anything untrusted runs). Everything else, this file's API included, the
-//! runtime (`exobox-rt`), the guest kernel and the batteries re-exported here from `exobox-kit`
-//! ([`setup`], [`store`](mod@store), [`net`], [`alloc`]), runs in the program's address space after
-//! lockdown and protects nothing.
+//! **Where isolation is.** Not in this crate: in `exobox-tcb` (`tcb/` at the repository's root,
+//! re-exported as [`tcb`]), which [`Guest::lockdown`] calls. Its lockdown checks the process (one
+//! thread; the guest's fds; every mapping), closes every fd not granted, drops what the process
+//! may not keep (core dumps, capabilities, privileges) and installs one seccomp filter, before
+//! anything untrusted runs. Everything here (this API, the runtime `exobox-rt`, the guest kernel,
+//! the batteries: [`setup`], [`store`](mod@store), [`net`], [`alloc`]) runs in the program's
+//! address space after lockdown and protects nothing.
 //!
-//! Layers (README.md, "The library"), each built only from the one below:
-//! 1. [`Guest`]: the kernel booted in this process ([`Guest::boot`]), host data given to it
-//!    ([`Guest::map_image`]), setup run in it ([`Guest::intercept`]) and a program exec'd in it
-//!    ([`Guest::run`]). Routing only, no security filter: no isolation (a test layer).
-//! 2. [`Sandbox`]: a `Guest` with a mode, the TCB's lockdown ([`Sandbox::run`],
-//!    [`Sandbox::run_fn`]), the caller's restrictions ([`Builder::restrict`]), the network's
-//!    hooks ([`net`]) and templates ([`Sandbox::fork`]). [`run`] (the CLI's path) is a `Sandbox`
-//!    for a [`Config`].
+//! **Two mechanisms, two jobs.** Before lockdown, [`Guest::run`]'s closure is routed to the guest
+//! by syscall user dispatch, per thread and switched by a selector byte (free); between closures
+//! the process is an ordinary one. From lockdown on, the filter traps every call not made from the
+//! runtime's gate, in every thread and process made after it.
 //!
-//! The process becomes the sandbox: one guest per process, used from the thread that built it
-//! (a `Sandbox` is `!Send`). A template forks it ([`Sandbox::fork`], [`Sandbox::spawn`]): each
-//! child is a sandbox of its own, sharing the template's booted kernel copy-on-write.
+//! The process becomes the sandbox: one guest per process, used from the thread that booted it
+//! (a `Guest` is `!Send`). A template forks it before lockdown ([`Guest::fork`],
+//! [`Guest::spawn`]): each child is a guest of its own, sharing the template's booted kernel
+//! copy-on-write. [`run`] (the CLI's path) is the whole of it for a [`Config`].
 
 pub mod alloc;
 mod image;
+mod memory;
 pub mod net;
 pub mod setup;
 pub mod store;
-mod tcb;
 
+pub use exobox_tcb as tcb;
 pub use image::Image;
 pub use net::{Cx, GuestSocket, HeldFd, NetError, OnConnect, OnListen, OnResolve};
-
-/// One classic-BPF instruction (`struct sock_filter`), for [`Builder::restrict`].
-pub use tcb::filter::SockFilter;
+/// What may be done on a granted fd ([`tcb::Config::grant`]).
+pub use tcb::Access;
+/// What the filter does to a refused host syscall: a debugging knob for the escape tests (a
+/// sandbox kills, the default, always).
+#[doc(hidden)]
+pub use tcb::Deny;
+/// How the sandbox runs the program's threads and processes. Each mode's host allowlist is a
+/// superset of the one before.
+pub use tcb::Mode;
+/// One classic-BPF instruction (`struct sock_filter`), for [`tcb::Config::restrict`].
+pub use tcb::SockFilter;
 /// The auxiliary-vector tag under which a sandboxed program finds the gate's address (what the
 /// escape tests call, as a compromised program that found the gate would).
 pub use exobox_rt::exec::AT_EXOBOX_GATE;
@@ -59,38 +66,12 @@ use std::convert::Infallible;
 use std::ffi::{CString, OsString};
 use std::fs::File;
 use std::marker::PhantomData;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use exobox_rt::{guest, sched};
-use tcb::inventory::{Fd, Inventory, MapKind};
-
-/// How the sandbox runs the program's threads and processes. Each mode's host allowlist is a
-/// superset of the one before.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Mode {
-    /// The guest kernel's threads and the program's on one host thread, as coroutines.
-    #[default]
-    Coroutine,
-    /// A host thread per program thread, made through the filter by one exact `clone`.
-    Threaded,
-    /// Threaded, and a guest `fork` is a host fork: processes share one guest kernel.
-    Fork,
-}
-
-/// What the filter does to a host syscall it doesn't allow. A debugging knob for the escape
-/// tests: a sandbox kills (the default), always.
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Deny {
-    /// Kill the sandbox (SIGSYS).
-    #[default]
-    Kill,
-    /// Fail the syscall with EPERM (for probing the filter).
-    Errno,
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -104,14 +85,19 @@ pub enum Error {
     Erofs(#[from] exobox_erofs::Error),
     #[error("{what}: {source}")]
     Io { what: String, source: std::io::Error },
-    /// An I/O error of the caller's (inside a guard, say), as it came: `?` on `std::fs` and
-    /// friends.
+    /// An I/O error of the caller's (inside a setup closure, say), as it came: `?` on `std::fs`
+    /// and friends.
     #[error(transparent)]
     Os(#[from] std::io::Error),
     #[error("the guest: {0}")]
     Guest(guest::Error),
     #[error("{}: {errno}", .path.display())]
     Exec { path: PathBuf, errno: std::io::Error },
+    #[error("lockdown: {0}")]
+    Lockdown(#[from] tcb::Error),
+    /// Other host threads at lockdown ([`Guest::lockdown`]'s check, before the TCB's own).
+    #[error("{0}")]
+    Threads(String),
     #[error("not implemented yet: {0}")]
     NotImplemented(&'static str),
 }
@@ -130,11 +116,13 @@ impl From<guest::Error> for Error {
 }
 
 // ------------------------------------------------------------------------------------------------
-// Layer 1: the guest.
+// The guest.
 
-/// What [`Guest::boot`] reserves.
+/// What [`Guest::boot`] makes.
 #[derive(Clone, Debug)]
 pub struct GuestConfig {
+    /// The mode (default: coroutine).
+    pub mode: Mode,
     /// The program's memory (the arena), in bytes. Reserved, not committed: it costs what the
     /// program touches. What `sysinfo` reports as the machine's memory.
     pub memory: usize,
@@ -145,6 +133,11 @@ pub struct GuestConfig {
     /// host's page cache, shared by every sandbox) instead of copied. Reserved, not committed;
     /// images past it are copied from.
     pub image_space: usize,
+    /// Fork mode: at most this many processes alive at once, the first one included; a fork past
+    /// it fails with EAGAIN (0: no bound but the runtime's host-thread slots). Ignored in the
+    /// other modes. The runtime's bound, in the program's address space: a compromised program can
+    /// bypass it. A bound the program can't is the caller's (`RLIMIT_NPROC`, a cgroup).
+    pub max_procs: u32,
 }
 
 impl Default for GuestConfig {
@@ -152,21 +145,52 @@ impl Default for GuestConfig {
         // The kernel's memory holds its slab, the page cache of what the program reads from its
         // images (evictable) and its ramfs files (/tmp). 32 MiB: each MiB costs 16 KiB of struct
         // pages, all written at boot (64 MiB was 1 MiB of every sandbox).
-        GuestConfig { memory: 4 << 30, kernel_memory: 32 << 20, image_space: 64 << 30 }
+        GuestConfig { mode: Mode::Coroutine, memory: 4 << 30, kernel_memory: 32 << 20, image_space: 64 << 30, max_procs: 0 }
     }
 }
 
 /// The guest kernel, booted in this process: [`Guest::boot`], then host work and setup in any
-/// order ([`Guest::map_image`], [`Guest::intercept`]), then [`Guest::run`], which never returns
-/// on success. `!Send`: the thread that booted it is the one that uses it.
-#[derive(Debug)]
+/// order ([`Guest::map_image`], [`Guest::pass_fd`], [`Guest::run`]), then [`Guest::lockdown`],
+/// then the program ([`Locked::exec`], [`Locked::run`]). `!Send`: the thread that booted it is
+/// the one that uses it.
 pub struct Guest {
-    /// Every host resource the sandbox keeps past lockdown (`tcb::inventory`).
-    inv: Inventory,
+    mode: Mode,
+    max_procs: u32,
     aux: guest::Aux,
     /// The image zone's unused part, `[next, end)`.
     zone: (usize, usize),
+    /// Fork mode's kernel memory is mapped shared (no template may fork it).
+    shared: bool,
+    /// Passed and held host fds: the guest's plumbing, granted at lockdown.
+    passed: Vec<RawFd>,
+    held: Vec<RawFd>,
+    /// The guest's own host fds, made at lockdown (the CPU tokens' eventfds, init's pidfd), for
+    /// the TCB to check and keep ([`tcb::Confined::host_fds`]).
+    host_fds: Vec<RawFd>,
+    hooks: net::Hooks,
     _thread: PhantomData<*const ()>,
+}
+
+impl std::fmt::Debug for Guest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Guest")
+            .field("mode", &self.mode)
+            .field("passed", &self.passed)
+            .field("held", &self.held)
+            .finish_non_exhaustive()
+    }
+}
+
+impl tcb::Confined for Guest {
+    fn host_fds(&self) -> &[RawFd] {
+        &self.host_fds
+    }
+    fn mode(&self) -> Mode {
+        self.mode
+    }
+    fn gate_ip(&self) -> u64 {
+        exobox_rt::trap::gate_ip()
+    }
 }
 
 /// A host path or an open file, for [`Guest::map_image`].
@@ -221,59 +245,57 @@ fn host_entropy() -> Result<[u8; 64], Error> {
     Ok(entropy)
 }
 
-/// Threaded mode's kernel idler host thread, started (at boot, and in a fork's child, which the
-/// fork didn't copy it to).
-fn spawn_idler() -> std::io::Result<()> {
-    std::thread::Builder::new()
-        .stack_size(256 * 1024)
-        .name("exobox-kernel".into())
-        .spawn(|| guest::threaded_kernel_main())
-        .map(drop)
+/// This process's other host threads (`/proc/self/task`, the caller's own excluded).
+fn other_threads() -> Vec<i32> {
+    // SAFETY: gettid.
+    let me = unsafe { libc::gettid() };
+    std::fs::read_dir("/proc/self/task")
+        .map(|d| d.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok()).filter(|&t| t != me).collect())
+        .unwrap_or_default()
+}
+
+/// A setup's end, at the closure's return or a panic's unwinding.
+struct SetupEnd;
+impl Drop for SetupEnd {
+    fn drop(&mut self) {
+        guest::setup_end();
+    }
 }
 
 impl Guest {
     /// Reserve the program's memory and the kernel's, boot the kernel on this thread, and set up
     /// the guest's basics ([`setup::defaults`]: `/proc`, `/dev`, `/tmp`, stdio, loopback,
-    /// entropy). Host code, no filter. Once per process.
+    /// entropy). Fork mode's processes share the kernel's memory, mapped shared here. Host code.
+    /// Once per process.
     pub fn boot(config: GuestConfig) -> Result<Guest, Error> {
-        Guest::boot_as(config, false)
-    }
-
-    /// [`Guest::boot`]; with `shared`, the kernel's memory (its pool, the coroutine stacks, the
-    /// runtime's shared section) is mapped shared, for fork mode's host forks.
-    fn boot_as(config: GuestConfig, shared: bool) -> Result<Guest, Error> {
         if BOOTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return Err(Error::NotImplemented("a second guest in one process"));
         }
+        let shared = config.mode == Mode::Fork;
         const PAGE: usize = 4096;
         // The allocator's region for after lockdown (`alloc`): reserved now, while mmap is the host's.
         alloc::reserve().map_err(Error::io("the allocator's region"))?;
-        // No core dumps: the sandbox killed by its filter (SIGSYS) would dump GiBs of reserved
-        // memory (the suite's escape_kill took longer than its 5 s timeout writing it), and the
-        // dump of a sandbox is the host's business only by accident. RLIMIT_CORE 0, not
-        // PR_SET_DUMPABLE 0, which would also hide /proc/<pid>/smaps_rollup (perf.rs's PSS) from
-        // its owner. A piped core_pattern (systemd-coredump) is still started, sees the limit and
-        // stops reading.
+        // No core dumps from here on (lockdown makes it so for good, with the dump flag): the
+        // sandbox killed by its filter (SIGSYS) would dump GiBs of reserved memory.
         let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
         // SAFETY: sets a limit of this process.
         unsafe { libc::setrlimit(libc::RLIMIT_CORE, &none) };
-        let mut inv = Inventory::new();
         let memory = config.memory.next_multiple_of(PAGE);
         let rwx = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
         let rw = libc::PROT_READ | libc::PROT_WRITE;
         let zone = config.image_space.next_multiple_of(PAGE);
         let reserving = |len| Error::io(format!("reserving {len} bytes"));
-        let arena = inv.reserve(ARENA_AT, memory + zone, rwx, false, MapKind::Arena).map_err(reserving(memory + zone))?;
+        let arena = memory::reserve(ARENA_AT, memory + zone, rwx, false).map_err(reserving(memory + zone))?;
         let mem_mb = config.kernel_memory.div_ceil(1 << 20).max(16);
         let heap_len = (mem_mb << 20) + PAGE;
         if shared {
             // The kernel's and the runtime's statics, before anything of them is used.
             // SAFETY: nothing else uses the runtime yet; this is the only thread.
-            unsafe { inv.share_section() }.map_err(Error::io("sharing the kernel's data (fork mode)"))?;
+            unsafe { memory::share_section() }.map_err(Error::io("sharing the kernel's data (fork mode)"))?;
         }
-        let heap = inv.reserve(0, heap_len, rw, shared, MapKind::KernelHeap).map_err(reserving(heap_len))? as *mut u8;
+        let heap = memory::reserve(0, heap_len, rw, shared).map_err(reserving(heap_len))? as *mut u8;
         let stacks_len = COROUTINES * COROUTINE_STACK;
-        let stacks = inv.reserve(0, stacks_len, rw, shared, MapKind::Stacks).map_err(reserving(stacks_len))? as *mut u8;
+        let stacks = memory::reserve(0, stacks_len, rw, shared).map_err(reserving(stacks_len))? as *mut u8;
         let loglevel = std::env::var("EXOBOX_KERNEL_LOGLEVEL").unwrap_or_else(|_| "1".into());
         // program_mem: what sysinfo and /proc/meminfo report (the kernel series' item 13): the
         // program's memory is the arena, not the kernel's pool (V8 sizes its heap from it).
@@ -281,7 +303,7 @@ impl Guest {
         // SAFETY: fresh reservations, the guest's from now on; this thread runs it.
         unsafe {
             guest::boot(guest::Boot {
-                arena: (arena as usize, memory + zone),
+                arena: (arena, memory + zone),
                 image_zone: zone,
                 heap: (heap, heap_len),
                 stacks: sched::Stacks { base: stacks, len: stacks_len, size: COROUTINE_STACK, guard: true },
@@ -292,29 +314,39 @@ impl Guest {
         let aux = |t| unsafe { libc::getauxval(t) };
         setup::defaults(&host_entropy()?).map_err(Error::io("the guest's basics"))?;
         Ok(Guest {
-            inv,
+            mode: config.mode,
+            max_procs: config.max_procs,
             aux: guest::Aux {
                 hwcap: aux(libc::AT_HWCAP),
                 hwcap2: aux(libc::AT_HWCAP2),
                 sysinfo_ehdr: aux(libc::AT_SYSINFO_EHDR),
                 minsigstksz: aux(libc::AT_MINSIGSTKSZ),
             },
-            zone: (arena as usize + memory, arena as usize + memory + zone),
+            zone: (arena + memory, arena + memory + zone),
+            shared,
+            passed: vec![],
+            held: vec![],
+            host_fds: vec![],
+            hooks: net::Hooks::default(),
             _thread: PhantomData,
         })
     }
 
-    /// A host fork's child (a template's instance: [`Sandbox::fork`], or a plain `fork()` of the
-    /// process) takes the guest over before its first use: the guest's pid is its own, threaded
-    /// mode's host threads are made again (`guest::fork_child`), and the guest's RNG gets fresh
-    /// host entropy and is reseeded (the fork copied its state: without it, every child of one
-    /// template would draw the same random bytes). Nothing in the process that booted it.
-    fn own(&mut self, token: Option<u16>) -> Result<(), Error> {
-        if token.is_none() && !guest::forked() {
+    /// Its mode.
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// A host fork's child (a template's instance: [`Guest::fork`], or a plain `fork()` of the
+    /// process) takes the guest over before its first use: the guest's pid is its own, and the
+    /// guest's RNG gets fresh host entropy and is reseeded (the fork copied its state: without it,
+    /// every child of one template would draw the same random bytes). Nothing in the process that
+    /// booted it.
+    fn own(&mut self) -> Result<(), Error> {
+        if !guest::forked() {
             return Ok(());
         }
-        self.inv.remake_tokens().map_err(Error::io("the CPU tokens' eventfds, after a fork"))?;
-        guest::fork_child(token, || spawn_idler().expect("the kernel idler thread"))?;
+        guest::fork_child();
         setup::reseed(&host_entropy()?).map_err(Error::io("reseeding the guest's RNG"))
     }
 
@@ -322,7 +354,7 @@ impl Guest {
     /// device `/dev/exobox/<name>` (a memblk disk over the mapping), the name being the file's
     /// without `.erofs` (for an fd, `image<N>`). Mapped a second time, privately, in the arena's
     /// image zone ([`GuestConfig::image_space`]): the program's mappings of its files are made
-    /// there in place. Host code (outside a guard).
+    /// there in place. Host code (outside [`Guest::run`]).
     pub fn map_image<'a>(&mut self, source: impl Into<ImageSource<'a>>) -> Result<Image, Error> {
         self.map_image_named(source.into(), None)
     }
@@ -333,7 +365,7 @@ impl Guest {
     }
 
     fn map_image_named(&mut self, source: ImageSource, name: Option<&str>) -> Result<Image, Error> {
-        self.own(None)?;
+        self.own()?;
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // The layout exobox-erofs wrote beside it (`X.layout` for `X.erofs`): where its ELFs are.
@@ -356,7 +388,7 @@ impl Guest {
         if len == 0 || !len.is_multiple_of(512) {
             return Err(Error::io(name)(std::io::Error::new(std::io::ErrorKind::InvalidData, "not an image of whole blocks")));
         }
-        let data = self.inv.map_image(file.as_raw_fd(), len).map_err(Error::io(format!("mapping {name}")))?;
+        let data = memory::map_image(file.as_raw_fd(), len).map_err(Error::io(format!("mapping {name}")))?;
         let in_zone = match layout.and_then(|l| std::fs::read(l).ok()) {
             Some(layout) => self.map_in_zone(&file, len, &layout)?,
             // No layout, no known slots: its files are copied when mapped.
@@ -385,7 +417,7 @@ impl Guest {
             return Ok(None);
         }
         // In the zone's unused part of the arena's reservation: nothing is there.
-        if self.inv.map_image_at(at, file.as_raw_fd(), len).is_err() {
+        if memory::map_image_at(at, file.as_raw_fd(), len).is_err() {
             return Ok(None);
         }
         self.zone.0 = at + size;
@@ -417,9 +449,32 @@ impl Guest {
         store.mounts.iter().map(|m| Ok(setup::Mount { image: self.map_image(&m.image)?, at: m.guest.clone(), kind: m.kind })).collect()
     }
 
-    /// Hold host fd `fd` for the hooks (a provider's connection, made before `run`): made
-    /// nonblocking and kept open for the sandbox's life. Under a [`Sandbox`] the filter allows
-    /// `read` and `write` on exactly it ([`Sandbox::hold_fd`]).
+    /// `fd`, open, kept as one of the guest's plumbing fds.
+    fn keep(fd: OwnedFd, what: &str) -> Result<RawFd, Error> {
+        let fd = fd.into_raw_fd();
+        // SAFETY: fcntl on the caller's fd, owned.
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+            return Err(Error::io(what)(std::io::Error::last_os_error()));
+        }
+        Ok(fd)
+    }
+
+    /// Give the guest host fd `fd` as its fd `guest` (e.g. a channel to the orchestrator at 1000),
+    /// now: a guest file whose reads and writes the runtime does on `fd` (as fds 0-2 are). A guest
+    /// read waits for the host fd without holding the guest's CPU, and the guest's `poll`/`epoll`
+    /// on it see the host fd's readiness (the kernel asks the runtime, whose idle wait watches the
+    /// fd). `fd` stays open for the sandbox's life; [`Guest::lockdown`] grants it read and write.
+    /// Host code; fails if `fd` isn't open.
+    pub fn pass_fd(&mut self, fd: OwnedFd, guest: i32) -> Result<(), Error> {
+        self.own()?;
+        let host = Guest::keep(fd, "passing an fd")?;
+        self.passed.push(host);
+        setup::host_fd(host, guest).map_err(Error::io(format!("the guest's fd {guest}")))
+    }
+
+    /// Hold host fd `fd` for the hooks (a provider's connection, made before lockdown): made
+    /// nonblocking and kept open for the sandbox's life; [`Guest::lockdown`] grants it read and
+    /// write.
     pub fn hold_fd(&mut self, fd: OwnedFd) -> Result<HeldFd, Error> {
         // SAFETY: fcntl on the caller's fd, owned.
         let fl = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
@@ -427,80 +482,186 @@ impl Guest {
         if fl < 0 || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK) } < 0 {
             return Err(Error::io("holding an fd")(std::io::Error::last_os_error()));
         }
-        let fd = self.inv.keep(fd, Fd::Held).map_err(Error::io("holding an fd"))?;
+        let fd = Guest::keep(fd, "holding an fd")?;
+        self.held.push(fd);
         Ok(HeldFd::from_raw(fd))
     }
 
-    /// Route this thread's syscalls to the guest while the guard lives: from here on, until the
-    /// guard drops, every syscall the calling thread makes is served by the guest kernel, as its
-    /// init (PID 1, root). Anything the guest kernel can do, a guard can: mounts, files, ids
-    /// (`setresuid`: the program is exec'd with init's credentials as they are then), the
-    /// hostname, the clock (`clock_settime`; the program gets EPERM for both, as an unprivileged
-    /// user would). The first guard installs the routing filter (permanent: seccomp filters can't
-    /// be removed); after the guard's drop, the runtime passes the trapped syscalls through to the
-    /// host (`exobox_rt::passthrough`), so host code behaves as before, until [`Guest::run`].
-    /// Guards may come and go any number of times, interleaved with host work.
+    /// [`Guest::hold_fd`] under `name`, for the hooks to find with [`Cx::held`]: a template's
+    /// hooks are given before it forks, each child holds its own provider's fd.
+    pub fn hold_fd_as(&mut self, name: &str, fd: OwnedFd) -> Result<HeldFd, Error> {
+        let held = self.hold_fd(fd)?;
+        net::name_held(name, held);
+        Ok(held)
+    }
+
+    /// The guest's `/etc/resolv.conf` and `/etc/hosts`, written (root's: [`setup::resolver`]) when
+    /// the program's names first resolve (an `on_resolve` or `on_connect` hook). A setup may change
+    /// them after.
+    fn resolves(&mut self) -> Result<(), Error> {
+        if !self.hooks.resolves() {
+            return Ok(());
+        }
+        setup::resolver().map_err(Error::io("the guest's resolver"))
+    }
+
+    /// The program's connects beyond loopback ([`net`]).
+    /// A hook is not a policy point: it runs in the program's address space after lockdown, and
+    /// a compromised program can skip it. Policy belongs at the far end of the held fds.
+    pub fn on_connect(&mut self, hook: OnConnect) -> Result<(), Error> {
+        let first = !self.hooks.resolves();
+        self.hooks.on_connect = hook;
+        if first { self.resolves() } else { Ok(()) }
+    }
+
+    /// The program's listens beyond loopback ([`net`]).
+    /// A hook is not a policy point: it runs in the program's address space after lockdown, and
+    /// a compromised program can skip it. Policy belongs at the far end of the held fds.
+    pub fn on_listen(&mut self, hook: OnListen) {
+        self.hooks.on_listen = hook;
+    }
+
+    /// The program's name lookups ([`net`]); like every hook, not a policy point. Without one, but
+    /// with an `on_connect`, every name resolves to an address of its own (see [`Cx::name_of`]).
+    pub fn on_resolve(&mut self, hook: OnResolve) -> Result<(), Error> {
+        let first = !self.hooks.resolves();
+        self.hooks.on_resolve = hook;
+        if first { self.resolves() } else { Ok(()) }
+    }
+
+    /// A task started on the hooks' executor at lockdown, before the program: a provider's
+    /// session over a held fd ([`Cx::held`]), ready before the first connect.
+    pub fn on_start<F, Fut>(&mut self, f: F)
+    where
+        F: FnOnce(Cx) -> Fut + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        self.hooks.on_start = Some(Box::new(move |cx| Box::pin(f(cx))));
+    }
+
+    /// Run `f` on this thread with its syscalls routed to the guest: every syscall `f` makes is
+    /// served by the guest kernel, as its init (PID 1, root), and once it returns the thread's
+    /// syscalls are the host's again. Syscall user dispatch does the routing, for this thread
+    /// only, switched by a selector byte (no syscall). Before lockdown: trusted setup, ordinary
+    /// Rust. Anything the guest kernel can do, `f` can: mounts, files, ids (`setresuid`: the
+    /// program runs with init's credentials as they are then), the hostname, the clock
+    /// (`clock_settime`; the program gets EPERM for both, as an unprivileged user would). Any
+    /// number of times, interleaved with host work.
     ///
-    /// What runs where while a guard lives:
-    /// - **Only this thread.** Other host threads' syscalls stay the host's (passthrough, if they
-    ///   were made after the first guard and inherited the filter). The guard is `!Send`, and
-    ///   only the thread that booted the guest may take one.
+    /// What runs where meanwhile:
+    /// - **Only this thread.** Other host threads are the host's (and must be gone by lockdown).
     /// - **Memory stays the host's.** `mmap`, `munmap`, `mremap`, `mprotect`, `madvise`, `brk`
-    ///   and friends pass through to the host, so the allocator (the system's, until lockdown) works
-    ///   as ever: what is allocated inside a guard is ordinary host memory, valid after it.
-    /// - **Everything else is the guest's**: files, fds, sockets, `getpid` (1), `getrandom`
-    ///   (the guest's RNG). An fd opened inside is a guest fd: don't keep it for after the guard
-    ///   (there it would name some host fd), and don't use a host fd inside. The guest's fds 0-2
-    ///   write and read the host's 0-2, so printing works. Host data is read before the guard and
-    ///   moved in (a `Vec`, a string): a host path means nothing inside.
+    ///   and friends go to the host, so the allocator works as ever: what is allocated inside is
+    ///   ordinary host memory, valid after it.
+    /// - **Everything else is the guest's**: files, fds, sockets, `getpid` (1), `getrandom` (the
+    ///   guest's RNG). An fd opened inside is a guest fd: don't keep it for after (there it would
+    ///   name some host fd), and don't use a host fd inside. The guest's fds 0-2 write and read the
+    ///   host's 0-2, so printing works. Host data is read before and moved in (a `Vec`, a string):
+    ///   a host path means nothing inside.
     /// - **std's lazy state** that makes no syscall (environment, thread-locals, the stdout
     ///   buffer) is unaffected. State that caches an fd or a syscall's answer on first use would
-    ///   cache the guest's: first use it outside (`std::io::stdout()` is fine either way: it
-    ///   writes fd 1).
-    /// - **No threads**: a `clone` inside fails with ENOSYS (setup is single-threaded; the
-    ///   program makes its threads after exec).
-    /// - **A panic** unwinds as usual and drops the guard on its way (back to the host's
-    ///   syscalls), its message printed through the guest's stderr, the host's. With
-    ///   `panic = "abort"`, the abort's signal is the guest's, which ends init and the process
-    ///   with SIGABRT.
+    ///   cache the guest's: first use it outside.
+    /// - **No threads**: a `clone` inside fails with ENOSYS. No host signal handlers: a handler's
+    ///   return (libc's restorer) would be the guest's `rt_sigreturn`.
+    /// - **A panic** unwinds as usual, the routing ended on its way.
     ///
-    /// Fails if the routing filter can't be installed (no seccomp).
-    pub fn intercept(&mut self) -> Result<Intercept<'_>, Error> {
-        self.own(None)?;
-        guest::route()?;
-        guest::intercept_begin()?;
-        Ok(Intercept { _guest: PhantomData })
+    /// Exec is not here: the loader runs after lockdown ([`Locked::exec`]), and refuses before.
+    pub fn run<R>(&mut self, f: impl FnOnce() -> R) -> Result<R, Error> {
+        self.own()?;
+        guest::setup_begin()?;
+        let _end = SetupEnd;
+        Ok(f())
     }
 
-    /// Exec `argv[0]` inside the guest with `argv` and `env` (each `NAME=value`): the routing
-    /// filter (if no guard has installed it), then the exec, no security filter (layer 1: a
-    /// [`Sandbox`] adds it). Never returns on success; on failure the error is the caller's to
-    /// report (its syscalls are the guest's by then, and printing and exiting work through it).
-    pub fn run(self, argv: &[OsString], env: &[OsString]) -> Result<Infallible, Error> {
-        let path = argv.first().ok_or(Error::NoProgram)?.clone();
-        self.launch(net::Hooks::default(), Start::Exec(&path, argv, env), |_| {
-            alloc::lockdown();
-            Ok(())
-        })
+    /// A host fork of the guest's process, before lockdown: a template's instance. The child is a
+    /// guest of its own, a copy of this one as it is now (its kernel, its mounts and files, what
+    /// it has mapped, passed and held), to set up further and lock down; the parent goes on, a
+    /// template for more. The child's guest RNG is reseeded with fresh host entropy at its first
+    /// use. Threaded mode's threads and CPU tokens are made at lockdown, so each child makes its
+    /// own. The child's status, once it runs, is its program's. Usable in a loop (a long-lived
+    /// template forking per request); outside [`Guest::run`]. The parent waits for its children
+    /// itself ([`wait`], or `waitpid`).
+    ///
+    /// Fork mode: not yet (its processes share the guest kernel's memory, which each instance
+    /// needs a copy of).
+    pub fn fork(&mut self) -> Result<Fork, Error> {
+        // The template isn't locked down: memory it shares with a child would be the child's to
+        // write (fork mode's shared kernel memory).
+        if self.shared {
+            return Err(Error::NotImplemented("a fork-mode template: its kernel's shared memory needs a copy per child"));
+        }
+        self.own()?;
+        // SAFETY: fork; the child is single-threaded and takes the guest over before using it.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(Error::io("fork")(std::io::Error::last_os_error()));
+        }
+        if pid == 0 {
+            self.own()?;
+            return Ok(Fork::Child);
+        }
+        Ok(Fork::Parent(pid as u32))
     }
 
-    /// Install the network hooks, begin setup (the routing filter in, if it isn't), run
-    /// `lockdown` (the security filter), start the hooks' `on_start` task, exec.
+    /// [`Guest::fork`], the child running `f` (its setup, lockdown, then the program) and ending
+    /// with its program (or, if `f` fails or panics, reporting it and exiting 125 or 101).
+    /// Returns the child to the parent.
+    pub fn spawn(&mut self, f: impl FnOnce(Guest) -> Result<Infallible, Error>) -> Result<Child, Error> {
+        match self.fork()? {
+            Fork::Parent(pid) => Ok(Child { pid }),
+            Fork::Child => {
+                // SAFETY: this process's copy of the guest, moved into `f`; the original is
+                // never used or dropped (the process ends here).
+                let g = unsafe { std::ptr::read(self) };
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(g)));
+                match r {
+                    Ok(Err(e)) => {
+                        eprintln!("exobox: {e}");
+                        std::process::exit(125)
+                    }
+                    _ => std::process::exit(101),
+                }
+            }
+        }
+    }
+
+    /// Lock the process down: the guest's own host fds made (threaded and fork mode: the CPU
+    /// tokens' eventfds; fork mode: init's pidfd), the network hooks installed, then exobox-tcb's
+    /// lockdown ([`tcb::Sandbox::configure_and_lockdown`]: one thread, the fds and mappings
+    /// checked, every fd not granted closed, core dumps and capabilities gone, the filter in),
+    /// then threaded mode's kernel thread started (under the filter), then the hooks' `on_start`.
+    /// `grants` makes the caller's grants (fds 0-2 among them: none is kept unless granted, and
+    /// the guest's stdio writes the host's 1 and 2); passed and held fds are granted read and
+    /// write here. On failure nothing untrusted has run, and the error is the caller's to report.
     ///
-    /// Nothing here touches the guest's files: this runs after the caller's guards, as init with
-    /// the credentials they left (a `setresuid` to a build user), which the exec is meant to have
-    /// and exobox's own writes are not (the resolver's files are written at build).
-    fn launch(
-        mut self,
-        hooks: net::Hooks,
-        start: Start,
-        lockdown: impl FnOnce(&Inventory) -> Result<(), Error>,
-    ) -> Result<Infallible, Error> {
-        self.own(None)?;
-        let on_start = hooks.install();
+    /// The process must have no host thread but this one.
+    pub fn lockdown(mut self, grants: impl FnOnce(&mut tcb::Config) -> tcb::Result<()>) -> Result<Locked, Error> {
+        self.own()?;
+        let others = other_threads();
+        if !others.is_empty() {
+            // One more look a moment later: a thread just joined (the image cache's builders)
+            // is still listed while it finishes exiting. The TCB checks again, for good.
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let others = other_threads();
+            if !others.is_empty() {
+                return Err(Error::Threads(format!(
+                    "the sandbox's process has {} other host thread(s) (tids {others:?}): join them before lockdown, \
+                     where only the thread that booted the guest may exist",
+                    others.len()
+                )));
+            }
+        }
+        // How the runtime writes the guest's host fds (a pipe's in pieces that can't block, a
+        // regular file's whole): looked at now, as they are for this run (after lockdown nothing
+        // may fstat them).
+        let mut plumbing: Vec<RawFd> = (0..3).collect();
+        plumbing.extend(&self.passed);
+        plumbing.extend(&self.held);
+        exobox_rt::host::note_host_fds(&plumbing);
+        let on_start = std::mem::take(&mut self.hooks).install();
         // Once the program runs, a panic is the runtime's: it ends the sandbox through the host
         // (`guest::runtime_panic`), not through the guest it was serving. Set now: setting a hook
-        // allocates, which lockdown ends.
+        // allocates.
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             if guest::program_runs() {
@@ -508,219 +669,115 @@ impl Guest {
             }
             prev(info)
         }));
-        guest::route()?;
-        guest::intercept_begin()?;
-        lockdown(&self.inv)?;
+        if self.mode != Mode::Coroutine {
+            // The CPU tokens' eventfds (fresh fds, the kernel's numbers), the runtime switched to
+            // threaded; the kernel idler starts after the filter.
+            guest::enable_threaded()?;
+            self.host_fds.extend(guest::token_fds());
+            if self.mode == Mode::Fork {
+                // SAFETY: a pidfd of this process.
+                let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) };
+                if pidfd < 0 {
+                    return Err(Error::io("init's pidfd")(std::io::Error::last_os_error()));
+                }
+                self.host_fds.push(pidfd as RawFd);
+                guest::enable_fork(self.max_procs, pidfd as i32)?;
+            }
+        }
+        // The filter allows no host memory call: allocations are the region's from here on (the
+        // TCB's own among them), and setup code that still makes one gets ENOMEM (mmap) or
+        // nothing done, not the filter's verdict.
+        alloc::lockdown();
+        guest::host_memory(false);
+        // Seccomp's trap takes over from syscall user dispatch.
+        guest::sud_off()?;
+        let (passed, held) = (self.passed.clone(), self.held.clone());
+        tcb::Sandbox::configure_and_lockdown(
+            |s| {
+                for &fd in passed.iter().chain(&held) {
+                    s.grant(fd, Access::ReadWrite);
+                }
+                grants(s)
+            },
+            &self,
+        )?;
         // Locked down: from here on, everything is the sandbox's.
+        guest::locked_down();
+        if self.mode != Mode::Coroutine {
+            guest::start_kernel_thread()?;
+        }
         if let Some(f) = on_start {
             exobox_rt::executor::spawn(f(Cx));
         }
-        match start {
-            Start::Exec(path, argv, env) => {
-                let args: Vec<&[u8]> = argv.iter().map(|a| a.as_bytes()).collect();
-                let envs: Vec<&[u8]> = env.iter().map(|a| a.as_bytes()).collect();
-                let errno = guest::exec(path.as_bytes(), &args, &envs, self.aux);
-                Err(Error::Exec { path: PathBuf::from(path), errno: std::io::Error::from_raw_os_error(errno.raw_os_error()) })
-            }
-            Start::Fn(f) => guest::run_fn(f),
-        }
+        Ok(Locked { aux: self.aux, _thread: PhantomData })
     }
 }
 
-/// What [`Guest::launch`] starts after lockdown.
-enum Start<'a> {
-    /// A program exec'd inside the guest: its path, argv and env.
-    Exec(&'a OsString, &'a [OsString], &'a [OsString]),
-    /// [`Sandbox::run_fn`]'s closure, run as the program.
-    Fn(Box<dyn FnOnce() -> i32 + 'a>),
+/// A guest after lockdown: the program is next, [`Locked::exec`] or [`Locked::run`]. Until then
+/// this thread's syscalls are served by the guest, as init's (printing an error works).
+pub struct Locked {
+    aux: guest::Aux,
+    _thread: PhantomData<*const ()>,
 }
 
-/// While it lives, the calling thread's syscalls are the guest's ([`Guest::intercept`]); dropped,
-/// they pass through to the host again.
-#[must_use = "the guest's routing ends when the guard is dropped"]
-pub struct Intercept<'a> {
-    _guest: PhantomData<(&'a mut Guest, *const ())>,
-}
-
-impl Drop for Intercept<'_> {
-    fn drop(&mut self) {
-        guest::intercept_end();
-    }
-}
-
-impl std::fmt::Debug for Intercept<'_> {
+impl std::fmt::Debug for Locked {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Intercept")
+        f.write_str("Locked")
     }
 }
 
-// ------------------------------------------------------------------------------------------------
-// Layer 2: the sandbox, and its lockdown (the TCB, `tcb`).
-
-/// A sandbox's configuration, before boot: [`Sandbox::builder`].
-pub struct Builder {
-    mode: Mode,
-    config: GuestConfig,
-    deny: Deny,
-    restrictions: Vec<Vec<SockFilter>>,
-    hooks: net::Hooks,
-    max_procs: u32,
+/// The guest's `execve` of `argv[0]` with `argv` and `env` (each `NAME=value`), as init with the
+/// credentials setup left. Never returns on success: the process's status is the program's. After
+/// lockdown only (in a [`Locked::run`] closure, or by [`Locked::exec`]); before it, the runtime's
+/// loader refuses (EPERM).
+pub fn execve(argv: &[OsString], env: &[OsString]) -> Error {
+    let Some(path) = argv.first() else { return Error::NoProgram };
+    let aux = AUX.get().copied().unwrap_or_default();
+    let args: Vec<&[u8]> = argv.iter().map(|a| a.as_bytes()).collect();
+    let envs: Vec<&[u8]> = env.iter().map(|a| a.as_bytes()).collect();
+    let errno = guest::exec(path.as_bytes(), &args, &envs, aux);
+    Error::Exec { path: PathBuf::from(path), errno: std::io::Error::from_raw_os_error(errno.raw_os_error()) }
 }
 
-impl Builder {
-    /// The mode (default: coroutine).
-    pub fn mode(mut self, mode: Mode) -> Self {
-        self.mode = mode;
-        self
+/// The host's auxiliary vector values, for [`execve`]: set at lockdown.
+static AUX: std::sync::OnceLock<guest::Aux> = std::sync::OnceLock::new();
+
+impl Locked {
+    /// Exec `argv[0]` inside the guest ([`execve`]). Never returns on success; on failure the
+    /// error is the caller's to report and exit with (its syscalls are the guest's, and printing
+    /// and exiting work through it).
+    pub fn exec(self, argv: &[OsString], env: &[OsString]) -> Result<Infallible, Error> {
+        let _ = AUX.set(self.aux);
+        Err(execve(argv, env))
     }
 
-    /// The memory the guest reserves (default: [`GuestConfig::default`]).
-    pub fn config(mut self, config: GuestConfig) -> Self {
-        self.config = config;
-        self
-    }
-
-    /// The program's connects beyond loopback ([`net`]).
-    /// A hook is not a policy point: it runs in the program's address space after lockdown, and
-    /// a compromised program can skip it. Policy belongs at the far end of the held fds.
-    pub fn on_connect(mut self, hook: OnConnect) -> Self {
-        self.hooks.on_connect = hook;
-        self
-    }
-
-    /// The program's listens beyond loopback ([`net`]).
-    /// A hook is not a policy point: it runs in the program's address space after lockdown, and
-    /// a compromised program can skip it. Policy belongs at the far end of the held fds.
-    pub fn on_listen(mut self, hook: OnListen) -> Self {
-        self.hooks.on_listen = hook;
-        self
-    }
-
-    /// The program's name lookups ([`net`]); like every hook, not a policy point. Without one, but with an `on_connect`, every name
-    /// resolves to an address of its own (see [`Cx::name_of`]).
-    pub fn on_resolve(mut self, hook: OnResolve) -> Self {
-        self.hooks.on_resolve = hook;
-        self
-    }
-
-    /// A task started on the hooks' executor at lockdown, before the program: a provider's
-    /// session over a held fd ([`Cx::held`]), ready before the first connect.
-    pub fn on_start<F, Fut>(mut self, f: F) -> Self
-    where
-        F: FnOnce(Cx) -> Fut + 'static,
-        Fut: std::future::Future<Output = ()> + 'static,
-    {
-        self.hooks.on_start = Some(Box::new(move |cx| Box::pin(f(cx))));
-        self
-    }
-
-    /// One more seccomp program, stacked at lockdown with the security filter: the kernel runs
-    /// every filter and takes the strictest answer, so a restriction can only take away (a call
-    /// the mode allows fails as the restriction says; one it refuses stays refused), never add.
-    /// Repeatable. A classic-BPF program over `struct seccomp_data`, as seccompiler and libseccomp
-    /// make them. It sees exobox's own syscalls (from the gate: the ones the mode allows, which it
-    /// can refuse with any verdict) and the program's too, but those are traps of the routing
-    /// filter's, and of the kernel's precedence (KILL > TRAP > ERRNO > ALLOW) only a kill outranks a
-    /// trap: an ERRNO leaves the program's call to the guest.
-    /// exobox installs the security filter after it, so its `prctl` and `seccomp` from the gate
-    /// get through (the security filter refuses both after).
+    /// `f` run as the program: on this thread, its syscalls trapped and served by the guest kernel
+    /// as an exec'd program's are (as init, with the credentials setup left), and its return
+    /// value the sandbox's exit status. Never returns. Exec is [`execve`] inside it.
     ///
-    /// With seccompiler (which exobox builds its own filter with; a dependency of yours too, for
-    /// this), forbidding `write` to fd 2:
-    ///
-    /// ```ignore
-    /// use seccompiler::{BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule};
-    /// let filter = SeccompFilter::new(
-    ///     [(libc::SYS_write, vec![SeccompRule::new(vec![SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 2)?])?])].into(),
-    ///     SeccompAction::Allow,       // what isn't matched
-    ///     SeccompAction::KillProcess, // what is
-    ///     std::env::consts::ARCH.try_into()?,
-    /// )?;
-    /// let bpf: BpfProgram = filter.try_into()?;
-    /// let sb = exobox::Sandbox::builder()
-    ///     .restrict(bpf.iter().map(|f| exobox::SockFilter { code: f.code, jt: f.jt, jf: f.jf, k: f.k }))
-    ///     .build()?;
-    /// ```
-    pub fn restrict(mut self, prog: impl IntoIterator<Item = SockFilter>) -> Self {
-        self.restrictions.push(prog.into_iter().collect());
-        self
-    }
-
-    /// What a refused host syscall gets (default: kill). For the escape tests.
-    #[doc(hidden)]
-    pub fn deny(mut self, deny: Deny) -> Self {
-        self.deny = deny;
-        self
-    }
-
-    /// Fork mode: at most `n` processes alive at once, the first one included; a fork past it
-    /// fails with EAGAIN (default: no bound but the runtime's host-thread slots). Ignored in the
-    /// other modes.
-    pub fn max_procs(mut self, n: u32) -> Self {
-        self.max_procs = n;
-        self
-    }
-
-    /// Boot the guest for the mode. Fork mode's processes share the kernel's memory, mapped
-    /// shared here. When the program's names resolve (an `on_resolve` or `on_connect` hook), the
-    /// guest's `/etc/resolv.conf` and `/etc/hosts` are written now, root's ([`setup::resolver`]):
-    /// a guard may change them.
-    pub fn build(self) -> Result<Sandbox, Error> {
-        let mut guest = Guest::boot_as(self.config, self.mode == Mode::Fork)?;
-        if self.hooks.resolves() {
-            setup::resolver().map_err(Error::io("the guest's resolver"))?;
-        }
-        if self.mode != Mode::Coroutine {
-            // The CPU tokens' eventfds, where the runtime looks for them, then the runtime
-            // switched to threaded (before lockdown), then the kernel idler host thread started
-            // and waited for (it installs its signal stack).
-            let base = exobox_rt::par::EFD_BASE as RawFd;
-            guest.inv.token_eventfds(base, exobox_rt::par::N_SLOTS).map_err(Error::io("the CPU tokens' eventfds"))?;
-            guest::enable_threaded()?;
-            spawn_idler().map_err(Error::io("the kernel idler thread"))?;
-            guest.inv.add_thread();
-            guest::threaded_wait_ready();
-            if self.mode == Mode::Fork {
-                let pidfd = guest.inv.init_pidfd().map_err(Error::io("init's pidfd"))?;
-                guest::enable_fork(self.max_procs, pidfd)?;
-            }
-        }
-        Ok(Sandbox { guest, mode: self.mode, deny: self.deny, restrictions: self.restrictions, hooks: self.hooks })
+    /// `f` is ordinary Rust in this process, so it is the sandbox's program: what it can reach on
+    /// the host is what the program's could (the filter's list), and what it captures it may use
+    /// (it's moved in). Its limits: no threads (`std::thread` makes a guest thread that knows
+    /// nothing of Rust's TLS: don't); its allocations come from the region reserved at boot (the
+    /// global allocator after lockdown); a panic in it is the runtime's (the sandbox dies of
+    /// SIGABRT); its host fds are the granted ones (any other was closed at lockdown: a `File`
+    /// captured from before is a closed or a guest fd now).
+    pub fn run(self, f: impl FnOnce() -> i32) -> Result<Infallible, Error> {
+        let _ = AUX.set(self.aux);
+        guest::run_fn(f)
     }
 }
 
-/// A [`Guest`] with a mode, its security filter, the network's hooks, and templates: built by
-/// [`Sandbox::builder`], given host data ([`Sandbox::map_image`], [`Sandbox::pass_fd`],
-/// [`Sandbox::hold_fd`]), set up through [`Sandbox::intercept`], forked per instance as a
-/// template ([`Sandbox::fork`]), and started by [`Sandbox::run`].
-pub struct Sandbox {
-    guest: Guest,
-    mode: Mode,
-    deny: Deny,
-    restrictions: Vec<Vec<SockFilter>>,
-    hooks: net::Hooks,
-}
-
-impl std::fmt::Debug for Sandbox {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Sandbox")
-            .field("mode", &self.mode)
-            .field("fds", &self.guest.inv.fds())
-            .field("maps", &self.guest.inv.maps())
-            .finish_non_exhaustive()
-    }
-}
-
-/// Which side of [`Sandbox::fork`] this is.
+/// Which side of [`Guest::fork`] this is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fork {
-    /// The new process: a sandbox of its own, to set up and run.
+    /// The new process: a guest of its own, to set up, lock down and run.
     Child,
     /// The template, with the child's host pid.
     Parent(u32),
 }
 
-/// A sandbox started by [`Sandbox::spawn`]: a child process of the caller's.
+/// A sandbox started by [`Guest::spawn`]: a child process of the caller's.
 #[derive(Debug)]
 pub struct Child {
     pid: u32,
@@ -737,7 +794,7 @@ impl Child {
     }
 }
 
-/// Wait for child process `pid` (a sandbox [`Sandbox::fork`] made): `waitpid`.
+/// Wait for child process `pid` (a sandbox [`Guest::fork`] made): `waitpid`.
 pub fn wait(pid: u32) -> std::io::Result<std::process::ExitStatus> {
     use std::os::unix::process::ExitStatusExt;
     let mut st = 0;
@@ -751,196 +808,6 @@ pub fn wait(pid: u32) -> std::io::Result<std::process::ExitStatus> {
         if e.kind() != std::io::ErrorKind::Interrupted {
             return Err(e);
         }
-    }
-}
-
-impl Sandbox {
-    /// A sandbox to configure, then [`Builder::build`].
-    pub fn builder() -> Builder {
-        Builder { mode: Mode::default(), config: GuestConfig::default(), deny: Deny::Kill, restrictions: vec![], hooks: net::Hooks::default(), max_procs: 0 }
-    }
-
-    /// Its mode.
-    pub fn mode(&self) -> Mode {
-        self.mode
-    }
-
-    /// [`Guest::map_image`].
-    pub fn map_image<'a>(&mut self, source: impl Into<ImageSource<'a>>) -> Result<Image, Error> {
-        self.guest.map_image(source)
-    }
-
-    /// [`Guest::map_image_as`].
-    pub fn map_image_as<'a>(&mut self, source: impl Into<ImageSource<'a>>, name: &str) -> Result<Image, Error> {
-        self.guest.map_image_as(source, name)
-    }
-
-    /// [`Guest::map_closure`].
-    pub fn map_closure(&mut self, program: &Path, allow_paths: &[PathBuf]) -> Result<Vec<setup::Mount>, Error> {
-        self.guest.map_closure(program, allow_paths)
-    }
-
-    /// [`Guest::map_store`].
-    pub fn map_store(&mut self, store: &store::Store) -> Result<Vec<setup::Mount>, Error> {
-        self.guest.map_store(store)
-    }
-
-    /// Give the guest host fd `fd` as its fd `guest` (e.g. a channel to the orchestrator at 1000),
-    /// now: a guest file whose reads and writes the runtime does on `fd` (as fds 0-2 are); the
-    /// filter is widened to `read` and `write` on exactly that host fd. A guest read waits for
-    /// the host fd without holding the guest's CPU, and the guest's `poll`/`epoll` on it see the
-    /// host fd's readiness (the kernel asks the runtime, whose idle wait watches the fd). `fd`
-    /// stays open for the sandbox's life. Host code (outside a guard); fails if `fd` isn't open.
-    pub fn pass_fd(&mut self, fd: OwnedFd, guest: i32) -> Result<(), Error> {
-        self.guest.own(None)?;
-        let host = self.guest.inv.keep(fd, Fd::Passed).map_err(Error::io("passing an fd"))?;
-        setup::host_fd(host, guest).map_err(Error::io(format!("the guest's fd {guest}")))
-    }
-
-    /// [`Guest::hold_fd`], and the filter widened to `read` and `write` on exactly that fd.
-    pub fn hold_fd(&mut self, fd: OwnedFd) -> Result<HeldFd, Error> {
-        self.guest.hold_fd(fd)
-    }
-
-    /// [`Sandbox::hold_fd`] under `name`, for the hooks to find with [`Cx::held`]: a template's
-    /// hooks are given at build, each child holds its own provider's fd.
-    pub fn hold_fd_as(&mut self, name: &str, fd: OwnedFd) -> Result<HeldFd, Error> {
-        let held = self.hold_fd(fd)?;
-        net::name_held(name, held);
-        Ok(held)
-    }
-
-    /// [`Guest::intercept`].
-    pub fn intercept(&mut self) -> Result<Intercept<'_>, Error> {
-        self.guest.intercept()
-    }
-
-    /// A host fork of the sandbox's process: a template's instance. The child is a sandbox of its
-    /// own, a copy of this one as it is now (its guest kernel, its mounts and files, what it has
-    /// mapped, passed and held), to set up further and [`Sandbox::run`]; the parent goes on, a
-    /// template for more. The fork is made right (`guest::fork_prepare`/`fork_child`): the
-    /// child's guest RNG is reseeded with fresh host entropy, and in threaded mode the kernel is
-    /// copied at rest (the CPU token held) and the child's host threads and CPU token made again.
-    /// The child's status, once it runs, is its program's. Usable in a loop (a long-lived
-    /// template forking per request); outside a guard. The parent waits for its children itself
-    /// ([`wait`], or `waitpid`).
-    ///
-    /// Fork mode: not yet (its processes share the guest kernel's memory, which each instance
-    /// needs a copy of).
-    pub fn fork(&mut self) -> Result<Fork, Error> {
-        // The template isn't locked down: memory it shares with a child would be the child's to
-        // write (fork mode's shared kernel memory, the only shared mapping exobox makes).
-        if self.guest.inv.has_shared() {
-            return Err(Error::NotImplemented("a fork-mode template: its kernel's shared memory needs a copy per child"));
-        }
-        self.guest.own(None)?;
-        let token = guest::fork_prepare();
-        // SAFETY: fork; the child is single-threaded and takes the guest over before using it.
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            guest::fork_parent(token);
-            return Err(Error::io("fork")(std::io::Error::last_os_error()));
-        }
-        if pid == 0 {
-            self.guest.own(Some(token.unwrap_or(0)))?;
-            return Ok(Fork::Child);
-        }
-        guest::fork_parent(token);
-        Ok(Fork::Parent(pid as u32))
-    }
-
-    /// [`Sandbox::fork`], the child running `f` (its setup, then `run`) and ending with its
-    /// program (or, if `f` fails or panics, reporting it and exiting 125 or 101). Returns the
-    /// child to the parent.
-    pub fn spawn(&mut self, f: impl FnOnce(Sandbox) -> Result<Infallible, Error>) -> Result<Child, Error> {
-        match self.fork()? {
-            Fork::Parent(pid) => Ok(Child { pid }),
-            Fork::Child => {
-                // SAFETY: this process's copy of the sandbox, moved into `f`; the original is
-                // never used or dropped (the process ends here).
-                let sb = unsafe { std::ptr::read(self) };
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(sb)));
-                match r {
-                    Ok(Err(e)) => {
-                        eprintln!("exobox: {e}");
-                        std::process::exit(125)
-                    }
-                    _ => std::process::exit(101),
-                }
-            }
-        }
-    }
-
-    /// Lockdown and exec: the routing filter (if no guard installed it), the network hooks
-    /// (whose resolver files, when names resolve, [`Builder::build`] wrote), then the security
-    /// filter (the mode's, and the restrictions) and the exec of `argv[0]` inside the guest with
-    /// `argv` and `env` (each `NAME=value`), as init with the credentials the guards left. Never returns on success: the process's status is the program's. On failure
-    /// the error is the caller's to report and exit with (after lockdown its syscalls are the
-    /// guest's, and printing and exiting work through it).
-    ///
-    /// The sandbox's process must have no host threads but the mode's own (the caller's would be
-    /// left unfiltered, or routed into the guest): `Error::Threads`.
-    pub fn run(self, argv: &[OsString], env: &[OsString]) -> Result<Infallible, Error> {
-        let path = argv.first().ok_or(Error::NoProgram)?.clone();
-        self.start(Start::Exec(&path, argv, env))
-    }
-
-    /// Lockdown, then `f` run as the program: on this thread, after both filters, its syscalls
-    /// trapped and served by the guest kernel as an exec'd program's are (as init, with the
-    /// credentials the guards left), and its return value the sandbox's exit status. Never
-    /// returns on success; fails as [`Sandbox::run`] does, before `f` runs.
-    ///
-    /// `f` is ordinary Rust in this process, so it is the sandbox's program: what it can reach on
-    /// the host is what the program's could (the security filter's list), and what it captures
-    /// it may use (it's moved in). Its limits: no threads (`std::thread` makes a guest thread
-    /// that knows nothing of Rust's TLS: don't); its allocations come from the region exobox
-    /// reserved at build (the global allocator after lockdown); a panic in it is the runtime's
-    /// (the sandbox dies of SIGABRT); its host fds are the inventory's (any other was closed
-    /// at lockdown: a `File` captured from before is a closed or a guest fd now).
-    pub fn run_fn(self, f: impl FnOnce() -> i32) -> Result<Infallible, Error> {
-        self.start(Start::Fn(Box::new(f)))
-    }
-
-    fn start(mut self, start: Start) -> Result<Infallible, Error> {
-        self.guest.own(None)?;
-        let fds: Vec<RawFd> = self
-            .guest
-            .inv
-            .fds()
-            .iter()
-            .filter(|(_, k)| matches!(k, Fd::Stdio | Fd::Passed | Fd::Held))
-            .map(|&(fd, _)| fd)
-            .collect();
-        // How the runtime writes the guest's host fds (a pipe's in pieces that can't block, a
-        // regular file's whole): looked at now, as they are for this run (after lockdown nothing
-        // may fstat them).
-        exobox_rt::host::note_host_fds(&fds);
-        // Compiled now, on the host: lockdown allocates nothing.
-        let mode = match self.mode {
-            Mode::Coroutine => tcb::filter::Mode::Coroutine,
-            Mode::Threaded => tcb::filter::Mode::Threaded,
-            Mode::Fork => tcb::filter::Mode::Fork,
-        };
-        let deny = match self.deny {
-            Deny::Kill => tcb::filter::Deny::Kill,
-            Deny::Errno => tcb::filter::Deny::Errno,
-        };
-        let gate_ip = exobox_rt::trap::gate_ip();
-        let security = tcb::filter::security(mode, deny, &self.guest.inv.pins(), gate_ip).map_err(|e| Error::Io {
-            what: "the security filter".into(),
-            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()),
-        })?;
-        let restrictions: Vec<Vec<SockFilter>> =
-            std::mem::take(&mut self.restrictions).iter().map(|r| tcb::filter::restriction(r, gate_ip)).collect();
-        let hooks = std::mem::take(&mut self.hooks);
-        self.guest.launch(hooks, start, move |inv| {
-            // The security filter allows no host memory call: allocations are the region's.
-            alloc::lockdown();
-            // Setup code that still makes one gets ENOMEM (mmap) or nothing done, not the
-            // filter's verdict.
-            guest::host_memory(false);
-            tcb::lockdown::lockdown(inv, &restrictions, &security).map_err(Error::io("lockdown"))
-        })
     }
 }
 
@@ -1006,15 +873,23 @@ pub fn store(config: &Config) -> Result<store::Store, Error> {
     Ok(cache.store(Path::new(program), &config.allow_paths)?)
 }
 
-/// Become the sandbox: [`Sandbox::builder`] for the mode, the closure's images (and
-/// `config.images`) mapped and mounted in a guard, [`Sandbox::run`]. Returns only on failure
-/// before the program starts; the process ends with the program's status.
+/// The program's stdio granted, as the CLI does ([`run`]): stdin read, stdout and stderr write.
+/// For [`Guest::lockdown`]'s grants (`g.lockdown(exobox::stdio)`, or called inside one's own).
+pub fn stdio(s: &mut tcb::Config) -> tcb::Result<()> {
+    s.grant(0, Access::Read).grant(1, Access::Write).grant(2, Access::Write);
+    Ok(())
+}
+
+/// Become the sandbox: [`Guest::boot`] for the mode, the closure's images (and `config.images`)
+/// mapped and mounted in a [`Guest::run`] closure, [`Guest::lockdown`] with the program's stdio
+/// granted (stdin read, stdout and stderr write), [`Locked::exec`]. Returns only on failure before
+/// the program starts; the process ends with the program's status.
 pub fn run(config: Config) -> Result<Infallible, Error> {
     let store = store(&config)?;
-    let mut sb = Sandbox::builder().mode(config.mode).deny(config.deny).max_procs(config.max_procs.unwrap_or(0)).build()?;
-    let mut mounts = sb.map_store(&store)?;
+    let mut g = Guest::boot(GuestConfig { mode: config.mode, max_procs: config.max_procs.unwrap_or(0), ..Default::default() })?;
+    let mut mounts = g.map_store(&store)?;
     for i in &config.images {
-        let img = sb.map_image_as(&i.path, &i.name)?;
+        let img = g.map_image_as(&i.path, &i.name)?;
         if let Some(at) = &i.mount {
             mounts.push(setup::Mount { image: img, at: at.clone(), kind: store::Kind::Dir });
         }
@@ -1022,11 +897,13 @@ pub fn run(config: Config) -> Result<Infallible, Error> {
     // The program's path as the host resolves it: the guest's working directory is `/`.
     let mut argv = config.argv.clone();
     argv[0] = std::path::absolute(&argv[0]).map_err(Error::io("the program's path"))?.into_os_string();
-    {
-        let _g = sb.intercept()?;
-        setup::mount_closure(&mounts)?;
-    }
-    sb.run(&argv, &config.env)
+    g.run(|| setup::mount_closure(&mounts))??;
+    let deny = config.deny;
+    let locked = g.lockdown(|s| {
+        s.deny(deny);
+        stdio(s)
+    })?;
+    locked.exec(&argv, &config.env)
 }
 
 #[cfg(test)]
@@ -1043,5 +920,14 @@ mod tests {
         for bad in ["a", "=p", "a=", "a/b=p", "a=p:"] {
             assert!(bad.parse::<ImageArg>().is_err(), "{bad} parsed");
         }
+    }
+
+    /// The runtime makes its threads and waits with the shapes the TCB's filter pins (a mismatch
+    /// would be a sandbox killed at its first thread, never a wider filter: this says which to
+    /// fix).
+    #[test]
+    fn the_runtimes_shapes() {
+        assert_eq!(tcb::CLONE_THREAD_FLAGS, exobox_rt::trap::CLONE_HOST_THREAD);
+        assert_eq!(tcb::PPOLL_FDS, exobox_rt::trap::PPOLL_FDS);
     }
 }

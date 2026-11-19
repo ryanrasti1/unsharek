@@ -331,8 +331,8 @@ pub static HOST_OPS: HostOps = HostOps(UnsafeCell::new(lkl_host_operations {
 // ---- print and panic ----
 
 /// All of `buf` to the host's stderr, a `write` on fd 2 through the gate (allowed by every
-/// filter). Not rustix's: once the routing filter is in, a syscall not from the gate traps and
-/// would be served by the guest (as the program's write to its fd 2), from inside the kernel.
+/// filter). Not rustix's: in a setup closure or after lockdown, a syscall not from the gate traps
+/// and would be served by the guest (as the program's write to its fd 2), from inside the kernel.
 /// Errors are dropped: there is nowhere else to report them.
 fn write_stderr(mut buf: &[u8]) {
     while !buf.is_empty() {
@@ -909,8 +909,8 @@ impl Host for SysHost {
             }
         };
         let ts = timeout.map(|t| crate::xabi::Timespec { tv_sec: t.tv_sec, tv_nsec: t.tv_nsec });
-        // Through the gate (the filter's one wait; rustix's poll would trap once the routing
-        // filter is in), watching the host fds coroutines wait for and the fds the hooks'
+        // Through the gate (the filter's one wait; rustix's poll would trap in setup and after
+        // lockdown), watching the host fds coroutines wait for and the fds the hooks'
         // executor waits on ([`idle_fds`]). EINTR (a signal) is a wake-up like any other.
         let mut fds = [crate::trap::PollFd::default(); crate::trap::PPOLL_FDS as usize];
         let n = idle_fds(&mut fds);

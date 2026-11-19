@@ -53,7 +53,7 @@ pub(super) fn enabled() -> bool {
 
 /// Fork mode, in init's process before lockdown, after [`enable_threaded`]: the `fork` host op,
 /// the bound on processes, init's pidfd for the others to watch (`init_pidfd`, the host's: made
-/// by exobox's inventory), the SIGCHLD handler that sees a process die on the host, and init's
+/// by exobox at lockdown), the SIGCHLD handler that sees a process die on the host, and init's
 /// main thread's traps on a shared stack.
 pub fn enable_fork(max_procs: u32, init_pidfd: i32) -> Result<(), Error> {
     par::set_max_procs(max_procs);
