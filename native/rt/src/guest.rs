@@ -1199,14 +1199,33 @@ fn emulate(uc: &mut Ucontext, e: Emulate, nr: usize, a: [usize; 6]) -> isize {
         }
         E::ArchPrctl if !program => unsafe { trap::gate(nr, a[0], a[1], a[2], a[3], a[4], a[5]) },
         E::ArchPrctl => {
+            const ARCH_SET_GS: usize = 0x1001;
             const ARCH_SET_FS: usize = 0x1002;
             const ARCH_GET_FS: usize = 0x1003;
+            const ARCH_GET_GS: usize = 0x1004;
             match a[0] {
                 ARCH_SET_FS => {
                     uc.mcontext.fs_base = a[1] as u64;
                     0
                 }
                 ARCH_GET_FS => ret(write_user(a[1], uc.mcontext.fs_base).map(|_| 0)),
+                // The GS base is the program's alone: the runtime never reads or writes it (the
+                // trap leaves it as it was; `par` finds its records from the stack pointer), so
+                // the host thread's own is the program's. In coroutine mode the program's threads
+                // share the host thread, and so one GS base (switches don't carry it).
+                // Linux's bound (TASK_SIZE_MAX); a non-canonical base would fault the wrgsbase.
+                ARCH_SET_GS if a[1] >= 0x7fff_ffff_f000 => -(Errno::PERM.raw_os_error() as isize),
+                ARCH_SET_GS => {
+                    // SAFETY: sets a register only the program uses.
+                    unsafe { core::arch::asm!("wrgsbase {}", in(reg) a[1], options(nomem, nostack, preserves_flags)) };
+                    0
+                }
+                ARCH_GET_GS => {
+                    let gs: usize;
+                    // SAFETY: reads a register.
+                    unsafe { core::arch::asm!("rdgsbase {}", out(reg) gs, options(nomem, nostack, preserves_flags)) };
+                    ret(write_user(a[1], gs).map(|_| 0))
+                }
                 _ => -(Errno::INVAL.raw_os_error() as isize),
             }
         }

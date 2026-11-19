@@ -5,6 +5,9 @@
 //! thread of its own, in parallel, and the kernel (LKL, the scheduler, the futexes, the arena) is
 //! guarded by a single **CPU token**: only the host thread holding it may touch that shared state.
 //!
+//! - **Which host thread.** Runtime code finds its host thread's record from the stack pointer
+//!   ([`me`]), never from a register: the FS and GS bases are the program's.
+//!
 //! - **The token.** [`OWNER`] names the slot that holds it (or [`NONE_SLOT`]). A host thread waits
 //!   for it by reading its own eventfd (blocking while the count is 0) and is handed it by a write
 //!   on that eventfd. The eventfds are made before lockdown at a fixed fd range (the filter pins
@@ -37,7 +40,7 @@
 
 use core::cell::Cell;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use rustix::fd::AsRawFd;
 
@@ -59,12 +62,17 @@ pub const NONE_SLOT: u32 = u32::MAX;
 /// `read`/`write` to `[EFD_BASE, EFD_BASE + N_SLOTS)`.
 pub const EFD_BASE: u32 = 256;
 /// A lazy thread's first (boot) stack: `thread_start`'s frame and the `rt_sigreturn` frame, until
-/// it jumps to the program. Small; the program then runs on its own stack.
-const BOOT_STACK: usize = 32 * 1024;
+/// it jumps to the program. Small; the program then runs on its own stack. Sized so a slot's
+/// stacks (alternate + boot) are a power of two: [`me`] finds the slot by a shift.
+const BOOT_STACK: usize = SLOT_STACKS - trap::ALTSTACK_SIZE;
+/// Each slot's part of the stack region: its alternate signal stack, then its boot stack.
+const SLOT_STACKS: usize = 1 << SLOT_SHIFT;
+const SLOT_SHIFT: u32 = 17;
+const _: () = assert!(trap::ALTSTACK_SIZE < SLOT_STACKS);
 
 const POLLIN: i16 = 1;
 
-/// One host thread's record. Reached through the GS base ([`me`]); its slot index keys the token.
+/// One host thread's record, found from the stack pointer ([`me`]); its slot index keys the token.
 pub struct HostSlot {
     id: u16,
     /// `EFD_BASE + id`.
@@ -141,6 +149,8 @@ pub struct Threaded {
     k_ready: AtomicBool,
     /// Next lazy slot search start.
     next: AtomicU32,
+    /// The slots' stack region ([`SLOT_STACKS`] each: alternate, then boot), for [`me`].
+    region: AtomicUsize,
 }
 
 // SAFETY: the scheduler fields are touched only by the token holder (one at a time). The atomics
@@ -165,16 +175,36 @@ pub static PAR: Threaded = Threaded {
     wtail: Cell::new(u16::MAX),
     k_ready: AtomicBool::new(false),
     next: AtomicU32::new(1),
+    region: AtomicUsize::new(0),
 };
 
 fn sched() -> &'static Sched {
     PAR.sched.get().expect("par not enabled")
 }
 
-/// The calling host thread's record, from its GS base.
+/// The calling host thread's record, found from the stack pointer: no register of the thread's is
+/// the runtime's. (It was the GS base, but the program may set GS itself: `arch_prctl(ARCH_SET_GS)`,
+/// or `wrgsbase` with FSGSBASE, which no filter sees; the runtime now never reads or writes it.)
+/// - On a slot's alternate or boot stack (the trap entry and the target hook run on the
+///   alternate stack, a lazy thread starts on its boot stack): that slot, by a subtraction and a
+///   shift (one region, [`SLOT_STACKS`] per slot).
+/// - On a coroutine's stack (the dispatcher on a program thread's control stack, LKL's threads,
+///   the scheduler loops): the host thread it is bound to, or was last switched to on
+///   (`Sched::par_host_of_stack`).
+/// - Anywhere else: the main thread's own stack (slot 0's root: setup code, and the program's
+///   main thread's traps), the only host stack runtime code runs on after `enable`.
 fn me() -> &'static HostSlot {
-    // SAFETY: every host thread sets its GS base to its slot ([`setup_host`]).
-    unsafe { &*(context::read_gs() as *const HostSlot) }
+    let sp: usize;
+    // SAFETY: reads rsp.
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags)) };
+    let off = sp.wrapping_sub(PAR.region.load(Ordering::Relaxed));
+    if off < SLOT_STACKS * N_SLOTS {
+        return &PAR.slots[off >> SLOT_SHIFT];
+    }
+    match sched().par_host_of_stack(sp) {
+        Some(h) => &PAR.slots[h as usize],
+        None => &PAR.slots[0],
+    }
 }
 
 /// This host thread's slot id.
@@ -379,15 +409,13 @@ pub fn wait_kernel_ready() {
 
 // ---- host-thread setup ----
 
-/// Give the calling host thread its slot: GS base, alternate signal stack (`lazy` threads already
-/// have theirs installed by `clone_thread`'s frame), and boot/alt regions.
+/// Give the calling host thread its slot: its alternate signal stack (`lazy` threads already have
+/// theirs installed by `clone_thread`'s frame). [`me`] finds the slot from the stack pointer.
 ///
 /// # Safety
 /// Called once per host thread; before lockdown for non-lazy threads (it uses `sigaltstack`).
 unsafe fn setup_host(id: u16, lazy: bool) {
     let h = slot(id);
-    // SAFETY: GS base is this thread's, read back by `me`.
-    unsafe { context::write_gs(h as *const HostSlot as usize) };
     if !lazy {
         // SAFETY: the alt region is this thread's; before lockdown.
         unsafe { trap::set_altstack(h.alt.get() as *mut u8, trap::ALTSTACK_SIZE).expect("altstack") };
@@ -404,7 +432,7 @@ unsafe fn setup_host(id: u16, lazy: bool) {
 pub unsafe fn enable(s: &'static Sched, root: Tid) -> Result<(u32, u32), rustix::io::Errno> {
     PAR.sched.set(Some(s));
     // Reserve alt + boot stacks for every slot in one NORESERVE region (only touched pages cost).
-    let each = trap::ALTSTACK_SIZE + BOOT_STACK;
+    let each = SLOT_STACKS;
     let total = each * N_SLOTS;
     // SAFETY: a fresh anonymous reservation owned by the runtime from now on.
     let base = unsafe {
@@ -415,6 +443,7 @@ pub unsafe fn enable(s: &'static Sched, root: Tid) -> Result<(u32, u32), rustix:
             rustix::mm::MapFlags::PRIVATE | rustix::mm::MapFlags::NORESERVE,
         )?
     } as usize;
+    PAR.region.store(base, Ordering::Relaxed);
     for i in 0..N_SLOTS {
         let h = &PAR.slots[i];
         h.alt.set(base + i * each);
@@ -590,7 +619,7 @@ extern "C" fn thread_start(arg: usize) -> ! {
     // SAFETY: the parent wrote the start state into the slot's boot region.
     let cs = unsafe { core::ptr::read(start_slot(id)) };
     let h = slot(id);
-    // SAFETY: GS base is this thread's; lazy (altstack already installed by the frame).
+    // SAFETY: the slot is this thread's; lazy (altstack already installed by the frame).
     unsafe { setup_host(id, true) };
     let bound = Tid::from_raw(h.bound.get());
     h.set_running(bound);

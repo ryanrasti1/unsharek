@@ -159,6 +159,7 @@ fn cases() -> Vec<Case> {
         fixture("small_stack", ALL),
         fixture("stdio_meminfo", ALL),
         fixture("sigsys", ALL),
+        fixture("gsbase", ALL),
         Case { cpu_budget: Some(Duration::from_millis(100)), ..fixture("idle", ALL) },
         // JITs work with no flag: W^X would be hardening of the program, not the sandbox's.
         fixture("rwx", ALL),

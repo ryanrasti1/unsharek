@@ -187,6 +187,10 @@ struct Slot {
     /// whichever host thread holds the CPU token). A program thread's coroutine is bound to its
     /// own host thread; LKL's kernel threads and timers stay unbound. Unused in coroutine mode.
     home: Cell<u16>,
+    /// Threaded mode: the host-thread slot an unbound coroutine was last switched to on
+    /// ([`Sched::par_context_switch`]), so runtime code on its stack can find its host thread
+    /// ([`Sched::par_host_of_stack`]) without a register of its own (the GS base is the program's).
+    on_host: Cell<u16>,
     tls: [Cell<usize>; TLS_KEYS],
 }
 
@@ -212,6 +216,7 @@ impl Slot {
             joiner: Cell::new(NONE),
             exit: Cell::new(0),
             home: Cell::new(NONE),
+            on_host: Cell::new(NONE),
             tls: [const { Cell::new(0) }; TLS_KEYS],
         }
     }
@@ -615,8 +620,34 @@ impl Sched {
     /// since the shared `current` is set by whichever host last held the token).
     pub fn par_context_switch(&self, from: Tid, to: Tid) {
         if let (Some(f), Some(t)) = (self.lookup(from), self.lookup(to)) {
+            // `to` runs on the host thread `from` is running on.
+            let h = self.host_of(f);
+            self.slots[t as usize].on_host.set(h);
             self.do_switch(f, t);
         }
+    }
+
+    /// The host-thread slot coroutine `i` runs on: its binding, else where it was last switched to.
+    fn host_of(&self, i: u16) -> u16 {
+        let s = &self.slots[i as usize];
+        if s.home.get() != NONE { s.home.get() } else { s.on_host.get() }
+    }
+
+    /// Threaded mode: the host-thread slot running the coroutine whose stack holds `sp`, if `sp`
+    /// is in the coroutines' stack region (a subtraction and a divide: the stacks are carved in
+    /// order, slot `i`'s at `base + (i - 1) * size`). `None` outside it (a host thread's own
+    /// stack), or for a coroutine never switched to.
+    pub fn par_host_of_stack(&self, sp: usize) -> Option<u16> {
+        let (base, size, _) = self.stacks.get();
+        if size == 0 {
+            return None;
+        }
+        let i = sp.wrapping_sub(base) / size + 1;
+        if i >= self.fresh.get() as usize {
+            return None;
+        }
+        let h = self.host_of(i as u16);
+        (h != NONE).then_some(h)
     }
 
     /// Make `tid` the current coroutine without a switch: threaded mode, when a host thread takes
