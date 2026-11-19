@@ -243,8 +243,7 @@ unsafe impl Sync for State {}
 
 /// What [`boot`] needs: memory the caller reserved before (host `mmap`, `MAP_NORESERVE`).
 pub struct Boot<'a> {
-    /// The program's arena, `(base, len)`: page-aligned, read/write/execute, zero, with
-    /// `filter::MADV_CHUNK` bytes of the reservation past `len` (the filter's `madvise` bound).
+    /// The program's arena, `(base, len)`: page-aligned, read/write/execute, zero.
     pub arena: (usize, usize),
     /// How much of the arena, at its end, is the image zone (`arena::Arena::set_image_zone`,
     /// `memblk`): where the caller maps images to be mapped in place from. 0 for none.
@@ -287,7 +286,7 @@ pub unsafe fn boot(b: Boot) -> Result<(), Error> {
         host::install(&SCHED, b.heap.0, b.heap.1);
         crate::executor::install(&SCHED);
         let table: &'static mut [Extent] = &mut ARENA_TABLE.get()[..];
-        let mut a = Arena::new(b.arena.0, b.arena.1, arena::Mode::Release, table).map_err(err("arena"))?;
+        let mut a = Arena::new(b.arena.0, b.arena.1, table).map_err(err("arena"))?;
         if b.image_zone != 0 {
             a.set_image_zone(b.arena.0 + b.arena.1 - b.image_zone).map_err(err("the image zone"))?;
             a.set_zone_writable_table(&mut ZONE_RW.get()[..]);
@@ -336,7 +335,7 @@ pub fn route() -> Result<(), Error> {
     if S.routed.get() {
         return Ok(());
     }
-    let p = Params { policy: Policy::RouteOnly, deny: Deny::Kill, gate_ip: trap::gate_ip(), arena: &[], token_fds: (0, 0), pid: 0, extra: &[] };
+    let p = Params { policy: Policy::RouteOnly, deny: Deny::Kill, gate_ip: trap::gate_ip(), token_fds: (0, 0), pid: 0, extra: &[] };
     // SAFETY: the static program, used only here and in `lock`, one at a time.
     let prog = unsafe { FILTER.get() };
     filter::compile(&p, prog).map_err(|_| Error { what: "the routing filter", errno: Errno::INVAL })?;
@@ -422,12 +421,10 @@ pub fn fork_child(token: Option<u16>, spawn_idler: impl FnOnce()) -> Result<(), 
 }
 
 /// Switch the runtime to threaded mode (a host thread per program thread): bind the main thread,
-/// make the CPU-token eventfds (before lockdown), set memory high-water (the mode filter refuses
-/// `madvise`), and install the scheduler driver. Returns the token eventfds' inclusive fd range,
+/// make the CPU-token eventfds (before lockdown), and install the scheduler driver. Returns the token eventfds' inclusive fd range,
 /// for the mode filter. Call once, after [`boot`] and before [`route`], on the main thread. The
 /// caller must also start the kernel idler host thread on [`threaded_kernel_main`].
 pub fn enable_threaded() -> Result<(u32, u32), Error> {
-    with_arena(|a, _| a.set_mode(arena::Mode::HighWater));
     // SAFETY: once, on the main (boot) thread, before lockdown.
     unsafe { par::enable(&SCHED, SCHED.current()) }.map_err(err("enabling threaded mode"))
 }
@@ -449,11 +446,6 @@ pub fn threaded_wait_ready() {
 /// lockdown, as each image is mapped.
 pub fn zone_writable(lo: usize, hi: usize) -> Result<(), Error> {
     with_arena(|a, _| a.add_zone_writable(lo, hi)).map_err(err("the image zone's writable pages"))
-}
-
-/// The arena as the mode filter's `madvise` range (inclusive): `filter::Params::arena`.
-pub fn arena_range() -> (u64, u64) {
-    (S.arena_lo.get() as u64, S.arena_hi.get() as u64 - 1)
 }
 
 /// Whether setup-phase memory calls may still go to the host (false just before the mode's
@@ -703,11 +695,6 @@ impl Backing for Guest {
 
     fn close(&mut self, file: u64) {
         lkl_quiet(l::__lkl__NR_close, [file as usize, 0, 0, 0, 0, 0]);
-    }
-
-    fn release(&mut self, addr: usize, len: usize) -> arena::Result<()> {
-        // SAFETY: the arena gives back only pages nothing relies on.
-        unsafe { trap::madvise_dontneed(addr, len) }
     }
 
     fn locate(&mut self, file: u64, offset: u64) -> Option<(usize, u64)> {

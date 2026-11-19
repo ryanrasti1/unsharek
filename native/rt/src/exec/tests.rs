@@ -6,7 +6,7 @@
 //! for real in a forked child.
 
 use super::*;
-use crate::arena::{Extent, Mapping, Mode};
+use crate::arena::{Extent, Mapping};
 use object::read::elf::ElfFile64;
 use std::collections::HashMap;
 use std::ffi::{CStr, OsStr};
@@ -74,11 +74,6 @@ impl Backing for Fs {
         Err(Errno::ACCESS)
     }
     fn close(&mut self, _: u64) {}
-    fn release(&mut self, addr: usize, len: usize) -> Result<()> {
-        // SAFETY: inside the reservation.
-        unsafe { std::ptr::write_bytes(addr as *mut u8, 0, len) };
-        Ok(())
-    }
 }
 
 /// A read/write/execute reservation, as the runtime makes before lockdown; at `at` exactly if given.
@@ -255,7 +250,7 @@ fn table() -> Vec<Extent> {
 
 fn arena<'t>(r: &Reservation, t: &'t mut [Extent]) -> Arena<'t> {
     // SAFETY: a fresh reservation, all zero, ours alone while the arena lives.
-    unsafe { Arena::new(r.base, r.len, Mode::Release, t) }.unwrap()
+    unsafe { Arena::new(r.base, r.len, t) }.unwrap()
 }
 
 /// The stack parsed back as libc's start code does.

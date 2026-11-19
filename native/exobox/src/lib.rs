@@ -293,9 +293,8 @@ impl Guest {
         let memory = config.memory.next_multiple_of(PAGE);
         let rwx = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
         let rw = libc::PROT_READ | libc::PROT_WRITE;
-        // The filter's madvise bound: an arena address plus a chunk stays inside the reservation.
         let zone = config.image_space.next_multiple_of(PAGE);
-        let arena = reserve(ARENA_AT, memory + zone + filter::MADV_CHUNK as usize, rwx)?;
+        let arena = reserve(ARENA_AT, memory + zone, rwx)?;
         let mem_mb = config.kernel_memory.div_ceil(1 << 20).max(16);
         let heap_len = (mem_mb << 20) + PAGE;
         let share = if shared {
@@ -405,7 +404,7 @@ impl Guest {
         };
         let image = Image { name: Box::leak(name.into_boxed_str()), data };
         let in_zone = match layout.and_then(|l| std::fs::read(l).ok()) {
-            Some(layout) => self.map_in_zone(&file, data, len, &layout)?,
+            Some(layout) => self.map_in_zone(&file, len, &layout)?,
             // No layout, no known slots: its files are copied when mapped.
             None => None,
         };
@@ -425,7 +424,7 @@ impl Guest {
     /// program kept it from ever being mapped in place again where nothing gives pages back
     /// (threaded and fork mode): fork mode copied nearly every exec's libraries, code and all
     /// (make -j4 copied 2.3 GB for 142 execs: native/PERF.md).
-    fn map_in_zone(&mut self, file: &File, data: &[u8], len: usize, layout: &[u8]) -> Result<Option<usize>, Error> {
+    fn map_in_zone(&mut self, file: &File, len: usize, layout: &[u8]) -> Result<Option<usize>, Error> {
         let (at, end) = self.zone;
         let size = len.next_multiple_of(4096);
         if end - at < size {
@@ -444,7 +443,7 @@ impl Guest {
             return Ok(None);
         }
         self.zone.0 = at + size;
-        for (lo, hi) in writable_pages(data, layout) {
+        for (lo, hi) in writable_pages(file, layout) {
             let (lo, hi) = (at + lo, (at + hi).min(at + size));
             if lo >= hi {
                 continue;
@@ -949,7 +948,6 @@ impl Sandbox {
             .iter()
             .flat_map(|c| [filter::Rule { nr: filter::NR_READ, conds: c }, filter::Rule { nr: filter::NR_WRITE, conds: c }])
             .collect();
-        let arena = [guest::arena_range()];
         let params = filter::Params {
             policy: filter::Policy::Mode(match self.mode {
                 Mode::Coroutine => filter::Mode::Coroutine,
@@ -961,7 +959,6 @@ impl Sandbox {
                 Deny::Errno => filter::Deny::Errno,
             },
             gate_ip: exobox_rt::trap::gate_ip(),
-            arena: &arena,
             token_fds: self.token_fds,
             pid: std::process::id(),
             extra: &extra,
@@ -1139,7 +1136,11 @@ mod tests {
 /// (at the file's offset of its lowest segment, `exobox_erofs`'s `elf.rs`), within its slot. An
 /// ELF whose headers can't be read has none (nothing of it can then be written in place: it is
 /// copied).
-fn writable_pages(image: &[u8], layout: &[u8]) -> Vec<(usize, usize)> {
+///
+/// The headers are read with `pread`, not from the image's mapping: touching the mapping made its
+/// pages the sandbox's (1.5 MB more PSS per idle sandbox).
+fn writable_pages(image: &File, layout: &[u8]) -> Vec<(usize, usize)> {
+    use std::os::unix::fs::FileExt;
     const PAGE: u64 = 4096;
     let mut out = Vec::new();
     for line in layout.split(|&b| b == b'\n') {
@@ -1149,8 +1150,26 @@ fn writable_pages(image: &[u8], layout: &[u8]) -> Vec<(usize, usize)> {
         if f.next() != Some(b"elf".as_slice()) {
             continue;
         }
-        let Some(elf) = image.get(offset as usize..(offset + size) as usize) else { continue };
-        let Some(loads) = elf_loads(elf) else { continue };
+        // The ELF header, then as much as its program headers need (a page, nearly always).
+        let mut head = vec![0u8; size.min(4096) as usize];
+        if image.read_at(&mut head, offset).is_err() {
+            continue;
+        }
+        let need = head.get(0x20..0x28).zip(head.get(0x36..0x3a)).map(|(o, n)| {
+            let phoff = u64::from_le_bytes(o.try_into().unwrap());
+            let (ent, num) = (u16::from_le_bytes([n[0], n[1]]) as u64, u16::from_le_bytes([n[2], n[3]]) as u64);
+            phoff.saturating_add(ent * num)
+        });
+        if let Some(need) = need
+            && need > head.len() as u64
+            && need <= size.min(1 << 20)
+        {
+            head.resize(need as usize, 0);
+            if image.read_at(&mut head, offset).is_err() {
+                continue;
+            }
+        }
+        let Some(loads) = elf_loads(&head) else { continue };
         let Some(&(vaddr0, off0, _, _, _)) = loads.iter().min_by_key(|l| l.0) else { continue };
         let lo = vaddr0 / PAGE * PAGE;
         let base = offset + off0 / PAGE * PAGE;

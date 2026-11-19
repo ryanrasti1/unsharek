@@ -58,8 +58,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use rustix::io::Errno;
 
-use crate::filter::{CLONE_HOST_THREAD, MADV_DONTNEED, NR_CLONE, NR_EXIT, NR_EXIT_GROUP};
-use crate::filter::{NR_MADVISE, NR_PPOLL, NR_READ, NR_WRITE};
+use crate::filter::{CLONE_HOST_THREAD, NR_CLONE, NR_EXIT, NR_EXIT_GROUP};
+use crate::filter::{NR_PPOLL, NR_READ, NR_WRITE};
 use crate::xabi::{SA_RESTORER, Timespec, X86Sigaction};
 
 // ------------------------------------------------------------------------------------------------
@@ -167,16 +167,6 @@ pub fn ppoll_fds(fds: &mut [PollFd], timeout: Option<&Timespec>) -> Result<usize
     let ts = timeout.map_or(0, |t| t as *const Timespec as usize);
     // SAFETY: the kernel reads the timespec and reads/writes the n pollfds, all borrowed.
     check(unsafe { gate(NR_PPOLL as usize, p, n, ts, 0, 8, 0) })
-}
-
-/// `madvise(addr, len, MADV_DONTNEED)`: freed arena pages back to the host. The filter allows it
-/// only with `addr` in the arena and `len <= MADV_CHUNK` (coroutine mode).
-///
-/// # Safety
-/// The range's contents become zero: nothing may rely on them.
-pub unsafe fn madvise_dontneed(addr: usize, len: usize) -> Result<(), Errno> {
-    // SAFETY: the caller's.
-    check(unsafe { gate(NR_MADVISE as usize, addr, len, MADV_DONTNEED as usize, 0, 0, 0) }).map(|_| ())
 }
 
 /// `exit_group(status)`: the end of the sandbox.

@@ -22,24 +22,21 @@
 //! extents (unmapping a whole mapping) never need room, so a full table can always be drained.
 //!
 //! # Clean and dirty: why never-written pages are tracked
-//! Free pages that were never handed out, and pages given back to the host, are zero. Reusing
-//! them costs nothing. An anonymous mapping that was never writable (`PROT_NONE` or `PROT_READ`)
+//! Free pages that were never handed out are zero. Reusing them costs nothing. An anonymous mapping that was never writable (`PROT_NONE` or `PROT_READ`)
 //! also still holds those zeros. glibc reserves 128 MiB `PROT_NONE` per malloc arena and trims it
 //! with `munmap`; capnix cleared freed pages in place without knowing which had been written and
 //! touched ~66 MB per sandbox doing it. Here a range stays clean until it is mapped or made
-//! writable, and clean ranges are neither released nor zeroed. The cost: there is no host
+//! writable, and clean ranges are never zeroed. The cost: there is no host
 //! `mprotect`, so a program that writes to a `PROT_NONE` page (it would have crashed natively)
 //! succeeds, and its own later mapping of that page may not read zero.
 //!
-//! # Giving pages back: two modes
-//! - [`Mode::Release`] (coroutine mode): freed dirty pages go back to the host at once
-//!   through [`Backing::release`] (`madvise(MADV_DONTNEED)`), in calls of at most [`MADV_CHUNK`]
-//!   bytes inside the arena: the filter allows only that. Free memory is then always clean.
-//! - [`Mode::HighWater`] (threaded and fork mode): the filter allows no `madvise` at all (concurrent
-//!   `madvise` and page faults is the Dirty-COW race class), so nothing is released and memory stays
-//!   at its peak. Freed dirty pages stay dirty and are cleared in place when they are handed out
-//!   again, only the pages that actually hold a nonzero byte: reading a page the program never
-//!   touched maps the host's shared zero page (free), writing it would make it the sandbox's.
+//! # Memory stays at its peak
+//! Nothing is given back to the host: the filter allows no `madvise` (in threaded and fork mode,
+//! concurrent `madvise` and page faults is the Dirty-COW race class, and one memory model for
+//! every mode is simpler than two; exec needs none, the image zone being read-only). Freed dirty
+//! pages stay dirty and are cleared in place when they are handed out again, only the pages that
+//! actually hold a nonzero byte: reading a page the program never touched maps the host's shared
+//! zero page (free), writing it would make it the sandbox's.
 //!
 //! # The image zone: files mapped in place
 //! The arena's top part can be the image zone ([`Arena::set_image_zone`]): the runtime maps the
@@ -101,8 +98,6 @@ pub type Result<T> = core::result::Result<T, Errno>;
 
 /// The page size (x86-64, aarch64 with 4 KiB pages).
 pub const PAGE: usize = 4096;
-/// The most bytes one [`Backing::release`] call covers: the filter's bound on `madvise`'s length.
-pub const MADV_CHUNK: usize = 1 << 20;
 /// The runtime's table size: Linux's default `vm.max_map_count` (65530), rounded up. An entry is
 /// [`core::mem::size_of::<Extent>()`] bytes (40 on 64-bit), 2.5 MiB in all, in the runtime's bss.
 pub const CAPACITY: usize = 1 << 16;
@@ -163,16 +158,7 @@ pub fn ret(r: Result<usize>) -> isize {
     }
 }
 
-/// How freed pages are given back (see the module docs).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
-    /// Through [`Backing::release`], at once, in chunks of at most [`MADV_CHUNK`].
-    Release,
-    /// Never: pages are reused, and cleared in place first if they were written.
-    HighWater,
-}
-
-/// What the arena needs from its caller: file contents, and the host's `madvise`. Addresses
+/// What the arena needs from its caller: file contents. Addresses
 /// passed are inside the arena; implementations read and write that memory directly (it is the
 /// program's, e.g. through LKL's `pread64`/`pwrite64`).
 pub trait Backing {
@@ -187,10 +173,6 @@ pub trait Backing {
     fn retain(&mut self, file: u64) -> Result<u64>;
     /// No mapping refers to a handle from [`Backing::retain`] any more.
     fn close(&mut self, file: u64);
-    /// Give `[addr, addr + len)` back to the host (`madvise(MADV_DONTNEED)`): afterwards it reads
-    /// zero (in the image zone, the image's bytes). `len <= MADV_CHUNK`; [`Mode::Release`] only.
-    /// On error the arena clears the range in place instead.
-    fn release(&mut self, addr: usize, len: usize) -> Result<()>;
     /// Where `file`'s bytes from `offset` to its end already are in the image zone
     /// ([`Arena::set_image_zone`]), and how many there are: `(address, bytes)`. None if they
     /// aren't (the default: no zone).
@@ -215,11 +197,8 @@ pub struct Stats {
     pub size: usize,
     /// Bytes mapped now.
     pub mapped: usize,
-    /// The highest arena offset ever mapped: in [`Mode::HighWater`], about what the sandbox may
-    /// hold.
+    /// The highest arena offset ever mapped: about what the sandbox may hold.
     pub high_water: usize,
-    /// Bytes given back through [`Backing::release`], in all.
-    pub released: u64,
     /// Bytes cleared in place (only pages that held a nonzero byte), in all.
     pub zeroed: u64,
     /// Table entries in use.
@@ -245,15 +224,14 @@ struct Shared {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
-    /// Not mapped. `dirty`: may hold data (only in high-water mode; release mode frees clean).
+    /// Not mapped. `dirty`: may hold data (it was written while mapped).
     Free { dirty: bool },
     /// Mapped with `prot`. `dirty`: may hold data (it is or was writable since it was zero, or
     /// holds a file's bytes). `anon`: zeros, not a file's bytes (what `MADV_DONTNEED` restores).
     /// In the image zone a mapping is always dirty, except one mapped in place
     /// (`anon: false, dirty: false`): the image's own bytes, never writable.
     Mapped { prot: u8, dirty: bool, anon: bool, shared: Option<Shared> },
-    /// Not mapped, in the image zone: holds the images' bytes (in release mode, as the host's
-    /// file mapping has them, so it can be mapped in place); never placed.
+    /// Not mapped, in the image zone: never placed.
     Image,
 }
 
@@ -294,7 +272,7 @@ impl Kind {
 /// `k` as it must be at `s` with the image zone from `zone`: there, unmapped and clean is
 /// [`Kind::Image`] and a mapping is dirty unless mapped in place (a zero anonymous page there was
 /// written zero, over the image's bytes, so it must be given back when freed). Unmapped and dirty
-/// stays so: high-water mode gives nothing back, so a freed page that was written (a library's
+/// stays so: nothing is given back, so a freed page that was written (a library's
 /// data, relocated) no longer holds the image's bytes, and mapping it in place again handed the
 /// next program a relocated copy (fork mode: ld.so's "Inconsistency detected ...
 /// elf_machine_rela_relative", in a compiler run's linker; also a second exec in threaded mode).
@@ -324,14 +302,12 @@ impl Extent {
 pub struct Arena<'t> {
     base: usize,
     end: usize,
-    mode: Mode,
     /// Sorted by start, covering `[base, end)`: entry i ends where i + 1 starts (the last at
     /// `end`). `table[..n]` is in use.
     table: &'t mut [Extent],
     n: usize,
     brk: usize,
     high: usize,
-    released: u64,
     zeroed: u64,
     /// Where the image zone starts (`end` if there is none): see [`Arena::set_image_zone`].
     zone: usize,
@@ -356,7 +332,7 @@ impl<'t> Arena<'t> {
     /// `[base, base + len)` is a private anonymous read/write/execute mapping, all zero, that nothing else
     /// hands out and that stays mapped while the arena lives. The arena reads, writes, zeroes and
     /// copies it, and passes its addresses to `backing`.
-    pub unsafe fn new(base: usize, len: usize, mode: Mode, table: &'t mut [Extent]) -> Result<Self> {
+    pub unsafe fn new(base: usize, len: usize, table: &'t mut [Extent]) -> Result<Self> {
         if !base.is_multiple_of(PAGE) || len == 0 || !len.is_multiple_of(PAGE) || base.checked_add(len).is_none() || table.is_empty() {
             return Err(Errno::INVAL);
         }
@@ -365,12 +341,10 @@ impl<'t> Arena<'t> {
         Ok(Arena {
             base,
             end,
-            mode,
             table,
             n: 1,
             brk: 0,
             high: base,
-            released: 0,
             zeroed: 0,
             zone: end,
             in_place: false,
@@ -383,9 +357,7 @@ impl<'t> Arena<'t> {
     /// the images (privately, before lockdown), so that a file on one is mapped by handing out
     /// the address of its bytes ([`Backing::locate`]) instead of copying them. The program's code
     /// is then the host's page cache, shared by every sandbox, not a copy in each (libc alone is
-    /// 2 MB). Nothing is placed in the zone; a mapping put there `MAP_FIXED` works, cleared
-    /// first. A range is mapped in place only while it holds the image's bytes: never written,
-    /// or given back since (release mode).
+    /// 2 MB). Nothing is placed in the zone (see the module docs).
     ///
     /// Not counted in [`Stats::size`]: it is the images', not the program's memory.
     pub fn set_image_zone(&mut self, zone: usize) -> Result<()> {
@@ -481,11 +453,6 @@ impl<'t> Arena<'t> {
         self.brk = brk;
     }
 
-    /// Switch how freed pages are given back. Threaded mode sets [`Mode::HighWater`] before the
-    /// program starts (its filter refuses `madvise`), while the arena still holds nothing.
-    pub fn set_mode(&mut self, mode: Mode) {
-        self.mode = mode;
-    }
 
     /// `brk(2)`: never grows, whatever is asked; the current break tells glibc it failed, and
     /// glibc's malloc falls back to `mmap`.
@@ -499,7 +466,6 @@ impl<'t> Arena<'t> {
             size: self.zone - self.base,
             mapped,
             high_water: self.high - self.base,
-            released: self.released,
             zeroed: self.zeroed,
             extents: self.n,
         }
@@ -577,8 +543,7 @@ impl<'t> Arena<'t> {
             shared: retained.map(|h| Shared { file: h, offset: offset + (s - lo) as u64 }),
         };
         // If the file can't be read, the range ends up unmapped: room for either outcome.
-        let hw = self.mode == Mode::HighWater;
-        let failed = move |_: usize, _: Kind| Kind::Free { dirty: hw };
+        let failed = move |_: usize, _: Kind| Kind::Free { dirty: true };
         let need = max(self.splits(lo, hi, &new), if file.is_some() { self.splits(lo, hi, &failed) } else { 0 });
         if let Err(e) = self.room(need) {
             if let Some(h) = retained {
@@ -593,9 +558,6 @@ impl<'t> Arena<'t> {
         {
             if let Some(h) = retained {
                 b.close(h);
-            }
-            if !hw {
-                self.release(b, lo, hi);
             }
             self.apply(lo, hi, &failed);
             return Err(e);
@@ -656,8 +618,15 @@ impl<'t> Arena<'t> {
                 self.apply(at, hi, &freed);
                 return None;
             }
+            // Zeros after: the rest of the file's last page (written already), then whole pages
+            // only where they hold a nonzero byte (a .bss never written stays untouched: the
+            // image's zero page, not the sandbox's memory).
+            let page_end = min(e, (s + part).next_multiple_of(PAGE));
             // SAFETY: writable zone pages, this mapping's.
-            unsafe { ptr::write_bytes((s + part) as *mut u8, 0, e - s - part) };
+            unsafe {
+                ptr::write_bytes((s + part) as *mut u8, 0, page_end - (s + part));
+                self.zeroed += zero_nonzero(page_end, e - page_end) as u64;
+            }
         }
         self.apply(at, hi, &new);
         self.high = max(self.high, hi);
@@ -791,10 +760,9 @@ impl<'t> Arena<'t> {
         Ok(0)
     }
 
-    /// `madvise(2)`. `MADV_DONTNEED` makes anonymous pages read zero (released, or cleared in
-    /// place in high-water mode); file pages keep their bytes, the closest we can come to
-    /// Linux re-reading the file. `MADV_FREE` releases in release mode and does nothing in
-    /// high-water mode (keeping the old bytes is one of its allowed outcomes). Advice that only
+    /// `madvise(2)`. `MADV_DONTNEED` makes anonymous pages read zero (cleared in place); file
+    /// pages keep their bytes, the closest we can come to Linux re-reading the file. `MADV_FREE`
+    /// does nothing (keeping the old bytes is one of its allowed outcomes). Advice that only
     /// tunes performance is accepted and ignored.
     pub fn madvise<B: Backing>(&mut self, b: &mut B, addr: usize, len: usize, advice: u32) -> Result<usize> {
         if !addr.is_multiple_of(PAGE) {
@@ -802,7 +770,7 @@ impl<'t> Arena<'t> {
         }
         let zero = match advice {
             MADV_DONTNEED | MADV_DONTNEED_LOCKED => true,
-            MADV_FREE => self.mode == Mode::Release,
+            MADV_FREE => false,
             MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_DONTFORK | MADV_DOFORK
             | MADV_MERGEABLE | MADV_UNMERGEABLE | MADV_HUGEPAGE | MADV_NOHUGEPAGE | MADV_DONTDUMP
             | MADV_DODUMP | MADV_KEEPONFORK | MADV_COLD | MADV_PAGEOUT | MADV_POPULATE_READ
@@ -1045,7 +1013,7 @@ impl<'t> Arena<'t> {
 
     fn first_fit(&self, len: usize, align: usize) -> Option<usize> {
         let mut i = 0;
-        // Nothing is placed in the image zone (where high-water mode leaves freed dirty pages).
+        // Nothing is placed in the image zone.
         while i < self.n && self.table[i].start < self.zone {
             if !self.table[i].kind.is_free() {
                 i += 1;
@@ -1067,12 +1035,10 @@ impl<'t> Arena<'t> {
 
     // ----- Memory -----
 
-    /// What `munmap` turns a mapping into: free, still dirty in high-water mode if it was (release
-    /// mode has given dirty pages back by then).
+    /// What `munmap` turns a mapping into: free, still dirty if it was.
     fn freed(&self) -> impl Fn(usize, Kind) -> Kind + use<> {
-        let hw = self.mode == Mode::HighWater;
         move |_, k| match k {
-            Kind::Mapped { dirty, .. } => Kind::Free { dirty: hw && dirty },
+            Kind::Mapped { dirty, .. } => Kind::Free { dirty },
             k => k,
         }
     }
@@ -1109,39 +1075,18 @@ impl<'t> Arena<'t> {
                         self.zeroed += unsafe { zero_nonzero(s, t - s) } as u64;
                     }
                 }
-            } else if k.is_dirty() && (reuse || self.mode == Mode::Release) {
+            } else if k.is_dirty() && reuse {
                 self.clear(b, at, e);
             }
             at = e;
         }
     }
 
-    /// Make `[lo, hi)` read zero: given back in release mode, cleared in place in high-water mode.
-    /// In the image zone (where `lo` is, `hi` too) given back is the image's bytes: cleared too.
-    fn clear<B: Backing>(&mut self, b: &mut B, lo: usize, hi: usize) {
-        if self.mode == Mode::Release {
-            self.release(b, lo, hi);
-            if lo < self.zone {
-                return;
-            }
-        }
+    /// Make `[lo, hi)` read zero: cleared in place, only the pages holding a nonzero byte (in
+    /// the zone, only writable pages come here).
+    fn clear<B: Backing>(&mut self, _b: &mut B, lo: usize, hi: usize) {
         // SAFETY: inside the arena (Arena::new's contract).
         self.zeroed += unsafe { zero_nonzero(lo, hi - lo) } as u64;
-    }
-
-    fn release<B: Backing>(&mut self, b: &mut B, lo: usize, hi: usize) {
-        let mut a = lo;
-        while a < hi {
-            let n = min(hi - a, MADV_CHUNK);
-            match b.release(a, n) {
-                Ok(()) => self.released += n as u64,
-                Err(_) => {
-                    // SAFETY: inside the arena (Arena::new's contract).
-                    self.zeroed += unsafe { zero_nonzero(a, n) } as u64;
-                }
-            }
-            a += n;
-        }
     }
 
     /// A shared file handle appears in `[lo, at)`.
@@ -1226,9 +1171,6 @@ impl<'t> Arena<'t> {
             let (s, e) = (self.table[i].start, self.ext_end(i));
             assert!(s < e && e <= self.end, "extent {i} [{s:#x}, {e:#x})");
             assert_eq!(s % PAGE, 0);
-            if self.mode == Mode::Release {
-                assert_ne!(self.table[i].kind, Kind::Free { dirty: true }, "release mode frees clean");
-            }
             let k = self.table[i].kind;
             assert_eq!(in_zone(self.zone, s, k), k, "extent {i} [{s:#x}, {e:#x}) as the zone has it");
             assert!(s >= self.zone || k != Kind::Image, "an image extent outside the zone");

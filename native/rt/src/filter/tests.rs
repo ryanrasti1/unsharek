@@ -5,8 +5,6 @@
 use super::*;
 
 const GATE: u64 = 0x0000_7f12_3456_7890;
-/// Two arenas: an ordinary one, and one spanning 2^32 (lo and hi differ in the high half).
-const ARENA: [(u64, u64); 2] = [(0x7f00_0000_0000, 0x7f00_4000_0000), (0xffff_0000, 0x1_0001_0000)];
 const TOKENS: (u32, u32) = (1100, 1356);
 const PID: u32 = 4242;
 const DENY: u32 = SECCOMP_RET_ERRNO | EPERM;
@@ -61,7 +59,7 @@ fn run(prog: &[SockFilter], d: &Data) -> u32 {
 
 fn build(mode: Mode, deny: Deny, extra: &[Rule]) -> Program {
     let mut p = Program::new();
-    let params = Params { policy: Policy::Mode(mode), deny, gate_ip: GATE, arena: &ARENA, token_fds: TOKENS, pid: PID, extra };
+    let params = Params { policy: Policy::Mode(mode), deny, gate_ip: GATE, token_fds: TOKENS, pid: PID, extra };
     compile(&params, &mut p).unwrap();
     p
 }
@@ -130,7 +128,6 @@ fn route_only() {
         policy: Policy::RouteOnly,
         deny: Deny::Kill,
         gate_ip: GATE,
-        arena: &ARENA,
         token_fds: TOKENS,
         pid: PID,
         extra: &extra,
@@ -151,8 +148,8 @@ fn route_only() {
 #[test]
 fn from_the_gate_zero_args() {
     // Which rules match all-zero arguments: read(0), exit_group, ppoll(nfds 0, no mask) in
-    // every mode, and exit(0) where threads exist. write(0), madvise(0) (not an arena), clone(0)
-    // and the token fds don't.
+    // every mode, and exit(0) where threads exist. write(0), madvise (never), clone(0) and the
+    // token fds don't.
     let all = [NR_RT_SIGRETURN, NR_READ, NR_EXIT_GROUP, NR_PPOLL];
     for mode in MODES {
         let prog = build(mode, Deny::Errno, &[]);
@@ -216,45 +213,18 @@ fn kill_self() {
     }
 }
 
+/// No madvise from the gate in any mode: memory stays at its peak (arena.rs). Coroutine mode had
+/// MADV_DONTNEED on the arena, a MiB at a time.
 #[test]
 fn madvise() {
-    let ok = [ARENA[0].0, 0, MADV_DONTNEED, 0, 0, 0];
-    for mode in [Mode::Coroutine] {
-        edges(mode, NR_MADVISE, ok, 0, &ARENA);
-        edges(mode, NR_MADVISE, ok, 1, &[(0, MADV_CHUNK)]);
-        edges(mode, NR_MADVISE, ok, 2, &[(MADV_DONTNEED, MADV_DONTNEED)]);
-        // The second arena too, at both ends.
+    for mode in MODES {
         let prog = build(mode, Deny::Errno, &[]);
-        for addr in [ARENA[1].0, ARENA[1].1, 1 << 32] {
-            assert_eq!(check(&prog, gate(NR_MADVISE, [addr, MADV_CHUNK, 4, 0, 0, 0])), ALLOW);
-        }
-        assert_eq!(check(&prog, gate(NR_MADVISE, [ARENA[1].1, MADV_CHUNK + 1, 4, 0, 0, 0])), DENY);
-        for advice in (0..=100).filter(|&a| a != MADV_DONTNEED) {
-            assert_eq!(check(&prog, gate(NR_MADVISE, [ARENA[0].0, 4096, advice, 0, 0, 0])), DENY);
-        }
-    }
-    // Never where there are host threads, not even inside the arena.
-    for mode in [Mode::Threaded, Mode::Fork] {
-        let prog = build(mode, Deny::Errno, &[]);
-        for &(lo, hi) in &ARENA {
-            for addr in [lo, hi] {
-                assert_eq!(check(&prog, gate(NR_MADVISE, [addr, 4096, 4, 0, 0, 0])), DENY);
+        for addr in [0, 0x20_0000, 0x7f00_0000_0000, u64::MAX] {
+            for advice in [0, 4, 8] {
+                assert_eq!(check(&prog, gate(NR_MADVISE, [addr, 4096, advice, 0, 0, 0])), DENY, "{mode:?}");
             }
         }
     }
-    // No arena: no madvise at all.
-    let mut p = Program::new();
-    let params = Params {
-        policy: Policy::Mode(Mode::Coroutine),
-        deny: Deny::Errno,
-        gate_ip: GATE,
-        arena: &[],
-        token_fds: TOKENS,
-        pid: PID,
-        extra: &[],
-    };
-    compile(&params, &mut p).unwrap();
-    assert_eq!(check(&p, gate(NR_MADVISE, [0, 0, 4, 0, 0, 0])), DENY);
 }
 
 #[test]
@@ -451,12 +421,11 @@ fn ranges_at_random() {
 #[test]
 fn errors() {
     let mut p = Program::new();
-    let with = |extra: &[Rule], token_fds, arena: &[(u64, u64)], p: &mut Program| {
+    let with = |extra: &[Rule], token_fds, p: &mut Program| {
         let params = Params {
             policy: Policy::Mode(Mode::Threaded),
             deny: Deny::Kill,
             gate_ip: GATE,
-            arena,
             token_fds,
             pid: PID,
             extra,
@@ -465,25 +434,24 @@ fn errors() {
     };
     let c = |arg, lo, hi| Cond { arg, lo, hi };
     assert_eq!(
-        with(&[Rule { nr: 1, conds: &[c(0, 2, 1)] }], TOKENS, &ARENA, &mut p),
+        with(&[Rule { nr: 1, conds: &[c(0, 2, 1)] }], TOKENS, &mut p),
         Err(Error::EmptyRange)
     );
     assert_eq!(
-        with(&[Rule { nr: 1, conds: &[c(6, 0, 1)] }], TOKENS, &ARENA, &mut p),
+        with(&[Rule { nr: 1, conds: &[c(6, 0, 1)] }], TOKENS, &mut p),
         Err(Error::NoSuchArg)
     );
     assert_eq!(
-        with(&[Rule { nr: 1, conds: &[c(0, 0, 1); 7] }], TOKENS, &ARENA, &mut p),
+        with(&[Rule { nr: 1, conds: &[c(0, 0, 1); 7] }], TOKENS, &mut p),
         Err(Error::TooManyConds)
     );
-    assert_eq!(with(&[], (5, 4), &ARENA, &mut p), Err(Error::EmptyRange));
-    assert_eq!(with(&[], TOKENS, &[(5, 4)], &mut p), Err(Error::EmptyRange));
+    assert_eq!(with(&[], (5, 4), &mut p), Err(Error::EmptyRange));
     // The longest rules (six general 64-bit ranges), more than fit.
     let conds: Vec<Cond> = (0..6).map(|i| c(i, 0x1_0000_0001, 0x2_0000_0000)).collect();
     let rules: Vec<Rule> = (0..100).map(|nr| Rule { nr, conds: &conds }).collect();
-    assert_eq!(with(&rules, TOKENS, &ARENA, &mut p), Err(Error::TooLong));
+    assert_eq!(with(&rules, TOKENS, &mut p), Err(Error::TooLong));
     // As many as fit is fine, and every jump stays inside one rule's reach.
-    assert_eq!(with(&rules[..60], TOKENS, &ARENA, &mut p), Ok(()));
+    assert_eq!(with(&rules[..60], TOKENS, &mut p), Ok(()));
     assert!(p.as_slice().len() <= MAX_INSNS);
 }
 
@@ -534,7 +502,6 @@ fn installs_in_the_kernel() {
             policy: Policy::Mode(mode),
             deny: Deny::Errno,
             gate_ip,
-            arena: &ARENA,
             token_fds: TOKENS,
         pid: PID,
             extra: &[],
@@ -584,7 +551,7 @@ fn installs_in_the_kernel() {
 #[test]
 fn stacked_filters_in_the_kernel() {
     let gate_ip = crate::trap::gate_ip();
-    let params = |policy| Params { policy, deny: Deny::Errno, gate_ip, arena: &ARENA, token_fds: TOKENS, pid: PID, extra: &[] };
+    let params = |policy| Params { policy, deny: Deny::Errno, gate_ip, token_fds: TOKENS, pid: PID, extra: &[] };
     let (mut route, mut mode) = (Program::new(), Program::new());
     compile(&params(Policy::RouteOnly), &mut route).unwrap();
     compile(&params(Policy::Mode(Mode::Coroutine)), &mut mode).unwrap();

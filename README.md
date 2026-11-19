@@ -154,8 +154,9 @@ against threaded mode (`threads`), and the host filter refusing a hostile progra
   and hands the registers and mask back. A death by a signal is the sandbox's, by the same signal.
 - **Memory.** Before lockdown exobox reserves one region for the program (its arena): readable,
   writable and executable, so JITs work. After lockdown there is no host `mmap`: the program's
-  memory calls are served from the arena, and freed pages go back with `madvise` where the mode
-  allows it.
+  memory calls are served from the arena. In every mode memory stays at its peak (no `madvise`:
+  with host threads it would race their page faults, the Dirty-COW class, and one model for every
+  mode is simpler); freed pages are cleared when handed out again, only those that were written.
 - **Exec inside the guest.** exobox locks down first, then loads the program from the guest's
   files into the arena, with its interpreter, and builds its stack. Nothing the program brings (its
   `PT_INTERP`, its libraries' constructors) runs before the filter is in place.
@@ -312,8 +313,8 @@ the unit tests of exobox and exobox-erofs.
 
 | Mode | Threads | Processes | Host syscalls allowed from the gate |
 |---|---|---|---|
-| `coroutine` (default) | the program's and the kernel's, as coroutines on one host thread | one | `write` (fds 1, 2), `read` (fd 0), `ppoll` (up to eight fds, no signal mask), `madvise` (inside the arena, one chunk, `MADV_DONTNEED`), `exit_group`; `read` and `write` on each held and passed fd (`hold_fd`, `pass_fd`) |
-| `threaded` | a host thread per program thread, made lazily; one guest CPU passed between them | one | coroutine's, without `madvise`, plus `read`/`write` on the CPU-token eventfds, `clone` with exactly the thread flag set, `exit(0)` |
+| `coroutine` (default) | the program's and the kernel's, as coroutines on one host thread | one | `write` (fds 1, 2), `read` (fd 0), `ppoll` (up to eight fds, no signal mask), `exit_group`; `read` and `write` on each held and passed fd (`hold_fd`, `pass_fd`) |
+| `threaded` | a host thread per program thread, made lazily; one guest CPU passed between them | one | coroutine's, plus `read`/`write` on the CPU-token eventfds, `clone` with exactly the thread flag set, `exit(0)` |
 | `fork` | as threaded | a guest fork is a host fork; the processes share one guest kernel | threaded's, plus `clone(SIGCHLD)` (from init's process) or `clone(CLONE_PARENT \| SIGCHLD)` (from the others), with no stack |
 
 `rt_sigreturn` from the gate (the SIGSYS handler's return) is allowed in every mode, and `kill` of

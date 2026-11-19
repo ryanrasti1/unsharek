@@ -105,9 +105,16 @@ int main(void)
 	}
 
 	/* 5. Memory outside the arena; fds nobody was given. */
-	/* Not the stack: the program's stack is in the arena, where madvise is allowed (coroutine
-	 * mode), and zeroing it would crash this test rather than probe the filter. The host's vDSO
-	 * is outside the arena in every mode. */
+	/* No madvise in any mode, the arena included (coroutine mode had DONTNEED there, a MiB at a
+	 * time): a heap page of the program's, which must keep its byte. And the host's vDSO. */
+	char *heap = malloc(1 << 20);
+	char *page = (char *)(((long)heap + 4095) & ~4095L);
+	*page = 7;
+	expect("madvise(arena page, DONTNEED) via gate", gate(SYS_madvise, (long)page, 4096, MADV_DONTNEED, 0, 0, 0), 0);
+	if (*page != 7) {
+		printf("madvise via gate zeroed an arena page: FAIL\n");
+		fails++;
+	}
 	expect("madvise(vDSO page, DONTNEED) via gate",
 	       gate(SYS_madvise, (long)getauxval(AT_SYSINFO_EHDR) & ~4095L, 4096, MADV_DONTNEED, 0, 0, 0), 0);
 	expect("write(1, \"\") via gate", gate(SYS_write, 1, (long)"", 0, 0, 0, 0), 1);
