@@ -8,11 +8,19 @@
 #   ./test --no-fail-fast            (the default stops at the first failure)
 #   ./test --perf                    the performance budgets instead (tests/perf.rs; tens of seconds)
 #   ./test --vs-native               each mode against native on build workloads (native/bench/quick.py)
+#   ./test --prove                   Kani's proofs: each #[seccomp] function equal to its program
+#                                    (seccomp-fn's examples, exobox-tcb's policy); minutes
 set -euo pipefail
 root="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=devshell.sh
 source "$root/devshell.sh"
 cd "$root"
+if [[ "${1:-}" == --prove ]]; then
+  shift
+  # -j: the harnesses in parallel (one per mode and shape; each a minute or two alone)
+  cargo kani --manifest-path seccomp-fn/Cargo.toml -p seccomp-fn -j --output-format=terse "$@"
+  exec cargo kani -p exobox-tcb -j --output-format=terse "$@"
+fi
 if [[ "${1:-}" == --vs-native ]]; then
   # Where each mode stands against native on the workloads that matter, in seconds
   # (native/bench/quick.py); not a correctness test.
@@ -27,4 +35,9 @@ if [[ "${1:-}" == --perf ]]; then
   build=(--release)
   shift
 fi
-exec cargo nextest run --workspace --no-tests=warn --profile "$profile" "${build[@]}" "$@"
+cargo nextest run --workspace --no-tests=warn --profile "$profile" "${build[@]}" "$@"
+# seccomp-fn, its own workspace (its fast checks, and run_bpf against the kernel), unless a filter
+# picked other tests
+if [[ $profile == default && $# == 0 ]]; then
+  exec cargo nextest run --manifest-path seccomp-fn/Cargo.toml --workspace --no-tests=warn
+fi

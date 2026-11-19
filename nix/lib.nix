@@ -2,11 +2,48 @@
 # `exoboxKernel` and `mkExobox`, the same functions the flake's `lib` has (flake.nix imports this).
 # The kernel's default source is the submodule lkl/linux: a checkout of exobox used this way needs
 # it checked out (`git submodule update --init lkl/linux`, or a recursive clone).
-{ pkgs }:
+# `seccompFn` is seccomp-fn's Nix library (seccomp-fn/nix/lib.nix: Kani, kaniCheck); the flake
+# passes its input's.
+{ pkgs, seccompFn ? import ../seccomp-fn/nix/lib.nix { inherit pkgs; } }:
 let
   inherit (pkgs) lib;
   fs = lib.fileset;
   system = pkgs.stdenv.hostPlatform.system;
+
+  # What cargo reads, for the package and the proof: a change to the docs (READMEs,
+  # native/DEPS.md) or the flake doesn't rebuild. In a git tree, only tracked files (not target/
+  # or .cache/).
+  src = fs.toSource {
+    root = ../.;
+    fileset = fs.unions [
+      ../Cargo.toml
+      ../Cargo.lock
+      (fs.difference ../native (fs.fileFilter (f: f.hasExt "md") ../native))
+      # exobox-tcb, the TCB (its own repository to be)
+      # (its README too: a test checks its allowlist table against the filter)
+      ../tcb
+      # seccomp-fn, the filter's compiler and proof (its own repository to be)
+      (fs.difference ../seccomp-fn (fs.maybeMissing ../seccomp-fn/target))
+      # A workspace member: cargo loads every member's manifest, built or not (the
+      # package failed to build without it).
+      (fs.difference ../examples (fs.fileFilter (f: f.hasExt "md") ../examples))
+      ../.config
+    ];
+  };
+
+  # The filter's proof: exobox-tcb's policy equal to its program, for every input and every
+  # param, by seccomp-fn's kaniCheck; with seccomp-fn's own examples' proofs. The package
+  # requires both (mkExobox), so a release's filter is proven.
+  kaniCheck = pkgs.runCommand "exobox-kani-proof" { } ''
+    mkdir $out
+    cat ${seccompFn.proof}/summary ${tcbProof}/summary > $out/summary
+  '';
+  tcbProof = seccompFn.kaniCheck {
+    name = "exobox-tcb-proof";
+    inherit src;
+    cargoLock = ../Cargo.lock;
+    runs = [ [ "-p" "exobox-tcb" "-j" "--output-format=terse" ] ];
+  };
 
   # The kernel, built once by lkl/Makefile as its own derivation, in the layout lkl-sys's
   # build.rs takes as EXOBOX_LKL_PREBUILT (lkl/Makefile's `install`): liblkl-kernel.a, lkl.o,
@@ -76,32 +113,19 @@ let
     pkgs.rustPlatform.buildRustPackage {
       pname = "exobox";
       version = "0.0.0";
-      # What cargo reads: a change to the docs (READMEs, native/DEPS.md) or the flake doesn't
-      # rebuild. In a git tree, only tracked files (not target/ or .cache/).
-      src = fs.toSource {
-        root = ../.;
-        fileset = fs.unions [
-          ../Cargo.toml
-          ../Cargo.lock
-          (fs.difference ../native (fs.fileFilter (f: f.hasExt "md") ../native))
-          # exobox-tcb, the TCB (its own repository to be)
-          # (its README too: a test checks its allowlist table against the filter)
-          ../tcb
-          # A workspace member: cargo loads every member's manifest, built or not (the
-          # package failed to build without it).
-          (fs.difference ../examples (fs.fileFilter (f: f.hasExt "md") ../examples))
-          ../.config
-        ];
-      };
+      inherit src;
       cargoLock.lockFile = ../Cargo.lock;
       cargoBuildFlags = [ "-p" "exobox" "-p" "exobox-erofs" ];
       # bindgen's libclang (as in the devshell)
       nativeBuildInputs = [ pkgs.rustPlatform.bindgenHook ];
       env.EXOBOX_LKL_PREBUILT = "${kernel}";
+      # The filter's proof (kaniCheck): the package isn't built unless it passed.
+      env.EXOBOX_KANI_PROOF = "${kaniCheck}";
+      preCheck = "cat $EXOBOX_KANI_PROOF/summary";
 
       # The hermetic tests only, with nextest (lkl-sys's boot test needs a process per test, as
       # in ./test): lkl-sys's (the given kernel boots, answers syscalls and halts; lkl.o has no
-      # relaxable relocations; the shim), exobox-tcb's (the filter against the old compiler,
+      # relaxable relocations; the shim), exobox-tcb's (the filter against its policy, sampled;
       # lockdown and each of its refusals in forked children), and exobox's and exobox-erofs's
       # unit tests. Not the
       # suite, the store test, erofs's image tests or exobox-rt's: they need the devshell's
@@ -113,7 +137,7 @@ let
         "-E" "package(lkl-sys)|package(exobox-tcb)|kind(lib)"
       ];
 
-      passthru = { inherit kernel; };
+      passthru = { inherit kernel; kani = kaniCheck; };
       meta = {
         description = "Unmodified Linux programs on an in-process Linux kernel (LKL), behind a strict seccomp filter";
         license = lib.licenses.gpl2Only;

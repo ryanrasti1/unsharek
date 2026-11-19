@@ -8,17 +8,22 @@
   # exobox's side of it, in one commit.
   inputs.self.submodules = true;
 
-  outputs = { self, nixpkgs }:
+  # seccomp-fn (its own repository to be): the filter's compiler, Kani and the proof's check.
+  inputs.seccomp-fn = { url = "path:./seccomp-fn"; inputs.nixpkgs.follows = "nixpkgs"; };
+
+  outputs = { self, nixpkgs, seccomp-fn }:
     let
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
       inherit (pkgs) lib;
 
       # exoboxKernel and mkExobox: nix/lib.nix, also importable without flakes (default.nix).
-      exobox = import ./nix/lib.nix { inherit pkgs; };
+      exobox = import ./nix/lib.nix { inherit pkgs; seccompFn = seccomp-fn.lib; };
       inherit (exobox) exoboxKernel mkExobox;
       # Programs the suite and the smoke check run: nix/test-programs.nix.
       tp = import ./nix/test-programs.nix { inherit pkgs; };
+      # Kani, the model checker the filter's proof runs on (seccomp-fn/nix/kani.nix).
+      kani = seccomp-fn.packages.${system}.kani;
     in
     {
       lib = { inherit exoboxKernel mkExobox; };
@@ -33,7 +38,12 @@
 
       # The release step's check: the package's exobox runs hello, Python, bash, Go and busybox in
       # all three modes inside Nix's build sandbox (nix/smoke.nix). `nix build .#checks.x86_64-linux.smoke`.
-      checks.${system}.smoke = import ./nix/smoke.nix { inherit pkgs tp; exobox = self.packages.${system}.default; };
+      checks.${system} = {
+        smoke = import ./nix/smoke.nix { inherit pkgs tp; exobox = self.packages.${system}.default; };
+        # The filter's proof (`./test --prove`), which the package requires: nix/lib.nix's
+        # `kaniCheck`.
+        kani = self.packages.${system}.default.kani;
+      };
 
       devShells.${system}.default = pkgs.mkShell {
         packages = with pkgs; [
@@ -59,6 +69,8 @@
           # its own stddef.h). Its setup hook runs when the shell is entered, so devshell.sh's
           # cached environment has both.
           rustPlatform.bindgenHook
+          # ./test --prove: cargo kani
+          kani
         ];
 
         # Programs from nixpkgs the test suite runs in the sandbox (native/tests).

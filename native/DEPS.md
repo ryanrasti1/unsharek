@@ -247,3 +247,19 @@ unchanged, only who depends on what.
 |---|---|---|---|
 | seccompiler 0.5 | the filter's allowlist, to classic BPF (`tcb/src/filter.rs`) | exobox-tcb (the TCB) | as before: ~24 KB stripped, ~0.3 s cold build |
 | exobox-tcb (workspace, path) | lockdown and the filter | exobox | none: code moved from exobox's `src/tcb` |
+
+## seccomp-fn (2026-11-19): the filter is a Rust function, proven; seccompiler is gone
+exobox-tcb's filter is one `#[seccomp]` function (`tcb/src/filter.rs`), compiled to classic BPF by
+seccomp-fn (`seccomp-fn/`, its own workspace and repository to be; exobox-tcb depends on it by
+path) and proven equal to it by Kani (`./test --prove`; the release build requires the proof).
+**seccompiler is removed**: exobox-tcb's run-time dependencies are seccomp-fn and libc.
+seccomp-fn's macro crate brings syn (with `full`), quote and proc-macro2, at build time only
+(versions already in the lock). Kani itself is a Nix derivation (seccomp-fn/nix/kani.nix: the
+0.68.0 release bundle and its pinned nightly), in the devshell and the release's check, never in
+the binary.
+
+| Crate | For | Where | Cost noted |
+|---|---|---|---|
+| seccomp-fn (path) | `run_bpf`, `install`, the builder the generated code calls | exobox-tcb (the TCB) | not measured here (the worktree has no release kernel build): its run-time code is the builder, `install` and `run_bpf`, a few KB, against seccompiler's ~24 KB |
+| seccomp-fn-macros (path): syn 3 (`full`), quote, proc-macro2 | `#[seccomp]` | build time only | ~5.6 s cold release build of the pair (syn `full` most of it), under load |
+| seccompiler 0.5 | removed | | -~24 KB stripped |
