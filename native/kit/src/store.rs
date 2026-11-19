@@ -47,7 +47,7 @@ use std::{env, process, thread};
 pub const STORE_DIR: &str = "/nix/store";
 
 /// Names the image cache's directory, over `$XDG_CACHE_HOME/exobox/images` (and under
-/// [`Config::image_cache`](crate::Config::image_cache)): for tests, and for a cache shared
+/// `exobox::Config::image_cache`): for tests, and for a cache shared
 /// between users.
 pub const CACHE_ENV: &str = "EXOBOX_IMAGE_CACHE";
 

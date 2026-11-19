@@ -1,0 +1,32 @@
+[package]
+name = "exobox-kit"
+version = "0.0.0"
+description = "exobox's batteries: guest setup, the Nix store as images, the network hooks' glue, the allocator after lockdown (none of it the TCB)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+exobox-erofs = { path = "../erofs" }
+# The runtime: guest calls for setup, the executor and socket impersonation the hooks plug into
+exobox-rt = { path = "../rt" }
+# Guest setup's constants and structs; the allocator's region; the store's host calls
+libc.workspace = true
+# Errno, the runtime's error type, in the hooks' adapters
+rustix.workspace = true
+thiserror.workspace = true
+# The global allocator after lockdown (src/alloc.rs): the hooks' and the executor's allocations,
+# from a region reserved before it
+talc = { version = "5", default-features = false }
+# The hooks' stream traits (futures-io's AsyncRead/AsyncWrite, futures-core's Stream)
+futures-io = "0.3"
+futures-core = "0.3"
+# tokio's AsyncRead/AsyncWrite too, for providers built on them (capnweb-rs's channel)
+tokio = { version = "1", default-features = false, optional = true }
+
+[features]
+tokio = ["dep:tokio"]
+
+[dev-dependencies]
+tempfile.workspace = true

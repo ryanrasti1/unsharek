@@ -14,34 +14,27 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 exobox-erofs = { path = "../erofs" }
-# The in-sandbox runtime (the dispatcher, the scheduler, the filter) and the kernel's numbers
+# The in-sandbox runtime: boot, the gate, routing, exec; given the inventory's resources
 exobox-rt = { path = "../rt" }
-lkl-sys = { path = "../lkl-sys" }
-# Host setup before the routing filter: reserving memory, mapping images, the auxiliary vector,
-# host entropy; and the guest's constants
+# The batteries, re-exported: setup, store, net, alloc (none of it the TCB)
+exobox-kit = { path = "../kit" }
+# The TCB's constants and the API's host calls before lockdown (the auxiliary vector, entropy,
+# setrlimit, fcntl, fork)
 libc.workspace = true
-# Errno, the runtime's error type, in the hooks' adapters
-rustix.workspace = true
 thiserror.workspace = true
 # The security filter's allowlist, compiled to classic BPF (src/tcb/filter.rs): Firecracker's
 seccompiler = "0.5"
-# The global allocator after lockdown (src/alloc.rs): the hooks' and the executor's allocations,
-# from a region reserved before it
-talc = { version = "5", default-features = false }
-# The hooks' stream traits (futures-io's AsyncRead/AsyncWrite, futures-core's Stream)
-futures-io = "0.3"
-futures-core = "0.3"
-# tokio's AsyncRead/AsyncWrite too, for providers built on them (capnweb-rs's channel)
-tokio = { version = "1", default-features = false, optional = true }
-
 [features]
-tokio = ["dep:tokio"]
+tokio = ["exobox-kit/tokio"]
 
 # build.rs: the binary's fixed-address link (the C compiler's PIE start files)
 [build-dependencies]
 exobox-build = { path = "../build" }
 
 [dev-dependencies]
+# tests/net.rs: the providers' streams
+futures-io = "0.3"
+futures-core = "0.3"
 exobox-fixtures = { path = "../fixtures" }
 # the suite's sysaudit table: syscall names by number
 syscalls.workspace = true

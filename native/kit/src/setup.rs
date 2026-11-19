@@ -1,8 +1,8 @@
-//! Helpers for setup inside an intercept guard ([`crate::Sandbox::intercept`]), written as
+//! Helpers for setup inside an intercept guard (`exobox::Sandbox::intercept`), written as
 //! ordinary Rust: inside one every syscall of the thread is the guest's, so `std::fs` and friends
 //! work on the guest's files. Anything else the guest kernel does is a syscall away there too
 //! (`setresuid`, `sethostname`, an `/etc/passwd` written with `std::fs::write`): exobox doesn't
-//! wrap them. And the guest's basics, which [`crate::Guest::boot`] makes itself ([`defaults`]).
+//! wrap them. And the guest's basics, which `exobox::Guest::boot` makes itself ([`defaults`]).
 
 use std::ffi::CStr;
 use std::io;
@@ -10,28 +10,33 @@ use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 
 use exobox_rt::guest;
-use lkl_sys as l;
+use exobox_rt::nr as l;
 
-use crate::{Error, Image};
+use crate::image::Image;
+
+/// `e` with what failed in front of its message (its kind kept).
+fn ctx(what: String) -> impl FnOnce(io::Error) -> io::Error {
+    move |e| io::Error::new(e.kind(), format!("{what}: {e}"))
+}
 
 /// Mount `image` (its block device, [`Image::device`]) at `path`, made if missing, read-only.
 /// Inside a guard: `mkdir` and `mount(2)` are the guest's there.
-pub fn mount_erofs(image: &Image, path: impl AsRef<Path>) -> Result<(), Error> {
+pub fn mount_erofs(image: &Image, path: impl AsRef<Path>) -> io::Result<()> {
     let path = path.as_ref();
     let what = || format!("mounting {} at {}", image.device().display(), path.display());
-    std::fs::create_dir_all(path).map_err(Error::io(what()))?;
+    std::fs::create_dir_all(path).map_err(ctx(what()))?;
     let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
     let (dev, at) = (c(&image.device()), c(path));
     // SAFETY: NUL-terminated strings, live for the call.
     let r = unsafe { libc::mount(dev.as_ptr(), at.as_ptr(), c"erofs".as_ptr(), libc::MS_RDONLY, std::ptr::null()) };
     if r != 0 {
-        return Err(Error::io(what())(io::Error::last_os_error()));
+        return Err(ctx(what())(io::Error::last_os_error()));
     }
     Ok(())
 }
 
 /// `image`'s disk in the guest (memblk over its host mapping) and its node, `/dev/exobox/<name>`.
-/// Host code before `run` ([`crate::Guest::map_image`]).
+/// Host code before `run` (`exobox::Guest::map_image`).
 /// `in_zone`: where it is mapped in the arena's image zone too.
 pub(crate) fn block_device(image: &Image, in_zone: Option<usize>) -> io::Result<()> {
     let b = image.bytes();
@@ -44,7 +49,7 @@ pub(crate) fn block_device(image: &Image, in_zone: Option<usize>) -> io::Result<
     sys(l::__lkl__NR_mknodat, [AT_FDCWD, p(&node), libc::S_IFBLK as usize | 0o400, dev, 0, 0]).map(|_| ())
 }
 
-/// An image mapped for [`mount_closure`] ([`crate::Guest::map_store`]): where the guest sees it,
+/// An image mapped for [`mount_closure`] (`exobox::Guest::map_store`): where the guest sees it,
 /// and what its root is.
 #[derive(Clone, Debug)]
 pub struct Mount {
@@ -61,7 +66,7 @@ pub struct Mount {
 /// symlink made, and the image's own mount detached again. Inside a guard.
 ///
 /// [`Kind::Entry`]: crate::store::Kind::Entry
-pub fn mount_closure(images: &[Mount]) -> Result<(), Error> {
+pub fn mount_closure(images: &[Mount]) -> io::Result<()> {
     for m in images {
         match m.kind {
             crate::store::Kind::Dir => mount_erofs(&m.image, &m.at)?,
@@ -72,11 +77,11 @@ pub fn mount_closure(images: &[Mount]) -> Result<(), Error> {
 }
 
 /// [`mount_closure`]'s store path that is a file or a symlink, `at`.
-fn mount_entry(image: &Image, at: &Path) -> Result<(), Error> {
+fn mount_entry(image: &Image, at: &Path) -> io::Result<()> {
     let what = || format!("showing {} at {}", image.device().display(), at.display());
     let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
     let (Some(name), Some(parent)) = (at.file_name(), at.parent()) else {
-        return Err(Error::io(what())(io::Error::from(io::ErrorKind::InvalidInput)));
+        return Err(ctx(what())(io::Error::from(io::ErrorKind::InvalidInput)));
     };
     let dir = PathBuf::from(format!("{}.d", image.device().display()));
     mount_erofs(image, &dir)?;
@@ -103,7 +108,7 @@ fn mount_entry(image: &Image, at: &Path) -> Result<(), Error> {
         libc::umount2(d.as_ptr(), libc::MNT_DETACH);
         libc::rmdir(d.as_ptr());
     }
-    shown.map_err(Error::io(what()))
+    shown.map_err(ctx(what()))
 }
 
 /// A guest syscall from host code outside a guard (generic numbers, made on the guest directly: a
@@ -159,7 +164,7 @@ fn close(fd: usize) {
 pub const NAMESERVER: &str = "10.0.2.3";
 
 /// The guest's `/etc/resolv.conf` (naming [`NAMESERVER`]) and `/etc/hosts` (localhost: no query
-/// for it), root's, 0644. Written by [`Builder::build`](crate::Builder::build) when names resolve
+/// for it), root's, 0644. Written by `exobox::Builder::build` when names resolve
 /// (an `on_resolve` or `on_connect` hook), as init at boot, before any guard: a guard may then
 /// change them or chown them, and nothing is written for them after the guards, whose
 /// credentials (a `setresuid` to a build user) it would have had (it failed with EACCES).
@@ -191,8 +196,8 @@ fn write_file(path: &CStr, mut data: &[u8]) -> io::Result<()> {
 
 /// Host fd `host` as guest fd `guest`: a guest file whose reads and writes the runtime does on
 /// the host's fd (`host_fd`, the kernel series' item 11), as fds 0-2 are. Host code (it calls the
-/// guest directly); under a [`Sandbox`](crate::Sandbox),
-/// [`Sandbox::pass_fd`](crate::Sandbox::pass_fd) does this and widens the filter to the host fd,
+/// guest directly); under a `exobox::Sandbox`,
+/// `exobox::Sandbox::pass_fd` does this and widens the filter to the host fd,
 /// which calling this alone doesn't.
 pub fn host_fd(host: RawFd, guest: RawFd) -> io::Result<()> {
     let fd = sys(l::__lkl__NR_host_fd, [host as usize, libc::O_RDWR as usize, 0, 0, 0, 0])?;
@@ -225,7 +230,8 @@ fn add_entropy(entropy: &[u8], reseed: bool) -> io::Result<()> {
 
 /// A fork's child's guest RNG made its own: `entropy` from the host, and the CRNG reseeded from
 /// it (`Guest`'s takeover after a fork).
-pub(crate) fn reseed(entropy: &[u8]) -> io::Result<()> {
+#[doc(hidden)]
+pub fn reseed(entropy: &[u8]) -> io::Result<()> {
     add_entropy(entropy, true)
 }
 

@@ -42,7 +42,7 @@ fn sandbox(argv: Vec<OsString>) -> ! {
     // 4. In a guard this thread's syscalls are the guest's, as its init: the mounts happen inside.
     {
         let _g = sb.intercept().unwrap_or_else(|e| ex::fail(e));
-        setup::mount_closure(&mounts).unwrap_or_else(|e| ex::fail(e));
+        setup::mount_closure(&mounts).unwrap_or_else(|e| ex::fail(e.into()));
     }
     // 5. The program is exec'd from the guest's files, behind the mode's filter. `run` returns
     //    only if the program couldn't be started.

@@ -2,7 +2,7 @@
 //!
 //! The program's AF_INET sockets are its own for loopback (127.0.0.0/8, 0.0.0.0): connects, binds
 //! and listens there are the guest kernel's, as always. Everything else goes to the hooks given
-//! to the sandbox's builder ([`Builder::on_connect`](crate::Builder::on_connect) and the rest):
+//! to the sandbox's builder (`exobox::Builder::on_connect` and the rest):
 //!
 //! - **`on_connect(cx, pid, addr)`**: a program's `connect` to `addr`. `Ok(stream)`: the program's
 //!   connect succeeds, and exobox copies both ways between its socket and `stream` (who closes
@@ -22,14 +22,14 @@
 //!   that exobox picks (10.64.0.0/10, one per name, for the sandbox's life), and `on_connect`
 //!   learns which name an address came from with [`Cx::name_of`]: name-based policy with no
 //!   resolver of the provider's. (With an `on_resolve`, `name_of` names its addresses too.)
-//! - **`on_start(cx)`** ([`Builder::on_start`](crate::Builder::on_start)): a task started at
+//! - **`on_start(cx)`** (`exobox::Builder::on_start`): a task started at
 //!   lockdown, before the program: a provider's session, up before the first connect.
 //!
 //! With no hook, everything but loopback is unreachable (`ENETUNREACH`, and lookups fail).
 //!
 //! **Templates.** The hooks are given at build, once for every instance a template forks; each
 //! instance holds its own provider's fd under a name
-//! ([`Sandbox::hold_fd_as`](crate::Sandbox::hold_fd_as)), which a hook finds with [`Cx::held`].
+//! (`exobox::Sandbox::hold_fd_as`), which a hook finds with [`Cx::held`].
 //!
 //! **Errors** ([`NetError`]), as the program sees them: for a connect, `Denied` EACCES,
 //! `Refused` ECONNREFUSED, `Unreachable` ENETUNREACH, `Timeout` ETIMEDOUT, `NoName` ENETUNREACH,
@@ -60,7 +60,7 @@
 //!
 //! What the hooks may do: compute, allocate (exobox's allocator serves the sandbox after
 //! lockdown), spawn tasks ([`Cx::spawn`]), wait on time and on the host fds held for them
-//! ([`Sandbox::hold_fd`](crate::Sandbox::hold_fd), [`Cx::readable`]), and use streams opened
+//! (`exobox::Sandbox::hold_fd`, [`Cx::readable`]), and use streams opened
 //! before lockdown (a `TcpStream` connected before `run`, held). Not: make syscalls (they would
 //! be the guest's, as init's: a thread of the program's process, which an exec waits for), open
 //! host sockets or files (no host syscall is left for that), or block (the executor is one of
@@ -149,11 +149,13 @@ impl From<io::Error> for NetError {
 // ------------------------------------------------------------------------------------------------
 // The hooks.
 
-pub(crate) type StartFn = Box<dyn FnOnce(Cx) -> Pin<Box<dyn Future<Output = ()>>>>;
+#[doc(hidden)]
+pub type StartFn = Box<dyn FnOnce(Cx) -> Pin<Box<dyn Future<Output = ()>>>>;
 
 /// What a sandbox runs for its program's network (module comment): the builder's.
+#[doc(hidden)]
 #[derive(Default)]
-pub(crate) struct Hooks {
+pub struct Hooks {
     pub on_connect: OnConnect,
     pub on_listen: OnListen,
     pub on_resolve: OnResolve,
@@ -309,12 +311,12 @@ impl Hooks {
     /// Whether the program's names resolve: an `on_resolve`, or an `on_connect` (names then
     /// resolve to addresses of their own, [`Cx::address_for`]). The guest's resolver files are
     /// written for it at build (`setup::resolver`).
-    pub(crate) fn resolves(&self) -> bool {
+    pub fn resolves(&self) -> bool {
         self.on_resolve.0.is_some() || self.on_connect.0.is_some()
     }
 
     /// The network hooks, given to the runtime: the task to start at lockdown.
-    pub(crate) fn install(self) -> Option<StartFn> {
+    pub fn install(self) -> Option<StartFn> {
         let resolve = match (self.on_resolve.0, &self.on_connect.0) {
             (Some(r), _) => Some(r),
             (None, Some(_)) => OnResolve::new(|cx: Cx, _, name: String| {
@@ -353,7 +355,8 @@ fn names() -> std::sync::MutexGuard<'static, Names> {
     NAMES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-pub(crate) fn name_held(name: &str, fd: HeldFd) {
+#[doc(hidden)]
+pub fn name_held(name: &str, fd: HeldFd) {
     let mut n = names();
     n.held.retain(|(k, _)| k != name);
     n.held.push((name.to_owned(), fd));
@@ -440,7 +443,7 @@ where
 pub struct Cx;
 
 impl Cx {
-    /// The fd held under `name` ([`Sandbox::hold_fd_as`](crate::Sandbox::hold_fd_as)).
+    /// The fd held under `name` (`exobox::Sandbox::hold_fd_as`).
     pub fn held(&self, name: &str) -> Option<HeldFd> {
         names().held.iter().find(|(k, _)| k == name).map(|&(_, fd)| fd)
     }
@@ -491,7 +494,7 @@ impl Cx {
     }
 }
 
-/// A host fd held for the hooks ([`Sandbox::hold_fd`](crate::Sandbox::hold_fd)): a provider's
+/// A host fd held for the hooks (`exobox::Sandbox::hold_fd`): a provider's
 /// connection, made before lockdown. Nonblocking; read and written through the runtime's gate,
 /// the filter allowing `read` and `write` on exactly this fd; waited on by the executor
 /// ([`Cx::readable`]). As `AsyncRead + AsyncWrite` it is a provider's stream. Open for the
@@ -512,6 +515,12 @@ fn io_err(e: Errno) -> io::Error {
 }
 
 impl HeldFd {
+    /// The handle of a host fd the sandbox's inventory holds (exobox's `Sandbox::hold_fd`).
+    #[doc(hidden)]
+    pub fn from_raw(fd: RawFd) -> HeldFd {
+        HeldFd { fd }
+    }
+
     /// One `read`; `WouldBlock` if nothing is there.
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         exobox_rt::trap::read(self.fd as u32, buf).map_err(io_err)

@@ -29,12 +29,10 @@
 //! (a `Sandbox` is `!Send`). A template forks it ([`Sandbox::fork`], [`Sandbox::spawn`]): each
 //! child is a sandbox of its own, sharing the template's booted kernel copy-on-write.
 
-pub mod alloc;
-pub mod net;
-pub mod setup;
-pub mod store;
+pub use exobox_kit::{alloc, net, setup, store};
 mod tcb;
 
+pub use exobox_kit::image::Image;
 pub use net::{Cx, GuestSocket, HeldFd, NetError, OnConnect, OnListen, OnResolve};
 
 /// One classic-BPF instruction (`struct sock_filter`), for [`Builder::restrict`].
@@ -155,33 +153,6 @@ pub struct Guest {
     /// The image zone's unused part, `[next, end)`.
     zone: (usize, usize),
     _thread: PhantomData<*const ()>,
-}
-
-/// A host image (erofs) mapped by [`Guest::map_image`], read-only. The guest sees it as the
-/// block device [`Image::device`]; [`setup::mount_erofs`] mounts it.
-#[derive(Clone, Copy, Debug)]
-pub struct Image {
-    name: &'static str,
-    /// The host mapping (read-only, alive for the process's life): the disk's bytes, which the
-    /// runtime also copies files from.
-    data: &'static [u8],
-}
-
-impl Image {
-    /// Its name: `/dev/exobox/<name>`.
-    pub fn name(&self) -> &str {
-        self.name
-    }
-
-    /// The guest's block device for it (a memblk disk, the kernel series' item 12).
-    pub fn device(&self) -> PathBuf {
-        Path::new("/dev/exobox").join(self.name)
-    }
-
-    /// The image's bytes (the host mapping).
-    pub fn bytes(&self) -> &'static [u8] {
-        self.data
-    }
 }
 
 /// A host path or an open file, for [`Guest::map_image`].
@@ -372,14 +343,13 @@ impl Guest {
             return Err(Error::io(name)(std::io::Error::new(std::io::ErrorKind::InvalidData, "not an image of whole blocks")));
         }
         let data = self.inv.map_image(file.as_raw_fd(), len).map_err(Error::io(format!("mapping {name}")))?;
-        let image = Image { name: Box::leak(name.into_boxed_str()), data };
         let in_zone = match layout.and_then(|l| std::fs::read(l).ok()) {
             Some(layout) => self.map_in_zone(&file, len, &layout)?,
             // No layout, no known slots: its files are copied when mapped.
             None => None,
         };
-        setup::block_device(&image, in_zone).map_err(Error::io(format!("the guest's {}", image.device().display())))?;
-        Ok(image)
+        let name: &'static str = Box::leak(name.into_boxed_str());
+        exobox_kit::image::register(name, data, in_zone).map_err(Error::io(format!("the guest's /dev/exobox/{name}")))
     }
 
     /// The image mapped again, privately, in the arena's image zone (`exobox_rt::memblk`): what
@@ -405,7 +375,7 @@ impl Guest {
             return Ok(None);
         }
         self.zone.0 = at + size;
-        for (lo, hi) in writable_pages(file, layout) {
+        for (lo, hi) in exobox_kit::image::writable_pages(file, layout) {
             let (lo, hi) = (at + lo, (at + hi).min(at + size));
             if lo >= hi {
                 continue;
@@ -444,7 +414,7 @@ impl Guest {
             return Err(Error::io("holding an fd")(std::io::Error::last_os_error()));
         }
         let fd = self.inv.keep(fd, Fd::Held).map_err(Error::io("holding an fd"))?;
-        Ok(HeldFd { fd })
+        Ok(HeldFd::from_raw(fd))
     }
 
     /// Route this thread's syscalls to the guest while the guard lives: from here on, until the
@@ -1055,85 +1025,4 @@ mod tests {
             assert!(bad.parse::<ImageArg>().is_err(), "{bad} parsed");
         }
     }
-}
-
-/// The pages of an image (offsets in it) where its ELFs' writable segments land when mapped in
-/// place: for each ELF of `layout` (exobox-erofs' `offset slot size elf|data path` lines), each
-/// writable PT_LOAD's pages, placed as ld.so places them over the reservation of the file's span
-/// (at the file's offset of its lowest segment, `exobox_erofs`'s `elf.rs`), within its slot. An
-/// ELF whose headers can't be read has none (nothing of it can then be written in place: it is
-/// copied).
-///
-/// The headers are read with `pread`, not from the image's mapping: touching the mapping made its
-/// pages the sandbox's (1.5 MB more PSS per idle sandbox).
-fn writable_pages(image: &File, layout: &[u8]) -> Vec<(usize, usize)> {
-    use std::os::unix::fs::FileExt;
-    const PAGE: u64 = 4096;
-    let mut out = Vec::new();
-    for line in layout.split(|&b| b == b'\n') {
-        let mut f = line.splitn(5, |&b| b == b' ');
-        let num = |x: Option<&[u8]>| x.and_then(|x| std::str::from_utf8(x).ok()?.parse::<u64>().ok());
-        let (Some(offset), Some(slot), Some(size)) = (num(f.next()), num(f.next()), num(f.next())) else { continue };
-        if f.next() != Some(b"elf".as_slice()) {
-            continue;
-        }
-        // The ELF header, then as much as its program headers need (a page, nearly always).
-        let mut head = vec![0u8; size.min(4096) as usize];
-        if image.read_at(&mut head, offset).is_err() {
-            continue;
-        }
-        let need = head.get(0x20..0x28).zip(head.get(0x36..0x3a)).map(|(o, n)| {
-            let phoff = u64::from_le_bytes(o.try_into().unwrap());
-            let (ent, num) = (u16::from_le_bytes([n[0], n[1]]) as u64, u16::from_le_bytes([n[2], n[3]]) as u64);
-            phoff.saturating_add(ent * num)
-        });
-        if let Some(need) = need
-            && need > head.len() as u64
-            && need <= size.min(1 << 20)
-        {
-            head.resize(need as usize, 0);
-            if image.read_at(&mut head, offset).is_err() {
-                continue;
-            }
-        }
-        let Some(loads) = elf_loads(&head) else { continue };
-        let Some(&(vaddr0, off0, _, _, _)) = loads.iter().min_by_key(|l| l.0) else { continue };
-        let lo = vaddr0 / PAGE * PAGE;
-        let base = offset + off0 / PAGE * PAGE;
-        for &(vaddr, _, memsz, writable, _) in &loads {
-            if !writable {
-                continue;
-            }
-            let Some(end) = vaddr.checked_add(memsz).and_then(|e| e.checked_next_multiple_of(PAGE)) else { continue };
-            let (s, e) = (base + (vaddr / PAGE * PAGE - lo), (base + (end - lo)).min(offset + slot));
-            if s < e {
-                out.push((s as usize, e as usize));
-            }
-        }
-    }
-    out
-}
-
-/// An ELF64 little-endian file's PT_LOADs: (p_vaddr, p_offset, p_memsz, writable, p_filesz).
-/// None if its headers aren't whole.
-fn elf_loads(elf: &[u8]) -> Option<Vec<(u64, u64, u64, bool, u64)>> {
-    let u16_at = |o: usize| Some(u16::from_le_bytes(elf.get(o..o + 2)?.try_into().ok()?));
-    let u32_at = |o: usize| Some(u32::from_le_bytes(elf.get(o..o + 4)?.try_into().ok()?));
-    let u64_at = |o: usize| Some(u64::from_le_bytes(elf.get(o..o + 8)?.try_into().ok()?));
-    if elf.get(..6)? != b"\x7fELF\x02\x01" {
-        return None;
-    }
-    let (phoff, phentsize, phnum) = (u64_at(0x20)? as usize, u16_at(0x36)? as usize, u16_at(0x38)? as usize);
-    let mut loads = Vec::new();
-    for i in 0..phnum {
-        let ph = phoff.checked_add(i.checked_mul(phentsize)?)?;
-        const PT_LOAD: u32 = 1;
-        const PF_W: u32 = 2;
-        if u32_at(ph)? != PT_LOAD {
-            continue;
-        }
-        let flags = u32_at(ph + 4)?;
-        loads.push((u64_at(ph + 16)?, u64_at(ph + 8)?, u64_at(ph + 40)?, flags & PF_W != 0, u64_at(ph + 32)?));
-    }
-    Some(loads)
 }

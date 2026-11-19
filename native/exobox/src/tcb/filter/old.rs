@@ -486,37 +486,3 @@ pub fn compile(params: &Params, out: &mut Program) -> Result<(), Error> {
     e.ret(params.deny.ret())?;
     Ok(())
 }
-
-/// `struct sock_fprog` (include/uapi/linux/filter.h).
-#[repr(C)]
-struct SockFprog {
-    len: u16,
-    filter: *const SockFilter,
-}
-
-/// Set no_new_privs and install `prog` on the calling thread (`flags` are seccomp's
-/// `SECCOMP_FILTER_FLAG_*`, e.g. TSYNC for every thread). After this, every syscall the thread
-/// makes goes through the filter: the caller must already have its SIGSYS handler in place, and
-/// make host syscalls only through the gate.
-///
-/// Both calls are made through the gate (`trap::gate`), so this works with a filter already in
-/// place: the mode's filter is installed on top of the routing one, which traps every call not
-/// from the gate (rustix's `prctl` would be served by the guest instead). The routing filter
-/// allows `seccomp` from the gate; the mode's lists don't, so nothing can be stacked after it.
-pub fn install(prog: &Program, flags: u32) -> Result<(), rustix::io::Errno> {
-    install_insns(prog.as_slice(), flags)
-}
-
-/// [`install`] for any classic-BPF program (exobox's `restrict`: the caller's own).
-pub fn install_insns(insns: &[SockFilter], flags: u32) -> Result<(), rustix::io::Errno> {
-    let check = |r: isize| if r < 0 { Err(rustix::io::Errno::from_raw_os_error(-r as i32)) } else { Ok(()) };
-    // Unprivileged seccomp requires no_new_privs (and it's right regardless: no setuid gains).
-    // prctl(PR_SET_NO_NEW_PRIVS = 38, 1).
-    // SAFETY: sets a flag of the process.
-    check(unsafe { exobox_rt::trap::gate(NR_PRCTL, 38, 1, 0, 0, 0, 0) })?;
-    let fprog = SockFprog { len: insns.len() as u16, filter: insns.as_ptr() };
-    // SECCOMP_SET_MODE_FILTER = 1 (include/uapi/linux/seccomp.h).
-    // SAFETY: seccomp reads `fprog` and the instructions it points to, both live for the call.
-    check(unsafe { exobox_rt::trap::gate(NR_SECCOMP, 1, flags as usize, &fprog as *const SockFprog as usize, 0, 0, 0) })
-}
-
