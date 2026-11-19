@@ -54,6 +54,41 @@ pub fn kernel<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// A syscall the hooks' own code made on the executor (a library's: capnweb-rs's stacker reads
+/// /proc/self/maps for its stack's bounds), as the kernel's tsi task (`lkl_net_syscall`): no
+/// thread of the program's. Made as the executor coroutine's own guest task, the first such call
+/// made the executor a thread of init's process, which nothing ever ended (it waits for its tasks,
+/// not in the kernel): after the program's exit_group init's process lived on, its files open,
+/// and the sandbox never ended (capnix's `the_default_net_refuses_without_caps`;
+/// `net_exit_code_provider_syscall`). Exits and the host-task calls are EINVAL.
+pub fn host_syscall(nr: core::ffi::c_long, a: [usize; 6]) -> isize {
+    let mut p = a.map(|v| v as core::ffi::c_long);
+    // SAFETY: the kernel runs; the arguments are the hooks' code's (LKL reads its pointers).
+    kernel(|| unsafe { l::lkl_net_syscall(nr, p.as_mut_ptr()) as isize })
+}
+
+/// How long the sandbox's end waits at most for the network to drain ([`drain`]).
+pub const DRAIN_NS: u64 = 1_000_000_000;
+
+/// At the sandbox's end (init's exit, its files closed): the executor runs until the network has
+/// drained, then the caller ends the sandbox. Drained: every connection's end and every lent sock
+/// gone (each copy has handed the program's last bytes and its EOF to the hook's stream, or its
+/// reset), and the executor settled (no task ready, none waiting to write to a held fd: the
+/// provider's session has written its last frames). Bounded by [`DRAIN_NS`]: a stream that never
+/// takes its bytes doesn't keep the sandbox alive; nor do tasks that only wait to read (a
+/// session's reader) or sleep. As Linux sends a socket's buffered data after a close, the
+/// program's exit included: bytes written just before an exit were lost when the sandbox ended at
+/// once (capnix's `bytes_written_just_before_exit_arrive`; `net_exit_flush_*`).
+pub fn drain() {
+    if !executor::installed() || executor::on_executor() {
+        return;
+    }
+    let deadline = executor::now().saturating_add(DRAIN_NS);
+    while !(R.objs.try_borrow().is_ok_and(|o| o.is_empty()) && executor::settled()) && executor::now() < deadline {
+        executor::wait_parked(deadline);
+    }
+}
+
 // ---- what the hooks give back ----
 
 /// A hook's byte stream, both directions (exobox adapts futures-io's and tokio's traits).

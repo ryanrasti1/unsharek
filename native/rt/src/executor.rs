@@ -89,6 +89,8 @@ struct Exec {
     /// wherever the CPU is). Fork mode: init's kernel thread, since the executor's state is init's
     /// process's own memory.
     home: Cell<u16>,
+    /// The sandbox's end, waiting for the executor to settle ([`settled`]): woken when it parks.
+    drainer: Cell<Option<Tid>>,
 }
 
 /// A cell behind a spin lock: the ready queue, pushed to by wakers from wherever they run.
@@ -130,6 +132,7 @@ static E: Exec = Exec {
     hostfds_ready: RefCell::new(Vec::new()),
     last_busy_poll: Cell::new(0),
     home: Cell::new(u16::MAX),
+    drainer: Cell::new(None),
 };
 
 /// Bind the executor's coroutine to host-thread slot `home` (fork mode: init's kernel thread).
@@ -150,6 +153,29 @@ fn sched() -> &'static Sched {
 /// Whether the executor runs (the guest booted).
 pub fn installed() -> bool {
     E.sched.get().is_some()
+}
+
+/// Whether the calling coroutine is the executor's. Its syscalls (a hook's library's: capnweb-rs's
+/// stacker reads /proc/self/maps) are the host's own, made as the kernel's tsi task
+/// (`tsi::host_syscall`), never as a thread of the program's.
+pub fn on_executor() -> bool {
+    installed() && E.tid.get().is_some_and(|t| t == sched().current())
+}
+
+/// Whether the executor has nothing left to do but wait for the outside: parked (or never
+/// started), nothing ready, and no task waiting to write to a held fd (a provider's session still
+/// flushing). Waits for reads (a session's reader, forever) and timers don't count.
+pub fn settled() -> bool {
+    let writing = E.watches.try_borrow().map_or(true, |w| w.iter().any(|x| x.events & POLLOUT != 0));
+    (E.tid.get().is_none() || E.parked.get()) && E.ready.with(|q| q.is_empty()) && !writing
+}
+
+/// Block the calling coroutine (not the executor's) until the executor parks, or `deadline`.
+pub fn wait_parked(deadline: u64) {
+    let s = sched();
+    E.drainer.set(Some(s.current()));
+    s.block(Some(deadline));
+    E.drainer.set(None);
 }
 
 // ---- tasks and wakers ----
@@ -290,6 +316,9 @@ fn run(_: usize) -> usize {
         let deadline = E.timers.borrow().iter().map(|t| t.deadline).min();
         // Woken by a waker (`sched.wake`), its timer, or the idle wait's fds (their wakers).
         E.parked.set(true);
+        if let Some(d) = E.drainer.get() {
+            s.wake(d);
+        }
         s.block(deadline);
         E.parked.set(false);
     }

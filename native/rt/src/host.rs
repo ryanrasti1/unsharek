@@ -647,11 +647,21 @@ const FD_REPOLL_NS: u64 = 5_000_000;
 /// The kernel's "restart this call if no handler says otherwise" (include/linux/errno.h).
 const ERESTARTSYS: core::ffi::c_long = 512;
 
+/// `hostfd_rw`'s flags (the kernel's `LKL_HOSTFD_*`, uapi asm/host_ops.h): a write, and the
+/// file is nonblocking (O_NONBLOCK).
+const HOSTFD_WRITE: c_int = 1;
+const HOSTFD_NONBLOCK: c_int = 2;
+
 /// `hostfd_rw`: a read or write on the host's fd for a guest file made by `host_fd`, called with
 /// the CPU free and the task asleep. The host thread is every coroutine's, so it must not block in
 /// the host: poll the fd (through the gate), and until it is ready block the coroutine, the idle
 /// wait watching the fd; then the one read or write, which won't block. Through the gate, so the
 /// filter decides: reads of 0 and writes of 1 and 2 (the program's stdio) and nothing else.
+///
+/// **Nonblocking files** (`HOSTFD_NONBLOCK`: the guest file is O_NONBLOCK) never wait: the poll
+/// says not ready, and the call is EAGAIN, as a pipe's, the fd watched. tokio drives a passed fd (capnix's channel
+/// at 1000) edge-triggered, reading to EAGAIN after each edge; before this flag that read waited
+/// here, and its runtime stalled (`passfd_epoll_et`).
 ///
 /// **Ends and signals.** The kernel's wait for this is uninterruptible (hostfd.c: the task asleep
 /// outside the CPU, as in a disk read), so neither a group exit nor a signal reaches a thread
@@ -664,8 +674,9 @@ const ERESTARTSYS: core::ffi::c_long = 512;
 /// `SA_RESTART` or is `EINTR`, as a pipe's read; with nothing pending the kernel runs the call
 /// again, back here. (The kernel-side fix would be hostfd.c waiting interruptibly and the host
 /// op being told to give up: see the item-8 notes in `guest`.)
-unsafe extern "C" fn hostfd_rw(fd: c_int, buf: *mut c_void, len: c_ulong, write: c_int) -> core::ffi::c_long {
-    let events = if write != 0 { POLLOUT } else { POLLIN };
+unsafe extern "C" fn hostfd_rw(fd: c_int, buf: *mut c_void, len: c_ulong, flags: c_int) -> core::ffi::c_long {
+    let write = flags & HOSTFD_WRITE != 0;
+    let events = if write { POLLOUT } else { POLLIN };
     let zero = crate::xabi::Timespec { tv_sec: 0, tv_nsec: 0 };
     let ready = || {
         let mut p = crate::trap::PollFd { fd, events, revents: 0 };
@@ -673,6 +684,15 @@ unsafe extern "C" fn hostfd_rw(fd: c_int, buf: *mut c_void, len: c_ulong, write:
     };
     match ready() {
         Ok(true) => {}
+        Ok(false) if flags & HOSTFD_NONBLOCK != 0 => {
+            // Watched until it is ready, as `hostfd_poll` watches what isn't: then the kernel
+            // wakes the file's pollers, the edge an edge-triggered epoll waits for after reading
+            // to EAGAIN (nothing else would tell it).
+            if crate::executor::installed() {
+                crate::executor::watch_hostfd(fd, events);
+            }
+            return -(rustix::io::Errno::AGAIN.raw_os_error() as core::ffi::c_long);
+        }
         Ok(false) => {
             let s = sched();
             let deadline = s.now().saturating_add(FD_REPOLL_NS);
@@ -693,7 +713,7 @@ unsafe extern "C" fn hostfd_rw(fd: c_int, buf: *mut c_void, len: c_ulong, write:
         }
         Err(e) => return -(e.raw_os_error() as core::ffi::c_long),
     }
-    let r = if write != 0 {
+    let r = if write {
         // SAFETY: the kernel's buffer of len bytes.
         crate::trap::write(fd as u32, unsafe { core::slice::from_raw_parts(buf as *const u8, len as usize) })
     } else {

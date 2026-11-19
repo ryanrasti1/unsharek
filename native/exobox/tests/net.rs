@@ -325,6 +325,10 @@ impl futures_core::Stream for OneConn {
     }
 }
 
+/// The `provider_syscall` child's: the connect hook makes a syscall of its own first, as
+/// capnweb-rs's stacker does (it reads /proc/self/maps for the stack's bounds).
+static STRAY_SYSCALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The held fd the hooks talk over (the child's own, under a name: the hooks are given at build).
 fn net_fd(cx: &Cx) -> HeldFd {
     cx.held("net").expect("no fd held as \"net\"")
@@ -334,6 +338,10 @@ fn net_fd(cx: &Cx) -> HeldFd {
 /// from.
 fn connect_hook(allow: fn(Option<String>) -> bool) -> OnConnect {
     OnConnect::new(move |cx: Cx, _pid, addr: SocketAddr| async move {
+        if STRAY_SYSCALL.load(std::sync::atomic::Ordering::Relaxed) {
+            // SAFETY: getpid has no arguments.
+            unsafe { libc::getpid() };
+        }
         if !allow(cx.name_of(addr.ip())) {
             return Err(NetError::Refused);
         }
@@ -375,7 +383,8 @@ fn child(kind: &str) -> ! {
     let argv: Vec<OsString> = std::env::var(ARGV).unwrap().split('\x1f').map(OsString::from).collect();
     let mut b = exobox::Sandbox::builder();
     match kind {
-        "provider" => {
+        "provider" | "provider_syscall" => {
+            STRAY_SYSCALL.store(kind == "provider_syscall", std::sync::atomic::Ordering::Relaxed);
             let (connect, resolve, listen) = provider();
             // The session up before the program: no first hook has to start it.
             b = b.on_connect(connect).on_resolve(resolve).on_listen(listen).on_start(|cx| async move {
@@ -389,7 +398,7 @@ fn child(kind: &str) -> ! {
     // SAFETY: fd 3 is this process's, from the parent, and nothing else owns it.
     let fd3 = unsafe { OwnedFd::from_raw_fd(3) };
     match kind {
-        "provider" | "named" => drop(sb.hold_fd_as("net", fd3).unwrap()),
+        "provider" | "provider_syscall" | "named" => drop(sb.hold_fd_as("net", fd3).unwrap()),
         "passfd" => sb.pass_fd(fd3, 1000).unwrap(),
         _ => drop(fd3),
     }
@@ -666,5 +675,100 @@ fn main() {
         }
         Ok(())
     }));
+    // capnix's repro: edge-triggered epoll on a passed fd, three rounds (tokio's use).
+    trials.push(Trial::test("passfd_epoll_et::coroutine", || {
+        let argv = vec![fx::bin("fd_epoll_et").display().to_string()];
+        let (code, out, err) = run("passfd", &argv, |mut sock| {
+            for _ in 0..3 {
+                let mut b = [0u8; 5];
+                if sock.read_exact(&mut b).is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(50));
+                let _ = sock.write_all(b"ping");
+            }
+        })?;
+        if code != 0 || !out.contains("FD_EPOLL_ET_OK") {
+            return Err(format!("exit {code}\n--- stdout:\n{out}\n--- stderr:\n{err}").into());
+        }
+        Ok(())
+    }));
+    // The sandbox's end with a hook's session still waiting on its held fd: the program connects
+    // once (the connect hook making a syscall of its own, as capnweb-rs's stacker does) and exits
+    // 3 at once, its socket open. It must end with 3, promptly. It hung when the hook's syscall
+    // made the executor a thread of init's process (capnix's `the_default_net_refuses_without_caps`).
+    let echo = s.echo.to_string();
+    for kind in ["provider", "provider_syscall"] {
+        let argv = vec![fx::bin("net_exit").display().to_string(), "connect".into(), "10.0.0.1".into(), echo.clone(), "3".into()];
+        trials.push(Trial::test(format!("net_exit_code_{kind}::coroutine"), move || {
+            let t0 = std::time::Instant::now();
+            let (code, out, err) = run(kind, &argv, proxy)?;
+            let took = t0.elapsed();
+            if code != 3 || !out.contains("NET_EXIT_CONNECTED") || took > Duration::from_secs(3) {
+                return Err(format!("exit {code} after {took:?}, wanted 3\n--- stdout:\n{out}\n--- stderr:\n{err}").into());
+            }
+            Ok(())
+        }));
+    }
+    // Bytes the program writes and shuts down just before it exits reach the hook's stream, all of
+    // them and then the EOF, as a closed socket's data is still sent on Linux (capnix's
+    // `bytes_written_just_before_exit_arrive`). They were lost: the sandbox ended at init's exit,
+    // before the copy ran. 1 MiB: more than the kernel's socket buffers hold at the exit.
+    for n in [5usize, 1 << 20] {
+        let argv = vec![fx::bin("net_exit").display().to_string(), "write".into(), "10.0.0.1".into(), "9".into(), n.to_string()];
+        trials.push(Trial::test(format!("net_exit_flush_{n}::coroutine"), move || {
+            let got = Arc::new(Mutex::new(Sunk::default()));
+            let g = got.clone();
+            let (code, out, err) = run("provider", &argv, move |sock| sink(sock, &g))?;
+            let got = got.lock().unwrap();
+            let want: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+            if code != 0 || !out.contains("NET_EXIT_WRITTEN") || got.data != want || !got.eof || got.reset {
+                return Err(format!(
+                    "exit {code}; the stream got {} of {n} bytes (matching: {}), eof {}, reset {}\n--- stdout:\n{out}\n--- stderr:\n{err}",
+                    got.data.len(),
+                    got.data == want[..got.data.len().min(n)],
+                    got.eof,
+                    got.reset
+                )
+                .into());
+            }
+            Ok(())
+        }));
+    }
     libtest_mimic::run(&args, trials).exit();
+}
+
+/// What a [`sink`] got on its one connection.
+#[derive(Default)]
+struct Sunk {
+    data: Vec<u8>,
+    eof: bool,
+    reset: bool,
+}
+
+/// The provider's other end as a sink: every connect accepted, its bytes and its end noted.
+fn sink(sock: UnixStream, got: &Mutex<Sunk>) {
+    let mut w = sock.try_clone().unwrap();
+    let mut sock = sock;
+    let mut buf = Vec::new();
+    let mut chunk = vec![0u8; 64 << 10];
+    loop {
+        let n = match sock.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        while let Some((id, op, p)) = take_frame(&mut buf) {
+            let mut g = got.lock().unwrap();
+            match op {
+                CONNECT => {
+                    let _ = w.write_all(&frame(id, CONNECTED, &[]));
+                }
+                DATA => g.data.extend_from_slice(&p),
+                CLOSE => g.eof = true,
+                RESET => g.reset = true,
+                _ => {}
+            }
+        }
+    }
 }

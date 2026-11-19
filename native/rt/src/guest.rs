@@ -766,6 +766,10 @@ fn me() -> &'static Thread {
 
 /// `lkl_syscall` as the current coroutine's task (attaching a new thread's first).
 fn lkl_call(nr: c_long, a: [usize; 6]) -> isize {
+    if crate::executor::on_executor() {
+        // The hooks' own calls (a library's) are the host's, never a thread of init's.
+        return crate::tsi::host_syscall(nr, a);
+    }
     // Threaded mode keeps the per-thread attach word in the host-thread record (the bound
     // coroutine is reached by a trap, not the per-coroutine TLS `me()`).
     let tid = if par::enabled() { par::take_attach() } else { me().attach.replace(0) };
@@ -959,6 +963,9 @@ fn exit_thread(code: usize) -> ! {
 /// other thread waited in a futex, or read a silent stdin, never ended.
 unsafe extern "C" fn task_exit(pid: core::ffi::c_int, status: core::ffi::c_int) {
     if pid == 1 {
+        // The program's sockets were closed by its exit: what they still hold reaches the hooks
+        // first (bounded).
+        crate::tsi::drain();
         if status & 0x7f == 0 {
             finish((status >> 8) & 0xff);
         }
