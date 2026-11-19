@@ -41,17 +41,17 @@
 - Each test runs natively too, unless it can't (it needs the sandbox) or mustn't (it is unsafe on
   the host). The native run checks the test: a leak test must leak natively.
 - Escape tests make one forbidden call each and expect death by SIGSYS (`escape_gate.c`'s
-  probes); every number's verdict is exobox-tcb's model test.
+  probes); every number's verdict is exobox-tcb's policy, proven (`./test --prove`).
 
 ## Code
 - The trusted computing base is the crate `exobox-tcb` (`tcb/`) and nothing else
   (`tcb/README.md`: the guarantee, what isn't guaranteed, the design, the review checklist):
-  lockdown's checks and the one seccomp filter. It depends on seccompiler and libc only, and on
+  lockdown's checks and the one seccomp filter. It depends on seccomp-fn and libc only, and on
   nothing of exobox's: build it as its own repository. Keep it small. A change that widens what
   the host allows (a filter rule, a kind of guest fd or mapping lockdown accepts) is a TCB change,
-  with a test in `tcb/tests/` (`filter.rs`, against its model; `lockdown.rs`), and
-  tcb/README.md's table, the model and the checklist follow it (a test checks the table against
-  the model, and the model against the filter). Everything else (exobox's
+  with a test in `tcb/tests/` (`filter.rs`; `lockdown.rs`), and
+  tcb/README.md's table and checklist follow it (a test checks the table's rows against the
+  policy's, in order; Kani proves the filter is the policy: `./test --prove`). Everything else (exobox's
   API and batteries in `native/exobox`, the runtime `native/rt`, the kernel) is not trusted: it
   is given grants, never produces values the filter trusts, and knows nothing of the filter. A
   network hook is never a policy point.

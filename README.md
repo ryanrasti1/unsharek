@@ -113,18 +113,19 @@ locked.exec(&argv, &env)                               // the program; never ret
   provider's own process, never in a hook. Anything a hook decides, a compromised program can
   skip. The network's only part of the TCB is the held fds: which ones, and the filter pinning
   `read` and `write` to exactly them.
-- **Where isolation is.** In `exobox-tcb` (`tcb/`, its own crate: seccompiler and libc, nothing
-  of exobox's), about 800 lines with comments (its tests and the old compiler apart) ([tcb/README.md](tcb/README.md): the guarantee, what
+- **Where isolation is.** In `exobox-tcb` (`tcb/`, its own crate: seccomp-fn and libc, nothing
+  of exobox's), about 620 lines with comments (its tests apart) ([tcb/README.md](tcb/README.md): the guarantee, what
   isn't guaranteed, the design and a review checklist). `Sandbox::configure_and_lockdown` takes
   the caller's grants and a `Confined` guest (its own fds, its mode, its gate's address) and, in
   order: checks there is exactly one thread; checks the guest's fds are eventfds (and in fork mode
   a pidfd); checks every mapping is private, read-only, or fork mode's shared anonymous memory;
   closes every fd neither granted nor the guest's; turns core dumps and dumpability off; drops
   every capability; sets `no_new_privs`; and installs **one
-  seccomp filter** with TSYNC: a hand-written gate check (a call not from the runtime's one
-  syscall instruction is TRAP, served in-process, in every thread and process made after; another
-  ABI is KILL) and then seccompiler's allowlist for the mode, each argument pinned, KILL for the
-  rest. Nothing else protects the host: the runtime, the guest kernel, the hooks, the store and
+  seccomp filter** with TSYNC: one Rust function, `policy()`, compiled to classic BPF by
+  seccomp-fn ([seccomp-fn/README.md](seccomp-fn/README.md)) and proven equal to it by Kani: a gate
+  check (a call not from the runtime's one syscall instruction is TRAP, served in-process, in every
+  thread and process made after; another ABI is KILL) and then the mode's rows, each argument
+  pinned, KILL for the rest. Nothing else protects the host: the runtime, the guest kernel, the hooks, the store and
   exobox's API run in the process after lockdown (or decide only what the guest sees, before it),
   and a bug in them breaks the guest, never the host.
 - **Layers.** `exobox` (`native/exobox`: the API, the CLI and the batteries `setup`, `store`,
@@ -159,7 +160,7 @@ against threaded mode (`threads`), and the host filter refusing a hostile progra
   so it never follows host code anywhere. From lockdown on, isolation is **one seccomp filter**,
   installed once, with TSYNC, as lockdown's last act; every thread and process made after inherits
   it. Its hand-written gate check sends every call not from the gate to TRAP (the same SIGSYS
-  entry; the handler accepts both kinds of trap) and kills other ABIs; seccompiler's allowlist of
+  entry; the handler accepts both kinds of trap) and kills other ABIs; the policy's rows for
   the mode's calls, each argument pinned (granted fds with their access, one `clone` flag set,
   the sandbox's own pid), judges the gate's. The gate check answers only TRAP or KILL, so the
   gate's address stays routing, not security: a compromised program can jump to the gate, and
