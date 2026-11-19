@@ -7,8 +7,10 @@
 //! - **No lost wakeups.** `*uaddr` is compared with the expected value and the waiter queued with
 //!   nothing else running in between: scheduling is cooperative, so that is atomic, as the kernel's
 //!   bucket lock makes it.
-//! - **Private and shared are the same.** One address space: the key is the address either way.
-//!   (Fork mode, with several processes, would key shared futexes by mapping instead.)
+//! - **Private and shared are the same.** The key is the address either way, in its address space
+//!   ([`Futexes::futex_in`]'s `space`): fork mode's processes share one table and each is a space
+//!   of its own (their memory is copied by the fork, never shared: a `MAP_SHARED` mapping of the
+//!   arena is private to each process after a fork).
 //! - **Timeouts** become absolute CLOCK_MONOTONIC deadlines on the scheduler's heap. A realtime
 //!   absolute deadline is converted once, at the call: a later jump of the realtime clock doesn't
 //!   move it (Linux would follow it).
@@ -64,6 +66,11 @@ pub fn bucket_of(addr: usize) -> usize {
     (((addr >> 2) as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - BUCKETS.trailing_zeros())) as usize
 }
 
+/// A waiter's key: the address, and above the user address space's 47 bits, the space.
+fn key_of(space: u32, addr: usize) -> usize {
+    addr ^ ((space as usize) << 48)
+}
+
 impl Futexes {
     pub const fn new() -> Self {
         Futexes { buckets: [const { WaitQueue::new() }; BUCKETS] }
@@ -78,6 +85,27 @@ impl Futexes {
     pub unsafe fn futex(
         &self,
         s: &Sched,
+        uaddr: *const u32,
+        op: u32,
+        val: u32,
+        timeout: Option<&Timespec>,
+        val3: u32,
+    ) -> Result<usize, Errno> {
+        // SAFETY: the caller's.
+        unsafe { self.futex_in(s, 0, uaddr, op, val, timeout, val3) }
+    }
+
+    /// [`Futexes::futex`] in address space `space`: a futex is a word of one address space, and
+    /// fork mode's processes each have their own (one table, shared, keyed by space and address:
+    /// the same address in two processes is two futexes). Space numbers are below 2^16.
+    ///
+    /// # Safety
+    /// As [`Futexes::futex`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn futex_in(
+        &self,
+        s: &Sched,
+        space: u32,
         uaddr: *const u32,
         op: u32,
         val: u32,
@@ -125,8 +153,9 @@ impl Futexes {
                 {
                     return Err(Errno::TIMEDOUT);
                 }
-                let q = &self.buckets[bucket_of(uaddr as usize)];
-                let tag = WaitTag { key: uaddr as usize, mask: bitset };
+                let key = key_of(space, uaddr as usize);
+                let q = &self.buckets[bucket_of(key)];
+                let tag = WaitTag { key, mask: bitset };
                 match s.wait(q, tag, deadline.map(|(d, _)| d)) {
                     Wake::Woken => Ok(0),
                     Wake::TimedOut => Err(Errno::TIMEDOUT),
@@ -138,7 +167,7 @@ impl Futexes {
                 if bitset == 0 {
                     return Err(Errno::INVAL);
                 }
-                Ok(self.wake(s, uaddr as usize, val, bitset))
+                Ok(self.wake_in(s, space, uaddr as usize, val, bitset))
             }
             _ => Err(Errno::NOSYS),
         }
@@ -148,8 +177,14 @@ impl Futexes {
     /// syscall's int and anything below 1 still wakes one. Also for the end of a thread with
     /// CLONE_CHILD_CLEARTID.
     pub fn wake(&self, s: &Sched, addr: usize, n: u32, bitset: u32) -> usize {
+        self.wake_in(s, 0, addr, n, bitset)
+    }
+
+    /// [`Futexes::wake`] in address space `space` ([`Futexes::futex_in`]).
+    pub fn wake_in(&self, s: &Sched, space: u32, addr: usize, n: u32, bitset: u32) -> usize {
         let max = (n as i32).max(1) as usize;
-        s.wake_where(&self.buckets[bucket_of(addr)], max, |t| t.key == addr && t.mask & bitset != 0)
+        let key = key_of(space, addr);
+        s.wake_where(&self.buckets[bucket_of(key)], max, |t| t.key == key && t.mask & bitset != 0)
     }
 }
 
@@ -240,6 +275,22 @@ mod tests {
         for (_, t) in ws {
             s.join(t).unwrap();
         }
+    }
+
+    /// Fork mode: one address in two processes is two futexes.
+    #[test]
+    fn spaces_are_apart() {
+        let (s, f, _) = setup(8);
+        let word: &'static u32 = Box::leak(Box::new(0));
+        let (w, t) = spawn_waiter(s, f, word, FUTEX_WAIT, 0, None);
+        s.yield_now();
+        assert_eq!(unsafe { f.futex_in(s, 7, word, FUTEX_WAKE, 1, None, 0) }, Ok(0), "another space's");
+        assert_eq!(f.wake_in(s, 1, word as *const u32 as usize, 1, FUTEX_BITSET_MATCH_ANY), 0);
+        s.yield_now();
+        assert_eq!(w.result.get(), None);
+        assert_eq!(unsafe { f.futex_in(s, 0, word, FUTEX_WAKE, 1, None, 0) }, Ok(1));
+        s.join(t).unwrap();
+        assert_eq!(w.result.get(), Some(Ok(0)));
     }
 
     #[test]
