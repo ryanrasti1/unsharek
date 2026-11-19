@@ -56,6 +56,13 @@
 //! be the guest's, as init's: a thread of the program's process, which an exec waits for), open
 //! host sockets or files (no host syscall is left for that), or block (the executor is one of
 //! the sandbox's coroutines: a blocking call stops the program too).
+//!
+//! Every hook and task runs on that one executor, in every mode: in threaded mode only while it
+//! holds the guest's CPU, so never on two host threads at once; in fork mode only in init's
+//! process. So `std::sync::Mutex` and thread-locals are fine (one lock owner at a time, one TLS),
+//! with the usual async rule held strictly: never keep a std lock across an `.await`. A task
+//! contending a lock another task holds blocks in `futex`, which parks the executor itself: a
+//! deadlock.
 
 use std::future::Future;
 use std::io;
