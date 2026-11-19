@@ -94,7 +94,7 @@ macro_rules! group {
 macro_rules! all {
     (native) => { $crate::all!(@one [] []); $crate::all!(@processes); };
     (coroutine) => {
-        $crate::all!(@one [ignore = "guest: coroutine mode's timers interrupt the runtime's waits at every tick (CPU while idle)"] []);
+        $crate::all!(@one [] []);
     };
     (threaded) => {
         $crate::all!(@one []
@@ -105,10 +105,7 @@ macro_rules! all {
             [ignore = "guest: threaded/fork exec from a thread panics the runtime"]);
         $crate::all!(@processes);
     };
-    // `idle`: of idle_cpu, over its CPU budget in coroutine mode (120 ms for 300 ms of sleeps): every
-    // guest timer's firing interrupts the runtime's own waits (`host::timer_fired`, in case it sent
-    // a signal), a waiter's check is a call into the kernel, which restarts the tick: a timed futex
-    // wait spins at the tick's rate until its deadline. `exec`: of exec_reset, which in threaded
+    // `idle`: of idle_cpu (none ignore it now). `exec`: of exec_reset, which in threaded
     // and fork mode panics the runtime (native/rt/src/context.rs:62, a subtraction's overflow)
     // after an exec from libtest's test thread while its main thread waits, and the sandbox hangs.
     (@one [$($idle:meta)*] [$($exec:meta)*]) => {

@@ -1569,6 +1569,11 @@ fn served(uc: &mut Ucontext, nr: usize, a: [usize; 6]) {
 }
 
 fn serve(uc: &mut Ucontext, nr: usize, a: [usize; 6]) -> isize {
+    // alarm, setitimer, timer_settime: from now on the kernel's timer may send a signal, so its
+    // firing interrupts the runtime's waits (`host::timer_fired`).
+    if matches!(nr, 37 | 38 | 223) {
+        host::SIGNAL_TIMERS.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
     // STOPGAP(item 10): readlink, readlinkat(AT_FDCWD) of /proc/self/exe.
     let exe = match nr {
         NR_READLINK => readlink_exe(a[0], a[1], a[2]),
