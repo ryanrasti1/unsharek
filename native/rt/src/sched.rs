@@ -732,6 +732,19 @@ impl Sched {
         None
     }
 
+    /// Whether a runnable coroutine is bound to no host (threaded mode: the kernel thread can run
+    /// it).
+    pub fn par_unbound_ready(&self) -> bool {
+        let mut i = self.run_head.get();
+        while i != NONE {
+            if self.slots[i as usize].home.get() == NONE {
+                return true;
+            }
+            i = self.slots[i as usize].run_next.get();
+        }
+        false
+    }
+
     /// Fire due timers (threaded mode drives this from the token holder's idle).
     pub fn par_expire(&self, force: bool) {
         self.expire_timers(force);

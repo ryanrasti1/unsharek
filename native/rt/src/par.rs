@@ -639,7 +639,12 @@ extern "C" fn thread_start(arg: usize) -> ! {
 pub fn thread_exited(id: u16) -> ! {
     let h = slot(id);
     h.used.store(false, Ordering::Release);
-    give(id, true);
+    // A coroutine bound to no host may be runnable (a timer this thread's last calls armed is woken
+    // to re-read its deadline, which is on no heap until it runs): this host can't run it any
+    // more, so the kernel thread takes the token rather than leaving it free with that coroutine
+    // stranded (a thread's end while main slept on that timer hung the process). The return to
+    // user mode (`leave`) doesn't look: it would hand the token off at nearly every call.
+    give(id, !sched().par_unbound_ready());
     // SAFETY: nothing else needs this thread's stack; the kernel clears the tid word (reuse frees
     // the Sched coroutines).
     unsafe { trap::exit_thread() }
