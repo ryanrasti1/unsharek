@@ -157,7 +157,11 @@ against threaded mode (`threads`), and the host filter refusing a hostile progra
    shared copy-on-write.
 6. Within the performance budgets (`./test --perf`): startup, memory per sandbox, parallel builds.
 7. Code mapped in place from the store images (done, in release-mode arenas: coroutine and fork),
-   and a streaming image builder for stores that write images as paths arrive.
+   and a streaming image builder for stores that write images as paths arrive. Images from
+   extents: a closure's image synthesized in memory over the host's store files, no file's data
+   read or copied (`exobox_erofs::synthesize`, and memblk disks of extents: done), then mapped
+   (each file once, before lockdown), mounted and mapped in place over the per-file mappings
+   (`map_image` from extents, the loader, `exobox::store`: next).
 8. For capnix (`~/src/capnix-proper`, "What exobox needs to provide"): a host fd passed to the guest
    at a given fd (its Cap'n Web channel at 1000), with the filter widened to exactly that fd; the
    program run as a given uid (setup is the guest's init, as root, and can drop to it before exec);

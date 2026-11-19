@@ -11,7 +11,10 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use exobox_erofs::{BLOCK_SIZE, Layout};
+use std::os::unix::fs::FileExt;
+use std::time::Instant;
+
+use exobox_erofs::{BLOCK_SIZE, Extent, FileLayout, Layout, Synthesized};
 use object::read::elf::{FileHeader, ProgramHeader};
 
 /// Runs an erofs-utils tool, bounded (AGENTS.md: everything run has a timeout of seconds).
@@ -60,14 +63,37 @@ impl Drop for Scratch {
     }
 }
 
-/// Builds `src` into an image, checks it with fsck.erofs, extracts it, and compares.
-fn roundtrip(src: &Path) -> Layout {
-    let scratch = Scratch::new();
-    let img = scratch.path().join("img");
-    let layout = exobox_erofs::build(src, &img).unwrap();
-    check_layout(&layout);
+/// The image `synthesize` describes, assembled here from its extents as a guest's disk is: the
+/// metadata's bytes, each file's bytes read from the open host file (`read_at`, not through the
+/// crate's writer) up to the extent's end, zeros past the file's end and for zero extents.
+fn assemble(s: &Synthesized) -> Vec<u8> {
+    let mut image = Vec::with_capacity(s.layout.size as usize);
+    for e in &s.extents {
+        let start = image.len();
+        assert_eq!(start as u64 % BLOCK_SIZE, 0);
+        assert_eq!(e.len() % BLOCK_SIZE, 0, "{e:?}");
+        assert!(!e.is_empty());
+        match e {
+            Extent::Metadata(b) => image.extend_from_slice(b),
+            &Extent::File { file, offset, len } => {
+                let f = &s.files[file];
+                assert_eq!(offset % BLOCK_SIZE, 0);
+                assert!(f.size > offset && f.size - offset <= len, "{f:?} {e:?}");
+                image.resize(start + len as usize, 0);
+                f.file
+                    .read_exact_at(&mut image[start..][..(f.size - offset) as usize], offset)
+                    .unwrap();
+            }
+            &Extent::Zeros(len) => image.resize(start + len as usize, 0),
+        }
+    }
+    assert_eq!(image.len() as u64, s.layout.size);
+    image
+}
+
+/// Checks an image file with fsck.erofs and extracts it into `out`.
+fn fsck_extract(img: &Path, out: &Path) {
     tool(&["fsck.erofs".as_ref(), img.as_os_str()]);
-    let out = scratch.path().join("out");
     let extract = format!("--extract={}", out.display());
     tool(&[
         "fsck.erofs".as_ref(),
@@ -75,8 +101,29 @@ fn roundtrip(src: &Path) -> Layout {
         "--preserve-perms".as_ref(),
         img.as_os_str(),
     ]);
+}
+
+/// Builds `src` into an image, checks it with fsck.erofs, extracts it, and compares. The same
+/// tree synthesized is the same image, written by the crate or assembled from its extents.
+fn roundtrip(src: &Path) -> Layout {
+    let scratch = Scratch::new();
+    let img = scratch.path().join("img");
+    let layout = exobox_erofs::build(src, &img).unwrap();
+    check_layout(&layout);
+    let out = scratch.path().join("out");
+    fsck_extract(&img, &out);
     let mut pairs = HashMap::new();
     compare(src, &out, Path::new(""), &mut pairs, &layout);
+    let synth = exobox_erofs::synthesize(&[(src.to_owned(), "/".into())]).unwrap();
+    assert_eq!(synth.layout, layout);
+    let built = fs::read(&img).unwrap();
+    assert!(assemble(&synth) == built, "synthesized != built");
+    let written = scratch.path().join("written");
+    synth.write(&written).unwrap();
+    assert!(
+        fs::read(&written).unwrap() == built,
+        "synthesized and written != built"
+    );
     // Image bytes: each file's data at its offset, as the runtime will map it.
     let image = fs::read(&img).unwrap();
     assert_eq!(image.len() as u64, layout.size);
@@ -338,5 +385,208 @@ fn store_paths() {
             }
         }
         assert!(elves > 0, "{}: no ELF files", path.display());
+    }
+}
+
+/// The files of `layout` under `at` (a root's place), with paths from there: what `compare` takes
+/// for that root's tree.
+fn under(layout: &Layout, at: &Path) -> Layout {
+    let at = at.strip_prefix("/").unwrap_or(at);
+    Layout {
+        size: layout.size,
+        files: layout
+            .files
+            .iter()
+            .filter_map(|f| {
+                let path = f.path.strip_prefix(at).ok()?.to_owned();
+                Some(FileLayout { path, ..f.clone() })
+            })
+            .collect(),
+    }
+}
+
+/// A synthesized image of several roots, each at its own place: assembled from its extents, fsck
+/// accepts it, and each place extracts as its tree. Hard links across roots share an inode and
+/// a host file; the directories leading to the places are made.
+#[test]
+fn synthesized_roots() {
+    let scratch = Scratch::new();
+    let s = scratch.path();
+    let file = |rel: &str, bytes: &[u8]| {
+        let p = s.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, bytes).unwrap();
+    };
+    file("one/bin/tool", b"#!/bin/sh\n");
+    file("one/lib/data", &[3; 9000]);
+    file("two/share/readme", b"two");
+    file("two/empty", b"");
+    fs::create_dir(s.join("three")).unwrap();
+    symlink("../one/bin/tool", s.join("two/tool")).unwrap();
+    fs::hard_link(s.join("one/lib/data"), s.join("two/data-link")).unwrap();
+    fs::set_permissions(s.join("two"), fs::Permissions::from_mode(0o555)).unwrap();
+    let roots = [
+        (s.join("two"), PathBuf::from("/nix/store/bbb-two")),
+        (s.join("one"), PathBuf::from("/nix/store/aaa-one")),
+        (s.join("three"), PathBuf::from("/x")),
+    ];
+    let synth = exobox_erofs::synthesize(&roots).unwrap();
+    check_layout(&synth.layout);
+    // Each file with data once, in the image's order: one's, then two's own.
+    let names: Vec<_> = synth
+        .files
+        .iter()
+        .map(|f| f.path.strip_prefix(s).unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        names,
+        ["one/bin/tool", "one/lib/data", "two/share/readme"].map(PathBuf::from)
+    );
+    let nid = |p: &str| {
+        synth
+            .layout
+            .files
+            .iter()
+            .find(|f| f.path == Path::new(p))
+            .unwrap()
+            .nid
+    };
+    assert_eq!(
+        nid("nix/store/aaa-one/lib/data"),
+        nid("nix/store/bbb-two/data-link")
+    );
+    // Deterministic, whatever the roots' order.
+    let mut reversed = roots.clone();
+    reversed.reverse();
+    let again = exobox_erofs::synthesize(&reversed).unwrap();
+    assert_eq!(
+        (&again.extents, &again.layout),
+        (&synth.extents, &synth.layout)
+    );
+
+    let img = scratch.path().join("img");
+    fs::write(&img, assemble(&synth)).unwrap();
+    let out = scratch.path().join("out");
+    fsck_extract(&img, &out);
+    let names = |p: &Path| {
+        let mut v: Vec<_> = fs::read_dir(p)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(names(&out), ["nix", "x"]);
+    assert_eq!(names(&out.join("nix/store")), ["aaa-one", "bbb-two"]);
+    assert_eq!(
+        fs::metadata(out.join("nix")).unwrap().mode() & 0o7777,
+        0o755
+    );
+    let mut pairs = HashMap::new();
+    for (host, at) in &roots {
+        let mounted = out.join(at.strip_prefix("/").unwrap());
+        compare(
+            host,
+            &mounted,
+            Path::new(""),
+            &mut pairs,
+            &under(&synth.layout, at),
+        );
+    }
+
+    // Places that aren't one: outside the image, taken twice, inside another root, the image's
+    // root and another; and a root that isn't a directory.
+    let root = |host: &str, at: &str| (s.join(host), PathBuf::from(at));
+    for bad in [
+        vec![root("one", "/a/../b")],
+        vec![root("one", "/a"), root("two", "/a")],
+        vec![root("one", "/a"), root("two", "/a/b")],
+        vec![root("one", "/a/b"), root("two", "a")],
+        vec![root("one", "/"), root("two", "/b")],
+        vec![root("one/lib/data", "/a")],
+    ] {
+        assert!(exobox_erofs::synthesize(&bad).is_err(), "{bad:?}");
+    }
+    assert!(exobox_erofs::synthesize(&[]).unwrap().files.is_empty());
+}
+
+/// A store path's closure (`nix-store -qR`), or None without nix.
+fn closure(path: &Path) -> Option<Vec<PathBuf>> {
+    let out = Command::new("timeout")
+        .args(["10", "nix-store", "-qR"])
+        .arg(path)
+        .output()
+        .ok()?;
+    out.status.success().then(|| {
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .collect()
+    })
+}
+
+/// A closure synthesized as one image, each store path at its own place: what it takes (time,
+/// files to map, extents), and for bash's, fsck's extraction compared with the store.
+#[test]
+fn synthesized_closures() {
+    for (var, extract) in [("EXOBOX_TEST_BASH", true), ("EXOBOX_TEST_PYTHON", false)] {
+        let Some(bin) = std::env::var_os(var) else {
+            eprintln!("skipped: {var} is unset (run in the devshell)");
+            continue;
+        };
+        let Some(paths) = closure(&store_path(Path::new(&bin))) else {
+            eprintln!("skipped: no nix-store");
+            return;
+        };
+        let roots: Vec<_> = paths
+            .iter()
+            .map(|p| (p.clone(), Path::new("/").join(p.file_name().unwrap())))
+            .collect();
+        // (The first in a process is ~0.1 s slower with thousands of files: see `HostFile`.)
+        let t = Instant::now();
+        let synth = exobox_erofs::synthesize(&roots).unwrap();
+        let took = t.elapsed();
+        check_layout(&synth.layout);
+        let count = |f: fn(&Extent) -> bool| synth.extents.iter().filter(|e| f(e)).count();
+        let meta: u64 = synth
+            .extents
+            .iter()
+            .filter_map(|e| match e {
+                Extent::Metadata(b) => Some(b.len() as u64),
+                _ => None,
+            })
+            .sum();
+        eprintln!(
+            "{var}: {} store paths, {} files to map ({} names), synthesized in {took:?}: {} extents \
+             ({} file mappings, {} zeros), metadata {meta} bytes, image {} bytes",
+            roots.len(),
+            synth.files.len(),
+            synth.layout.files.len(),
+            synth.extents.len(),
+            count(|e| matches!(e, Extent::File { .. })),
+            count(|e| matches!(e, Extent::Zeros(_))),
+            synth.layout.size,
+        );
+        if !extract {
+            continue;
+        }
+        let scratch = Scratch::new();
+        let img = scratch.path().join("img");
+        synth.write(&img).unwrap();
+        let out = scratch.path().join("out");
+        fsck_extract(&img, &out);
+        let mut pairs = HashMap::new();
+        for (host, at) in &roots {
+            let mounted = out.join(at.strip_prefix("/").unwrap());
+            compare(
+                host,
+                &mounted,
+                Path::new(""),
+                &mut pairs,
+                &under(&synth.layout, at),
+            );
+        }
     }
 }
