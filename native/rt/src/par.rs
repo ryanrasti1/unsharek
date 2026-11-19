@@ -988,6 +988,58 @@ pub fn drop_proc() {
     PAR.live_procs.fetch_sub(1, Ordering::AcqRel);
 }
 
+/// The main thread's alternate signal stack, installed again (exobox's intercept: host code may
+/// have changed it in passthrough). Through the gate.
+pub fn rearm_altstack() {
+    // SAFETY: slot 0's alternate stack is the main thread's.
+    let _ = unsafe { trap::set_altstack(PAR.slots[0].alt.get() as *mut u8, trap::ALTSTACK_SIZE) };
+}
+
+/// A host fork's child (a template's instance), before it uses the guest: only the forking
+/// (main) thread was copied, and it holds the CPU token (exobox's fork takes it first, so the
+/// kernel was copied at rest). What the fork didn't copy, or copied as shared:
+/// - the CPU-token eventfds: a fork shares their open files with the parent, so every hand-off
+///   here would wake the parent's threads (and theirs ours). Each is made again, at its fd.
+/// - the kernel idler thread: gone. Its slot is cleared (its scheduler coroutine freed: nothing
+///   runs on it), for a new one (`kernel_main` on a thread the caller spawns, then
+///   [`wait_kernel_ready`]).
+/// - the token's lock and waiter queue: whatever state the other threads left them in is
+///   nobody's now; reset, the main thread the owner.
+///
+/// Program threads don't exist yet (setup can't make any), so no other slot is in use.
+pub fn after_fork(s: &'static Sched) -> Result<(), rustix::io::Errno> {
+    PAR.spin.store(false, Ordering::Release);
+    PAR.whead.set(u16::MAX);
+    PAR.wtail.set(u16::MAX);
+    for i in 0..N_SLOTS {
+        PAR.slots[i].wnext.set(u16::MAX);
+        // eventfd2(0, 0) then dup2 onto the slot's fd, through the gate (the routing filter may
+        // be in: rustix's would trap).
+        // SAFETY: a new eventfd, moved to the fd the filter pins; the inherited one is closed.
+        let efd = unsafe { trap::gate(290, 0, 0, 0, 0, 0, 0) };
+        if efd < 0 {
+            return Err(rustix::io::Errno::from_raw_os_error(-efd as i32));
+        }
+        // SAFETY: as above.
+        let r = unsafe { trap::gate(33, efd as usize, (EFD_BASE + i as u32) as usize, 0, 0, 0, 0) };
+        // SAFETY: closes the temporary fd.
+        unsafe { trap::gate(3, efd as usize, 0, 0, 0, 0, 0) };
+        if r < 0 {
+            return Err(rustix::io::Errno::from_raw_os_error(-r as i32));
+        }
+    }
+    let k = slot(KERNEL);
+    let old = k.sched_co.replace(0);
+    if old != 0 {
+        s.drop_adopted(Tid::from_raw(old));
+    }
+    k.running.set(0);
+    k.used.store(false, Ordering::Release);
+    PAR.k_ready.store(false, Ordering::Release);
+    PAR.owner.store(0, Ordering::Release);
+    Ok(())
+}
+
 /// True in threaded mode after [`enable`] has run (the driver is installed).
 pub fn enabled() -> bool {
     PAR.sched.get().is_some()

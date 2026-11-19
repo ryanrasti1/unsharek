@@ -224,8 +224,8 @@ checksum = "9f1f0d310082fd5de539d4f41601182241147498444a7695c520288a0cdbead6"
 name = "exobox"
 version = "0.0.0"
 dependencies = [
- "cc",
  "clap",
+ "exobox-build",
  "exobox-erofs",
  "exobox-fixtures",
  "exobox-rt",
@@ -243,6 +243,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "exobox-build"
+version = "0.0.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "exobox-erofs"
 version = "0.0.0"
 dependencies = [
@@ -250,6 +257,20 @@ dependencies = [
  "object",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "exobox-examples"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "exobox",
+ "exobox-build",
+ "exobox-erofs",
+ "exobox-fixtures",
+ "futures-io",
+ "libc",
+ "tempfile",
 ]
 
 [[package]]

@@ -30,6 +30,7 @@ pub mod guest;
 pub mod host;
 pub mod memblk;
 pub mod par;
+pub mod passthrough;
 pub mod sched;
 pub mod share;
 pub mod sync;

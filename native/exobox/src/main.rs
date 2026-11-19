@@ -19,12 +19,10 @@ enum Command {
     Run {
         #[arg(long, value_enum, default_value_t = Mode::Coroutine)]
         mode: Mode,
-        /// What a disallowed host syscall gets.
-        #[arg(long, value_enum, default_value_t = Deny::Kill)]
+        /// What a disallowed host syscall gets: a debugging knob for the escape tests (errno:
+        /// EPERM, so a probe lives to report it).
+        #[arg(long, value_enum, default_value_t = Deny::Kill, hide = true)]
         deny: Deny,
-        /// Allow one more host syscall: name[:argN=V|argN=LO..HI,...]. Repeatable.
-        #[arg(long = "allow", value_name = "RULE")]
-        rules: Vec<exobox::Rule>,
         /// More the program may see and map: a store path (with its closure) or a host path
         /// (read-only). Repeatable.
         #[arg(long = "allow-path", value_name = "PATH")]
@@ -56,7 +54,7 @@ enum Deny {
 }
 
 fn main() -> ExitCode {
-    let Command::Run { mode, deny, rules, allow_paths, images, max_procs, argv } = Cli::parse().command;
+    let Command::Run { mode, deny, allow_paths, images, max_procs, argv } = Cli::parse().command;
     let config = exobox::Config {
         mode: match mode {
             Mode::Coroutine => exobox::Mode::Coroutine,
@@ -67,7 +65,6 @@ fn main() -> ExitCode {
             Deny::Kill => exobox::Deny::Kill,
             Deny::Errno => exobox::Deny::Errno,
         },
-        rules,
         allow_paths,
         images,
         max_procs,

@@ -195,11 +195,7 @@ fn cases() -> Vec<Case> {
         // The filter.
         fixture("escape", ALL).args(vec![Arg::Secret]).flags(&["--deny=errno"]).native(None),
         fixture("escape_gate", ALL).flags(&["--deny=errno"]).native(None),
-        fixture("escape_gate", ALL)
-            .renamed("escape_gate_allow")
-            .flags(&["--deny=errno", "--allow=getppid"])
-            .env(&[("EXOBOX_TEST_ALLOW_NR", "110")])
-            .native(None),
+        // A restriction (Builder::restrict) on top of the mode's list: tests/guest.rs.
         case(
             "escape_kill",
             Prog::Fixture("escape_kill"),
@@ -362,6 +358,9 @@ fn sysaudit_check(out: &str) -> Result<(), String> {
     // a signal queued to another pid with si_code >= 0 is EPERM (do_rt_sigqueueinfo checks that
     // first), and a futex op that doesn't exist (the buffer's address as the op) is ENOSYS.
     const SERVED_AS: &[(&str, &str)] = &[("rt_sigqueueinfo", "EPERM"), ("rt_tgsigqueueinfo", "EPERM"), ("futex", "ENOSYS")];
+    // Served, and the buffer's address as the mode decides the answer (its file type bits): a
+    // device node's is EPERM, an invalid type's EINVAL. Either is served.
+    const SERVED_OR: &[(&str, &str)] = &[("mknod", "EPERM"), ("mknodat", "EPERM")];
     let class = |nr: i64| -> &'static str {
         let name = syscalls::Sysno::new(nr as usize).map(|s| s.name()).unwrap_or("");
         if let Some((_, as_)) = SERVED_AS.iter().find(|(n, _)| *n == name) {
@@ -388,7 +387,8 @@ fn sysaudit_check(out: &str) -> Result<(), String> {
             Err(_) => result, // signalN, hang, none
         };
         let want = class(nr);
-        if got != want {
+        let name = syscalls::Sysno::new(nr as usize).map(|s| s.name()).unwrap_or("");
+        if got != want && !SERVED_OR.contains(&(name, got)) {
             wrong.push(format!("{nr} ({}): {result}, wanted {want}", syscalls::Sysno::new(nr as usize).map(|s| s.name()).unwrap_or("?")));
         }
     }
