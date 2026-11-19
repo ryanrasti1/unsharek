@@ -40,8 +40,32 @@ static COUNT: AtomicUsize = AtomicUsize::new(0);
 /// A guest syscall (generic number), as the caller makes them.
 pub type Syscall = fn(c_long, [usize; 6]) -> isize;
 
+/// One extent of a memblk disk (the kernel's `struct lkl_memblk_extent`): `len` bytes, a whole
+/// number of 512-byte sectors and not 0, of host memory at `addr`, or zeros when `addr` is 0.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Extent {
+    pub addr: u64,
+    pub len: u64,
+}
+const _: () = assert!(size_of::<Extent>() == 16);
+
+/// At most this many extents make one disk (the kernel's `MEMBLK_MAX_EXTENTS`).
+pub const MAX_EXTENTS: usize = 1 << 20;
+
+/// A new memblk disk of `extents`, in order; returns its device number (`new_encode_dev`'s, as
+/// `mknod` takes it). The kernel copies the table: where a block is in host memory is the
+/// caller's to know from its own (the kernel has no call for it). Not registered for [`pread`]
+/// and [`locate`]: [`add`] does that for a disk of one mapping.
+///
+/// # Safety
+/// Each extent's memory stays mapped, readable and unchanged for as long as the process lives.
+pub unsafe fn disk(sys: Syscall, extents: &[Extent]) -> Result<usize, Errno> {
+    res(sys(l::__lkl__NR_memblk_add, [extents.as_ptr() as usize, extents.len(), 0, 0, 0, 0]))
+}
+
 /// Make `[addr, addr + len)` (host memory, read-only and unchanged for the process's life) the
-/// guest's next memblk disk; returns its device number (`new_encode_dev`'s, as `mknod` takes it).
+/// guest's next memblk disk, of that one extent; returns its device number (`new_encode_dev`'s, as `mknod` takes it).
 /// `in_zone`: where the same image is mapped privately in the arena's image zone, if it is.
 ///
 /// # Safety
@@ -53,7 +77,8 @@ pub unsafe fn add(sys: Syscall, addr: *const u8, len: usize, in_zone: Option<usi
     if n == MAX {
         return Err(Errno::NOSPC);
     }
-    let dev = res(sys(l::__lkl__NR_memblk_add, [addr as usize, len, 0, 0, 0, 0]))?;
+    // SAFETY: the caller's.
+    let dev = unsafe { disk(sys, &[Extent { addr: addr as u64, len: len as u64 }]) }?;
     DEV[n].store(dev, Ordering::Relaxed);
     ADDR[n].store(addr as usize, Ordering::Relaxed);
     LEN[n].store(len, Ordering::Relaxed);
@@ -69,7 +94,7 @@ fn res(r: isize) -> Result<usize, Errno> {
 /// `include/uapi/linux/fiemap.h`.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct Extent {
+struct FiemapExtent {
     logical: u64,
     physical: u64,
     length: u64,
@@ -77,7 +102,7 @@ struct Extent {
     flags: u32,
     reserved: [u32; 3],
 }
-const _: () = assert!(size_of::<Extent>() == 56);
+const _: () = assert!(size_of::<FiemapExtent>() == 56);
 
 /// How many extents one call asks for: a flat erofs file is one.
 const EXTENTS: usize = 4;
@@ -91,7 +116,7 @@ struct Fiemap {
     mapped_extents: u32,
     extent_count: u32,
     reserved: u32,
-    extents: [Extent; EXTENTS],
+    extents: [FiemapExtent; EXTENTS],
 }
 
 /// `_IOWR('f', 11, struct fiemap)`.
