@@ -149,6 +149,8 @@ struct Thread {
     /// whether its probe ran one ([`futex_call`]).
     handled: Cell<u32>,
     handled_restart: Cell<bool>,
+    /// [`Sched::interrupts`] when this thread's futex wait last asked the kernel ([`futex_call`]).
+    asked: Cell<u64>,
     /// Fork mode, during a clone that makes a process: the child's stack (0: the parent's) and FS
     /// base, for the `fork` host op inside the call (`fork::fork_op`).
     fork_sp: Cell<usize>,
@@ -220,6 +222,7 @@ static S: State = State {
             quiet: Cell::new(None),
             handled: Cell::new(0),
             handled_restart: Cell::new(false),
+            asked: Cell::new(0),
             fork_sp: Cell::new(0),
             fork_fs: Cell::new(0),
         }
@@ -2062,14 +2065,26 @@ fn futex_call(a: [usize; 6]) -> isize {
         op = futex::FUTEX_WAIT_BITSET | (op & futex::FUTEX_PRIVATE_FLAG);
         val3 = futex::FUTEX_BITSET_MATCH_ANY;
     }
+    let t = cur();
+    let wait = cmd == futex::FUTEX_WAIT || cmd == futex::FUTEX_WAIT_BITSET;
     loop {
         // A wait of the runtime's own, not the kernel's: a group exit, an exec's kill or a signal
         // can't reach it, so `SCHED.interrupt_waits` wakes it (Interrupted: EINTR here) to ask.
-        SCHED.set_interruptible(true);
-        // SAFETY: uaddr is program memory (checked).
-        // Keyed by this process (fork mode: each process's memory is its own).
-        let r = unsafe { futexes().futex_in(&SCHED, par::proc_id(), uaddr as *const u32, op, val, ts.as_ref(), val3) };
-        SCHED.set_interruptible(false);
+        // That wakes only threads already in the wait: one sent since this thread last asked
+        // finds it on its way in (in threaded mode, waiting for the CPU token the sender held),
+        // so it asks first, as Linux's futex_wait checks signal_pending before it sleeps.
+        // (Without this, glibc's setresuid, which signals every other thread and waits for each,
+        // hung guest-tests' files::devnodes: signal_futex_race.)
+        let r = if wait && t.asked.get() != SCHED.interrupts() {
+            Err(Errno::INTR)
+        } else {
+            SCHED.set_interruptible(true);
+            // SAFETY: uaddr is program memory (checked).
+            // Keyed by this process (fork mode: each process's memory is its own).
+            let r = unsafe { futexes().futex_in(&SCHED, par::proc_id(), uaddr as *const u32, op, val, ts.as_ref(), val3) };
+            SCHED.set_interruptible(false);
+            r
+        };
         if r != Err(Errno::INTR) {
             return ret(r);
         }
@@ -2078,8 +2093,8 @@ fn futex_call(a: [usize; 6]) -> isize {
         // wait on an unchanged word waits again (the wake is invisible; a timed one to its
         // deadline); otherwise a wakeup for nothing, which a futex wait may return (0). A handler ran: EINTR, as Linux's
         // (or the wait again, for an untimed wait under SA_RESTART: Linux's -ERESTARTSYS).
-        let t = cur();
         let before = t.handled.get();
+        t.asked.set(SCHED.interrupts());
         lkl_call(l::__lkl__NR_getpid, [0; 6]);
         if t.handled.get() == before {
             // SAFETY: program memory (checked), 4-aligned (futex checked), read atomically.

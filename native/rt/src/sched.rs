@@ -281,6 +281,8 @@ pub struct Sched {
     par: Cell<Option<&'static dyn Par>>,
     /// Coroutines marked [`Sched::set_interruptible`].
     interruptible: Cell<usize>,
+    /// [`Sched::interrupt_waits`] calls so far, waiters or not ([`Sched::interrupts`]).
+    interrupts: Cell<u64>,
 }
 
 /// Threaded mode's scheduler driver (`par`): the single hook [`Sched::schedule`] delegates to when
@@ -354,6 +356,7 @@ impl Sched {
             tls_dtors: [const { Cell::new(None) }; TLS_KEYS],
             par: Cell::new(None),
             interruptible: Cell::new(0),
+            interrupts: Cell::new(0),
         }
     }
 
@@ -880,6 +883,7 @@ impl Sched {
     /// kill, a signal) that it only learns at the task's next call. Each such waiter then makes
     /// one (the guest's futex, the host fd's restart). Cheap when there are none.
     pub fn interrupt_waits(&self) {
+        self.interrupts.set(self.interrupts.get().wrapping_add(1));
         if self.interruptible.get() == 0 {
             return;
         }
@@ -889,6 +893,14 @@ impl Sched {
                 self.resume(i, Wake::Interrupted);
             }
         }
+    }
+
+    /// How many times [`Sched::interrupt_waits`] was called, whether or not anything waited: a
+    /// coroutine about to enter such a wait that last asked the kernel before the latest call asks
+    /// again first (the call that sent its signal came while it was on its way into the wait, not
+    /// in it, and woke nothing for it).
+    pub fn interrupts(&self) -> u64 {
+        self.interrupts.get()
     }
 
     /// Make a blocked coroutine runnable. If it was on a wait queue it leaves it, with

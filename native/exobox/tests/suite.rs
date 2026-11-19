@@ -369,6 +369,7 @@ fn cases() -> Vec<Case> {
         // (one host thread, and user code isn't preempted).
         fixture("busy_sleep", THREADED_FORK).args(vec![Arg::Lit("user")]),
         fixture("busy_sleep", ALL).renamed("busy_sleep_calls").args(vec![Arg::Lit("calls")]),
+        fixture("signal_futex_race", ALL),
         // cargo, rustup-less: Rust's std probes statx with NULLs (statx_probe), which crashed every
         // cargo at startup. Its build in fork mode: cargo, rustc and cc, each a process of its own.
         case("cargo_version", Prog::External("EXOBOX_TEST_CARGO"), ALL, ok("cargo ")).args(vec![Arg::Lit("--version")]),
