@@ -574,6 +574,12 @@ unsafe extern "C" fn timer_alloc(f: Option<unsafe extern "C" fn()>) -> *mut c_vo
 
 /// Fire once, `delta` ns from now. Saturating (`Timer::set_oneshot`): LKL's clockevent allows
 /// ULONG_MAX, "no event".
+/// A kernel timer is armed (threaded mode's `par::give`: the idler must get the token, if only to
+/// run the timer's coroutine, which puts the deadline on the heap).
+pub fn timer_armed() -> bool {
+    TIMER_POOL.slots.iter().any(|s| s.used.get() && s.get().timer.is_armed())
+}
+
 unsafe extern "C" fn timer_set_oneshot(timer: *mut c_void, delta: c_ulong) -> c_int {
     // SAFETY: LKL passes what timer_alloc gave it.
     unsafe { TIMER_POOL.slot(timer) }.get().timer.set_oneshot(delta);

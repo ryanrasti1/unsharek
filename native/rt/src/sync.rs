@@ -157,6 +157,14 @@ pub struct Timer {
     tid: Cell<Option<Tid>>,
 }
 
+impl Timer {
+    /// Armed: it will fire (its deadline may not be on the scheduler's heap yet: its coroutine
+    /// puts it there when it next runs).
+    pub fn is_armed(&self) -> bool {
+        self.state.get() == TimerState::Armed
+    }
+}
+
 impl Default for Timer {
     fn default() -> Self {
         Self::new()
