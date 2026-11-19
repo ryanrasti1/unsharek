@@ -14,6 +14,38 @@
 use seccomp_fn::examples::*;
 use seccomp_fn::*;
 
+// Over 255 instructions, so its far jumps go through JA. Here, not in the examples: its proof
+// takes more than ten minutes (the proof's cost grows with the program's length, about
+// quadratically), so it is checked by its sampled test and against the kernel only.
+/// Long enough that its jumps go through JA: a row per number, all to one shared verdict.
+#[seccomp]
+fn long(d: &SeccompData, k: u64) -> u32 {
+    if d.nr == 2000 || d.args[0] == k || d.args[1] == k || d.args[2] == k || d.args[3] == k
+        || d.args[4] == k || d.args[5] == k || d.instruction_pointer == k
+        || d.args[0] == 1 || d.args[1] == 1 || d.args[2] == 1 || d.args[3] == 1 || d.args[4] == 1 || d.args[5] == 1
+        || d.args[0] == 2 || d.args[1] == 2 || d.args[2] == 2 || d.args[3] == 2 || d.args[4] == 2 || d.args[5] == 2
+        || d.args[0] == 3 || d.args[1] == 3 || d.args[2] == 3 || d.args[3] == 3 || d.args[4] == 3 || d.args[5] == 3
+        || d.args[0] == 4 || d.args[1] == 4 || d.args[2] == 4 || d.args[3] == 4 || d.args[4] == 4 || d.args[5] == 4
+        || d.args[0] == 5 || d.args[1] == 5 || d.args[2] == 5 || d.args[3] == 5 || d.args[4] == 5 || d.args[5] == 5
+        || d.args[0] == 6 || d.args[1] == 6 || d.args[2] == 6 || d.args[3] == 6 || d.args[4] == 6 || d.args[5] == 6
+        || d.args[0] == 7 || d.args[1] == 7 || d.args[2] == 7 || d.args[3] == 7 || d.args[4] == 7 || d.args[5] == 7
+        || d.args[0] == 8 || d.args[1] == 8 || d.args[2] == 8 || d.args[3] == 8 || d.args[4] == 8 || d.args[5] == 8
+        || d.args[0] == 9 || d.args[1] == 9 || d.args[2] == 9 || d.args[3] == 9 || d.args[4] == 9 || d.args[5] == 9
+        || d.args[0] < 10 || d.args[1] > 10 || d.args[2] <= 10 || d.args[3] >= 10 || d.args[4] != 10
+    {
+        return SECCOMP_RET_ERRNO | (100 + 10);
+    }
+    SECCOMP_RET_ALLOW
+}
+
+
+#[test]
+fn long_needs_ja() {
+    let prog = long_bpf(11);
+    assert!(prog.len() > 256, "{} instructions", prog.len());
+    assert!(prog.iter().any(|i| i.code == 0x05), "no JA");
+}
+
 std::arch::global_asm!(
     ".globl seccomp_fn_probe",
     "seccomp_fn_probe:",
