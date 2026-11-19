@@ -510,9 +510,12 @@ impl Guest {
         })
     }
 
-    /// Install the network hooks, begin setup (the routing filter in, if it isn't), write the
-    /// resolver's files if a hook resolves, run `lockdown` (the security filter), start the
-    /// hooks' `on_start` task, exec.
+    /// Install the network hooks, begin setup (the routing filter in, if it isn't), run
+    /// `lockdown` (the security filter), start the hooks' `on_start` task, exec.
+    ///
+    /// Nothing here touches the guest's files: this runs after the caller's guards, as init with
+    /// the credentials they left (a `setresuid` to a build user), which the exec is meant to have
+    /// and exobox's own writes are not (the resolver's files are written at build).
     fn launch(
         mut self,
         hooks: net::Hooks,
@@ -524,19 +527,9 @@ impl Guest {
         self.own(None)?;
         let args: Vec<&[u8]> = argv.iter().map(|a| a.as_bytes()).collect();
         let envs: Vec<&[u8]> = env.iter().map(|a| a.as_bytes()).collect();
-        let (resolves, on_start) = hooks.install();
+        let on_start = hooks.install();
         guest::route()?;
         guest::intercept_begin()?;
-        let r = (|| {
-            if resolves {
-                setup::resolver().map_err(Error::io("the guest's resolver"))?;
-            }
-            Ok(())
-        })();
-        if let Err(e) = r {
-            guest::intercept_end();
-            return Err(e);
-        }
         lockdown()?;
         if let Some(f) = on_start {
             exobox_rt::executor::spawn(f(Cx));
@@ -668,9 +661,14 @@ impl Builder {
     }
 
     /// Boot the guest for the mode. Fork mode's processes share the kernel's memory, mapped
-    /// shared here.
+    /// shared here. When the program's names resolve (an `on_resolve` or `on_connect` hook), the
+    /// guest's `/etc/resolv.conf` and `/etc/hosts` are written now, root's ([`setup::resolver`]):
+    /// a guard may change them.
     pub fn build(self) -> Result<Sandbox, Error> {
         let guest = Guest::boot_as(self.config, self.mode == Mode::Fork)?;
+        if self.hooks.resolves() {
+            setup::resolver().map_err(Error::io("the guest's resolver"))?;
+        }
         let token_fds = if self.mode != Mode::Coroutine {
             // Make the CPU-token eventfds and switch the runtime to threaded (before lockdown),
             // then start the kernel idler host thread and wait for it to install its signal stack.
@@ -884,10 +882,10 @@ impl Sandbox {
         }
     }
 
-    /// Lockdown and exec: the routing filter (if no guard installed it), the network hooks, the
-    /// guest's resolver files when names resolve, then the security filter (the mode's, and the
-    /// restrictions) and the exec of `argv[0]` inside the guest with `argv` and `env` (each
-    /// `NAME=value`). Never returns on success: the process's status is the program's. On failure
+    /// Lockdown and exec: the routing filter (if no guard installed it), the network hooks
+    /// (whose resolver files, when names resolve, [`Builder::build`] wrote), then the security
+    /// filter (the mode's, and the restrictions) and the exec of `argv[0]` inside the guest with
+    /// `argv` and `env` (each `NAME=value`), as init with the credentials the guards left. Never returns on success: the process's status is the program's. On failure
     /// the error is the caller's to report and exit with (after lockdown its syscalls are the
     /// guest's, and printing and exiting work through it).
     ///

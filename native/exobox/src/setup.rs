@@ -106,12 +106,34 @@ fn close(fd: usize) {
 pub const NAMESERVER: &str = "10.0.2.3";
 
 /// The guest's `/etc/resolv.conf` (naming [`NAMESERVER`]) and `/etc/hosts` (localhost: no query
-/// for it). Called by `run` when there is an `on_resolve` hook, as init, before `pre_exec`.
+/// for it), root's, 0644. Written by [`Builder::build`](crate::Builder::build) when names resolve
+/// (an `on_resolve` or `on_connect` hook), as init at boot, before any guard: a guard may then
+/// change them or chown them, and nothing is written for them after the guards, whose
+/// credentials (a `setresuid` to a build user) it would have had (it failed with EACCES).
+/// Direct guest calls: outside a guard or in one.
 pub fn resolver() -> io::Result<()> {
-    std::fs::create_dir_all("/etc")?;
+    mkdir(c"/etc", 0o755)?;
     // One attempt, two seconds: the answer is local, a lost one isn't coming.
-    std::fs::write("/etc/resolv.conf", format!("nameserver {NAMESERVER}\noptions timeout:2 attempts:1\n"))?;
-    std::fs::write("/etc/hosts", "127.0.0.1 localhost\n::1 localhost\n")
+    write_file(c"/etc/resolv.conf", format!("nameserver {NAMESERVER}\noptions timeout:2 attempts:1\n").as_bytes())?;
+    write_file(c"/etc/hosts", b"127.0.0.1 localhost\n::1 localhost\n")
+}
+
+/// `data` as the guest's file `path`, made or truncated.
+fn write_file(path: &CStr, mut data: &[u8]) -> io::Result<()> {
+    let flags = (libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC) as usize;
+    let fd = sys(l::__lkl__NR_openat, [AT_FDCWD, p(path), flags, 0o644, 0, 0])?;
+    let mut r = Ok(());
+    while !data.is_empty() {
+        match sys(l::__lkl__NR_write, [fd, data.as_ptr() as usize, data.len(), 0, 0, 0]) {
+            Ok(n) => data = &data[n..],
+            Err(e) => {
+                r = Err(e);
+                break;
+            }
+        }
+    }
+    close(fd);
+    r
 }
 
 /// Host fd `host` as guest fd `guest`: a guest file whose reads and writes the runtime does on

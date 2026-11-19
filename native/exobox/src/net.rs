@@ -306,10 +306,15 @@ impl OnResolve {
 }
 
 impl Hooks {
-    /// The network hooks, given to the runtime: whether names resolve (the guest's resolver
-    /// files are then written), and the task to start at lockdown. With an `on_connect` and no
-    /// `on_resolve`, names resolve to addresses of their own ([`Cx::address_for`]).
-    pub(crate) fn install(self) -> (bool, Option<StartFn>) {
+    /// Whether the program's names resolve: an `on_resolve`, or an `on_connect` (names then
+    /// resolve to addresses of their own, [`Cx::address_for`]). The guest's resolver files are
+    /// written for it at build (`setup::resolver`).
+    pub(crate) fn resolves(&self) -> bool {
+        self.on_resolve.0.is_some() || self.on_connect.0.is_some()
+    }
+
+    /// The network hooks, given to the runtime: the task to start at lockdown.
+    pub(crate) fn install(self) -> Option<StartFn> {
         let resolve = match (self.on_resolve.0, &self.on_connect.0) {
             (Some(r), _) => Some(r),
             (None, Some(_)) => OnResolve::new(|cx: Cx, _, name: String| {
@@ -319,9 +324,8 @@ impl Hooks {
             .0,
             (None, None) => None,
         };
-        let resolves = resolve.is_some();
         tsi::set_hooks(tsi::Hooks { connect: self.on_connect.0, listen: self.on_listen.0, resolve });
-        (resolves, self.on_start)
+        self.on_start
     }
 }
 
