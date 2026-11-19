@@ -1,0 +1,15 @@
+[package]
+name = "seccomp-fn"
+description = "A seccomp filter as a plain Rust function, compiled to classic BPF and proven equal to it by Kani"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+seccomp-fn-macros = { path = "../seccomp-fn-macros", version = "0.0.0" }
+# seccomp(2), the syscall numbers
+libc = "0.2"
+
+[lints]
+workspace = true
