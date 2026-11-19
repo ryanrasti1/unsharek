@@ -43,9 +43,10 @@ in
     name = "seccomp-fn-proof";
     src = pkgs.lib.fileset.toSource {
       root = ../.;
+      # not target/ (a build outside a git tree sees it)
       fileset = pkgs.lib.fileset.unions [ ../Cargo.toml ../Cargo.lock ../seccomp-fn ../seccomp-fn-macros ];
     };
     cargoLock = ../Cargo.lock;
-    runs = [ [ "-p" "seccomp-fn" ] ];
+    runs = [ [ "-p" "seccomp-fn" "-j" "--output-format=terse" ] ];
   };
 }

@@ -164,9 +164,16 @@ impl Cx {
     /// conjuncts without `d` (`threads && ...`) are decided at build time: an arm they rule out
     /// is not emitted.
     fn matches(&mut self, m: &syn::ExprMatch, pos: &Pos) -> R<Ts> {
-        match self.field(&m.expr)? {
+        // `d.nr`, or `d.nr` widened without changing its value (`as i64`, to match libc's
+        // `SYS_*` as they are): a pattern outside u32's range then matches no call, in Rust and
+        // in the program alike
+        let scrutinee = match &*m.expr {
+            Expr::Cast(c) if matches!(&*c.ty, syn::Type::Path(p) if p.path.get_ident().is_some_and(|i| ["i64", "u64", "i128", "u128"].iter().any(|s| i == s))) => &*c.expr,
+            e => e,
+        };
+        match self.field(scrutinee)? {
             Some(f) if f.to_string() == quote!(::seccomp_fn::Field::Nr).to_string() => {}
-            _ => return err(&m.expr, "`match` on anything but `d.nr`"),
+            _ => return err(&m.expr, "`match` on anything but `d.nr` (or `d.nr as i64`)"),
         }
         // The arms up to the first `_` without a guard (the rest are unreachable).
         let mut arms = vec![];
@@ -227,7 +234,7 @@ impl Cx {
                 let nrs: Vec<&&Pat> = pats.iter().collect();
                 self.insns += 1 + nrs.len();
                 self.jumps += nrs.len();
-                quote!(__b.nr_in(&[#(#nrs),*], #then, #next))
+                quote!(__b.nr_in(&[#((#nrs) as i128),*], #then, #next))
             };
             let arm_code = quote!({ let #entry = #body; let #then = #guarded; #test });
             code = if pure.is_empty() {
@@ -412,8 +419,10 @@ fn expand(f: &ItemFn) -> R<Ts> {
                 let (#(#shape_names),*) = __shapes[#i];
                 #(#ints)*
                 let __d: ::seccomp_fn::SeccompData = kani::any();
-                let __prog = #bpf(#(#names),*);
-                assert_eq!(::seccomp_fn::run_bpf(&__prog, &__d), #name(&__d, #(#names),*));
+                // the program name_bpf returns (a copy of this, `to_vec`)
+                let __b = #builder(#(#names),*);
+                let __prog = __b.program();
+                assert_eq!(::seccomp_fn::run_bpf(__prog, &__d), #name(&__d, #(#names),*));
             }
         }
     });
@@ -434,8 +443,8 @@ fn expand(f: &ItemFn) -> R<Ts> {
         #f
 
         #[allow(unused_variables, unused_braces, clippy::all)]
-        fn #builder(#params) -> ::seccomp_fn::Builder {
-            let mut __b = ::seccomp_fn::Builder::with_capacity(#bound);
+        fn #builder(#params) -> ::seccomp_fn::Builder<#bound> {
+            let mut __b = ::seccomp_fn::Builder::<#bound>::new();
             let _: ::seccomp_fn::Label = #body;
             __b
         }

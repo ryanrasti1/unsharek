@@ -165,3 +165,20 @@ pub fn abi(d: &SeccompData) -> u32 {
     }
     SECCOMP_RET_ERRNO | 101
 }
+
+/// README.md's example, as it is there: libc's `SYS_*` (`i64`), matched on `d.nr as i64`.
+pub mod readme {
+    use super::AUDIT_ARCH_X86_64;
+    use crate::{SeccompData, seccomp};
+    use libc::{SECCOMP_RET_ALLOW, SECCOMP_RET_KILL_PROCESS, SYS_kill, SYS_read, SYS_write};
+
+    #[seccomp]
+    pub fn policy(d: &SeccompData, pid: u64) -> u32 {
+        if d.arch != AUDIT_ARCH_X86_64 { return SECCOMP_RET_KILL_PROCESS; }
+        match d.nr as i64 {
+            SYS_read | SYS_write => SECCOMP_RET_ALLOW,
+            SYS_kill if d.args[0] == pid && d.args[1] >= 1 && d.args[1] <= 64 => SECCOMP_RET_ALLOW,
+            _ => SECCOMP_RET_KILL_PROCESS,
+        }
+    }
+}
