@@ -55,6 +55,8 @@ enum Arg {
     Marker,
     Fixture(&'static str),
     Denied(&'static str),
+    /// The path a devshell variable names (a program from nixpkgs, as data).
+    Env(&'static str),
 }
 
 #[derive(Clone, Copy)]
@@ -302,6 +304,16 @@ fn cases() -> Vec<Case> {
             stdout_delay: Duration::from_millis(300),
             ..fixture("stdout_full", FORK).renamed("stdout_full_child").args(vec![Arg::Lit("child"), Arg::Lit("nonblock")])
         },
+        // The program that found it: xz's threads writing a nonblocking stdout into a pipe that
+        // fills (xz polls for POLLOUT at each EAGAIN). It hung ~4 runs in 6 in threaded and fork
+        // mode before the idle wait watched every waited-on host fd. Compresses bash's binary
+        // (~1.4 MB in, ~0.5 MB out: several pipefuls); the output starts with xz's magic.
+        Case {
+            stdout_delay: Duration::from_millis(300),
+            ..case("xz_pipe", Prog::External("EXOBOX_TEST_XZ"), ALL, Expect { stdout: vec!["7zXZ"], ..status(Status::Code(0)) })
+                .args(vec![Arg::Lit("-T2"), Arg::Lit("-3"), Arg::Lit("--block-size=128KiB"), Arg::Lit("-c"), Arg::Env("EXOBOX_TEST_BASH")])
+                .uses(&["EXOBOX_TEST_BASH"])
+        },
         Case {
             stdout_delay: Duration::from_millis(300),
             ..fixture("stdout_full", FORK)
@@ -469,6 +481,7 @@ fn run(c: &Case, mode: Mode, secret: &PathBuf) -> Result<(), Failed> {
         Arg::Marker => marker.clone(),
         Arg::Fixture(name) => fx::bin(name),
         Arg::Denied(name) => fx::denied_dir().join(name),
+        Arg::Env(var) => env::var_os(var).map(PathBuf::from).unwrap_or_default(),
     });
     let mut cmd = if mode == Mode::Native {
         Command::new(&prog)
