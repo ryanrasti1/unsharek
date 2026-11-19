@@ -1,10 +1,13 @@
 //! Compiles c/*.c into $OUT_DIR/bin (the examples' own guest programs), with the compiler `cc`
-//! finds (the devshell's gcc, whose glibc is a store path: the program's closure comes with it).
+//! finds (the devshell's gcc, whose glibc is a store path: the program's closure comes with it),
+//! and links the examples' binaries at a fixed address (`exobox_build::link_fixed_address`).
 
 use std::path::PathBuf;
 use std::{env, fs};
 
 fn main() {
+    // Linked as the exobox CLI is: at a fixed address, not a PIE (exobox-build says why).
+    exobox_build::link_fixed_address();
     let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("bin");
     let src = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("c");
     fs::create_dir_all(&out).unwrap();

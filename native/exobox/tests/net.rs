@@ -1,13 +1,17 @@
 //! The program's network through a sandbox's hooks (`exobox::net`), each case a sandbox in a
 //! child process of its own (this binary re-run), named `<case>::coroutine` as the suite's are.
 //!
-//! The provider plays capnix's part: it holds ONE fd (a socketpair end, the child's fd 3), starts
-//! its session on first use (`cx.spawn`: a reader and a writer task) and multiplexes every
+//! The provider plays capnix's part: it holds ONE fd (a socketpair end, the child's fd 3, held as
+//! "net" and found by its hooks with `cx.held`), starts its session at lockdown (`on_start`: a
+//! reader and a writer task) and multiplexes every
 //! connect and lookup over it with a trivial framing (stream id, op, length, bytes), one stream
 //! per connect. This process holds the other end: a proxy that makes real loopback TCP
 //! connections to the echo and HTTP servers it started (any 10.0.0.0/8 address, port P, is
 //! 127.0.0.1:P; 10.0.0.66 is refused, 10.0.0.67 denied, 10.0.0.68 reset once connected) and answers lookups from a table
 //! (`echo.test` 10.0.0.1, `web.test` 10.0.0.2, `denied.test` denied, others no such name).
+//! The `named` kind has no resolver: names get exobox's own addresses (10.64.0.0/10, which the
+//! proxy also takes for loopback), and its `on_connect` allows `web.test` alone, by name
+//! (`cx.name_of`).
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -18,7 +22,7 @@ use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
@@ -27,7 +31,7 @@ use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::Duration;
 
-use exobox::{Cx, HeldFd, Hooks, NetError, OnConnect, OnListen, OnResolve, PreExec};
+use exobox::{Cx, HeldFd, NetError, OnConnect, OnListen, OnResolve};
 use exobox_fixtures as fx;
 use futures_io::{AsyncRead, AsyncWrite};
 use libtest_mimic::{Arguments, Failed, Trial};
@@ -325,13 +329,23 @@ impl futures_core::Stream for OneConn {
 /// capnweb-rs's stacker does (it reads /proc/self/maps for the stack's bounds).
 static STRAY_SYSCALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn provider(fd: HeldFd) -> (OnConnect, OnResolve, OnListen) {
-    let connect = OnConnect::new(move |cx: Cx, _pid, addr: SocketAddr| async move {
+/// The held fd the hooks talk over (the child's own, under a name: the hooks are given at build).
+fn net_fd(cx: &Cx) -> HeldFd {
+    cx.held("net").expect("no fd held as \"net\"")
+}
+
+/// The connect hook: through the proxy, if `allow` says so of the name the address was resolved
+/// from.
+fn connect_hook(allow: fn(Option<String>) -> bool) -> OnConnect {
+    OnConnect::new(move |cx: Cx, _pid, addr: SocketAddr| async move {
         if STRAY_SYSCALL.load(std::sync::atomic::Ordering::Relaxed) {
             // SAFETY: getpid has no arguments.
             unsafe { libc::getpid() };
         }
-        let s = session(cx, fd);
+        if !allow(cx.name_of(addr.ip())) {
+            return Err(NetError::Refused);
+        }
+        let s = session(cx, net_fd(&cx));
         let SocketAddr::V4(a) = addr else { return Err(NetError::Unsupported) };
         let mut p = a.ip().octets().to_vec();
         p.extend_from_slice(&a.port().to_be_bytes());
@@ -343,9 +357,13 @@ fn provider(fd: HeldFd) -> (OnConnect, OnResolve, OnListen) {
                 Err(error_of(&data))
             }
         }
-    });
+    })
+}
+
+fn provider() -> (OnConnect, OnResolve, OnListen) {
+    let connect = connect_hook(|_| true);
     let resolve = OnResolve::new(move |cx: Cx, _pid, name: String| async move {
-        let s = session(cx, fd);
+        let s = session(cx, net_fd(&cx));
         let (_, op, data) = request(&s, RESOLVE, name.as_bytes(), false).await;
         match op {
             ADDRS => Ok(data.chunks(4).map(|c| IpAddr::V4(Ipv4Addr::new(c[0], c[1], c[2], c[3]))).collect()),
@@ -359,36 +377,38 @@ fn provider(fd: HeldFd) -> (OnConnect, OnResolve, OnListen) {
     (connect, resolve, listen)
 }
 
-/// The child: a sandbox for argv (`ARGV`), with the provider (`provider`), none (`nohooks`), or
-/// fd 3 passed as fd 1000 (`passfd`).
+/// The child: a sandbox for argv (`ARGV`), with the provider (`provider`), the name-based one
+/// (`named`), none (`nohooks`), or fd 3 passed as fd 1000 (`passfd`).
 fn child(kind: &str) -> ! {
     let argv: Vec<OsString> = std::env::var(ARGV).unwrap().split('\x1f').map(OsString::from).collect();
-    let config = exobox::Config {
-        argv: vec![argv[0].clone()],
-        allow_paths: vec![fx::bin_dir()],
-        image_cache: std::env::var_os("EXOBOX_NET_TEST_CACHE").map(PathBuf::from),
-        ..Default::default()
-    };
-    let store = exobox::store(&config).unwrap();
-    let mut sb = exobox::Sandbox::boot(exobox::Mode::Coroutine, exobox::GuestConfig::default()).unwrap();
-    // SAFETY: fd 3 is this process's, from the parent, and nothing else owns it.
-    let fd3 = unsafe { OwnedFd::from_raw_fd(3) };
-    let mut hooks = Hooks::default();
+    let mut b = exobox::Sandbox::builder();
     match kind {
         "provider" | "provider_syscall" => {
             STRAY_SYSCALL.store(kind == "provider_syscall", std::sync::atomic::Ordering::Relaxed);
-            let held = sb.hold_fd(fd3).unwrap();
-            (hooks.on_connect, hooks.on_resolve, hooks.on_listen) = provider(held);
+            let (connect, resolve, listen) = provider();
+            // The session up before the program: no first hook has to start it.
+            b = b.on_connect(connect).on_resolve(resolve).on_listen(listen).on_start(|cx| async move {
+                let _ = session(cx, net_fd(&cx));
+            });
         }
-        "passfd" => {
-            sb.pass_fd(fd3, 1000);
-        }
+        "named" => b = b.on_connect(connect_hook(|name| name.as_deref() == Some("web.test"))),
+        _ => {}
+    }
+    let mut sb = b.build().unwrap();
+    // SAFETY: fd 3 is this process's, from the parent, and nothing else owns it.
+    let fd3 = unsafe { OwnedFd::from_raw_fd(3) };
+    match kind {
+        "provider" | "provider_syscall" | "named" => drop(sb.hold_fd_as("net", fd3).unwrap()),
+        "passfd" => sb.pass_fd(fd3, 1000).unwrap(),
         _ => drop(fd3),
     }
-    let mounts: Vec<_> = store.mounts.iter().map(|m| (sb.map_image(&m.image).unwrap(), m.guest.clone())).collect();
-    hooks.pre_exec = PreExec::new(move || exobox::setup::mount_closure(&mounts));
+    let mounts = sb.map_closure(Path::new(&argv[0]), &[fx::bin_dir()]).unwrap();
+    {
+        let _g = sb.intercept().unwrap();
+        exobox::setup::mount_closure(&mounts).unwrap();
+    }
     let env: Vec<OsString> = vec!["EXOBOX_TEST_MODE=coroutine".into()];
-    let e = sb.run(hooks, &argv, &env).unwrap_err();
+    let e = sb.run(&argv, &env).unwrap_err();
     eprintln!("exobox: {e}");
     std::process::exit(125)
 }
@@ -545,7 +565,7 @@ fn run(kind: &str, argv: &[String], peer: impl FnOnce(UnixStream) + Send + 'stat
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.env(CHILD, kind)
         .env(ARGV, argv.join("\x1f"))
-        .env("EXOBOX_NET_TEST_CACHE", PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("image-cache"))
+        .env("EXOBOX_IMAGE_CACHE", PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("image-cache"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -613,6 +633,28 @@ fn main() {
                 format!("import urllib.request, sys; sys.stdout.write(urllib.request.urlopen({url:?}, timeout=5).read().decode())"),
             ],
             "NET_HTTP_OK",
+        );
+        // No resolver: names get exobox's own addresses, and the connect hook decides by name.
+        let fetch = |host: &str| format!("http://{host}:{}/", s.http);
+        case(
+            "net_named",
+            "named",
+            vec![
+                py.to_string_lossy().into_owned(),
+                "-c".into(),
+                format!(
+                    "import socket, urllib.request, sys\n\
+                     a = socket.gethostbyname('web.test'); b = socket.gethostbyname('other.test')\n\
+                     assert a.startswith('10.') and a != b and socket.gethostbyname('web.test') == a, (a, b)\n\
+                     body = urllib.request.urlopen({:?}, timeout=5).read().decode()\n\
+                     try:\n    urllib.request.urlopen({:?}, timeout=5); sys.exit('other.test connected')\n\
+                     except OSError as e:\n    assert 'refused' in str(e).lower(), e\n\
+                     sys.stdout.write(body.replace('NET_HTTP_OK', 'NET_NAMED_OK'))",
+                    fetch("web.test"),
+                    fetch("other.test")
+                ),
+            ],
+            "NET_NAMED_OK",
         );
     }
     // A socket used after fork is fork mode's (the hooks run in init's process, the child's host

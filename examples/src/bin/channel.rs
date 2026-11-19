@@ -6,13 +6,15 @@
 //!
 //! The filter is widened to `read` and `write` on exactly that host fd: the channel is the
 //! program's one way out, and whatever authority it carries is decided at the parent's end.
+//!
+//! This process builds the sandbox, and `Sandbox::spawn` forks it off to run (a template's
+//! child: `run` takes its process over, so it runs in a process of its own). The parent keeps its
+//! end of the socketpair and talks; its own syscalls stay the host's.
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
 
-use exobox::{GuestConfig, Hooks, Mode, PreExec, Sandbox, setup};
+use exobox::{Mode, Sandbox, setup};
 use exobox_examples as ex;
 
 /// The program: a line-oriented server on fd 1000, until EOF.
@@ -24,41 +26,30 @@ for line in rx:
     tx.write(f"{n * n}\n")
 "#;
 
-/// The sandbox, in a child: its fd 3 (the parent's socketpair end) becomes the guest's fd 1000.
-fn sandbox(python: &Path) -> ! {
-    let run = || -> Result<std::convert::Infallible, exobox::Error> {
-        let mut sb = Sandbox::boot(Mode::Coroutine, GuestConfig::default())?;
-        // SAFETY: fd 3 is ours, put there by the parent (`give_fd`), and nothing else owns it.
-        sb.pass_fd(unsafe { OwnedFd::from_raw_fd(3) }, 1000);
-        let store = ex::mount_closure(&mut sb, python, &[])?;
-        let hooks = Hooks { pre_exec: PreExec::new(move || setup::mount_closure(&store)), ..Default::default() };
-        sb.run(hooks, &ex::os(&[python.to_str().unwrap(), "-c", SQUARES]), &[])
-    };
-    let Err(e) = run();
-    ex::fail(e)
-}
-
-fn main() {
+fn main() -> Result<(), exobox::Error> {
     let python = ex::nix_program("EXOBOX_TEST_PYTHON");
-    if ex::role().as_deref() == Some("sandbox") {
-        sandbox(&python);
-    }
-    let (ours, theirs) = UnixStream::pair().expect("socketpair");
-    let mut cmd = ex::self_command("sandbox");
-    ex::give_fd(&mut cmd, &theirs, 3);
-    let mut child = cmd.spawn().expect("spawn");
-    drop(theirs); // the child's now: our copy would keep its reads from ever seeing EOF
+    let (ours, theirs) = UnixStream::pair()?;
 
-    let mut answers = BufReader::new(ours.try_clone().unwrap());
+    let mut sb = Sandbox::builder().mode(Mode::Coroutine).build()?;
+    sb.pass_fd(theirs.into(), 1000)?;
+    let store = sb.map_closure(&python, &[])?;
+    {
+        let _g = sb.intercept()?;
+        setup::mount_closure(&store)?;
+    }
+    let argv = ex::os(&[python.to_str().unwrap(), "-c", SQUARES]);
+    let child = sb.spawn(move |sb| sb.run(&argv, &[]))?;
+
+    let mut answers = BufReader::new(ours.try_clone()?);
     let mut tx = ours;
     for n in [3, 7, 12, 99] {
-        writeln!(tx, "{n}").unwrap();
+        writeln!(tx, "{n}")?;
         let mut line = String::new();
-        answers.read_line(&mut line).unwrap();
+        answers.read_line(&mut line)?;
         println!("host sent {n:>3}, sandbox answered {}", line.trim());
     }
     // A half-close: the program's `for line in rx` ends, and so does the program.
-    tx.shutdown(std::net::Shutdown::Write).unwrap();
-    let status = child.wait().unwrap();
-    println!("sandbox: {}", ex::describe(status));
+    tx.shutdown(std::net::Shutdown::Write)?;
+    println!("sandbox: {}", ex::describe(child.wait()?));
+    Ok(())
 }

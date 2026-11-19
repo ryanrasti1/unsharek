@@ -101,8 +101,11 @@ fn escape() {
     if out.starts_with("skipped:") {
         return;
     }
-    // With the rule, getppid through the gate is the host's: the example's own pid.
-    let pid = out.lines().next().and_then(|l| l.split_whitespace().last()).unwrap();
-    let widened = out.lines().any(|l| l.contains("getppid() via the gate") && l.ends_with(&format!("-> {pid}")));
-    assert!(widened, "getppid wasn't widened:\n{out}");
+    // Without the restriction the program's own getppid is the guest's (0); with it, a kill
+    // before the program can print its answer.
+    let restricted = out.split("restrict(getppid: kill)").nth(1).unwrap_or_default();
+    assert!(
+        restricted.contains("killed by SIGSYS") && !restricted.contains("getppid(), trapped"),
+        "the restriction didn't take getppid away:\n{out}"
+    );
 }

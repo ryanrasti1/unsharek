@@ -1,6 +1,8 @@
-//! Helpers for setup closures ([`crate::Guest::run`]'s `before_exec`), written as ordinary Rust:
-//! inside the closure every syscall is the guest's, so `std::fs` and friends work on the guest's
-//! files. And the guest's basics, which [`crate::Guest::boot`] makes itself ([`defaults`]).
+//! Helpers for setup inside an intercept guard ([`crate::Sandbox::intercept`]), written as
+//! ordinary Rust: inside one every syscall of the thread is the guest's, so `std::fs` and friends
+//! work on the guest's files. Anything else the guest kernel does is a syscall away there too
+//! (`setresuid`, `sethostname`, an `/etc/passwd` written with `std::fs::write`): exobox doesn't
+//! wrap them. And the guest's basics, which [`crate::Guest::boot`] makes itself ([`defaults`]).
 
 use std::ffi::CStr;
 use std::io;
@@ -13,7 +15,7 @@ use lkl_sys as l;
 use crate::{Error, Image};
 
 /// Mount `image` (its block device, [`Image::device`]) at `path`, made if missing, read-only.
-/// From a setup closure: `mkdir` and `mount(2)` are the guest's there.
+/// Inside a guard: `mkdir` and `mount(2)` are the guest's there.
 pub fn mount_erofs(image: &Image, path: impl AsRef<Path>) -> Result<(), Error> {
     let path = path.as_ref();
     let what = || format!("mounting {} at {}", image.device().display(), path.display());
@@ -51,8 +53,8 @@ pub fn mount_closure(images: &[(Image, PathBuf)]) -> Result<(), Error> {
     Ok(())
 }
 
-/// A guest syscall from host code before `run` (generic numbers; the routing filter isn't in, so
-/// a plain `std::fs` call would still be the host's).
+/// A guest syscall from host code outside a guard (generic numbers, made on the guest directly: a
+/// plain `std::fs` call there is the host's).
 fn sys(nr: std::ffi::c_long, a: [usize; 6]) -> io::Result<usize> {
     let r = guest::syscall(nr, a);
     if r < 0 { Err(io::Error::from_raw_os_error(-r as i32)) } else { Ok(r as usize) }
@@ -113,9 +115,10 @@ pub fn resolver() -> io::Result<()> {
 }
 
 /// Host fd `host` as guest fd `guest`: a guest file whose reads and writes the runtime does on
-/// the host's fd (`host_fd`, the kernel series' item 11), as fds 0-2 are. For a setup closure;
-/// under a [`Sandbox`](crate::Sandbox), [`Sandbox::pass_fd`](crate::Sandbox::pass_fd) does this and
-/// widens the filter to the host fd, which a closure calling this alone doesn't.
+/// the host's fd (`host_fd`, the kernel series' item 11), as fds 0-2 are. Host code (it calls the
+/// guest directly); under a [`Sandbox`](crate::Sandbox),
+/// [`Sandbox::pass_fd`](crate::Sandbox::pass_fd) does this and widens the filter to the host fd,
+/// which calling this alone doesn't.
 pub fn host_fd(host: RawFd, guest: RawFd) -> io::Result<()> {
     let fd = sys(l::__lkl__NR_host_fd, [host as usize, libc::O_RDWR as usize, 0, 0, 0, 0])?;
     if fd != guest as usize {
@@ -124,6 +127,31 @@ pub fn host_fd(host: RawFd, guest: RawFd) -> io::Result<()> {
         r?;
     }
     Ok(())
+}
+
+/// The guest's RNG given `entropy` from the host (RNDADDENTROPY, credited in full), and with
+/// `reseed`, its CRNG reseeded from it at once (RNDRESEEDCRNG): a fork's child would otherwise
+/// keep drawing from the key it copied until the kernel's next periodic reseed.
+fn add_entropy(entropy: &[u8], reseed: bool) -> io::Result<()> {
+    let fd = open(c"/dev/urandom", libc::O_RDWR as usize)?;
+    let mut req = vec![0u8; 8 + entropy.len()];
+    req[..4].copy_from_slice(&((entropy.len() * 8) as i32).to_ne_bytes());
+    req[4..8].copy_from_slice(&(entropy.len() as i32).to_ne_bytes());
+    req[8..].copy_from_slice(entropy);
+    const RNDADDENTROPY: usize = 0x4008_5203;
+    const RNDRESEEDCRNG: usize = 0x5207;
+    let mut r = sys(l::__lkl__NR_ioctl, [fd, RNDADDENTROPY, req.as_ptr() as usize, 0, 0, 0]);
+    if r.is_ok() && reseed {
+        r = sys(l::__lkl__NR_ioctl, [fd, RNDRESEEDCRNG, 0, 0, 0, 0]);
+    }
+    close(fd);
+    r.map(|_| ())
+}
+
+/// A fork's child's guest RNG made its own: `entropy` from the host, and the CRNG reseeded from
+/// it (`Guest`'s takeover after a fork).
+pub(crate) fn reseed(entropy: &[u8]) -> io::Result<()> {
+    add_entropy(entropy, true)
 }
 
 /// The guest's basics, as init's: `/proc`, `/dev` (null, zero, full, random, urandom, tty, devpts,
@@ -157,16 +185,7 @@ pub fn defaults(entropy: &[u8]) -> io::Result<()> {
         sys(l::__lkl__NR_fchmodat, [AT_FDCWD, p(d), 0o1777, 0, 0, 0])?;
     }
 
-    // The RNG: RNDADDENTROPY with the host's bytes, credited in full.
-    let fd = open(c"/dev/urandom", libc::O_RDWR as usize)?;
-    let mut req = vec![0u8; 8 + entropy.len()];
-    req[..4].copy_from_slice(&((entropy.len() * 8) as i32).to_ne_bytes());
-    req[4..8].copy_from_slice(&(entropy.len() as i32).to_ne_bytes());
-    req[8..].copy_from_slice(entropy);
-    const RNDADDENTROPY: usize = 0x4008_5203;
-    let r = sys(l::__lkl__NR_ioctl, [fd, RNDADDENTROPY, req.as_ptr() as usize, 0, 0, 0]);
-    close(fd);
-    r?;
+    add_entropy(entropy, false)?;
 
     // Loopback up: SIOCGIFFLAGS, then SIOCSIFFLAGS with IFF_UP | IFF_RUNNING.
     let s = sys(l::__lkl__NR_socket, [libc::AF_INET as usize, libc::SOCK_DGRAM as usize, 0, 0, 0, 0])?;

@@ -1,6 +1,6 @@
 // The filter itself: call every x86-64 syscall number through the runtime's gate instruction (the
-// one a compromised app would jump to) and check each is refused, except the one a run allowed
-// with --allow (EXOBOX_TEST_ALLOW_NR). Then probe argument checks every mode shares. Run with
+// one a compromised app would jump to) and check each is refused. Then probe argument checks
+// every mode shares (tests/guest.rs runs it under a restriction too: it changes none of this). Run with
 // --deny=errno so refusals return EPERM. EXOBOX_TEST_TARGET: a pid outside the sandbox.
 // Prints ESCAPE_GATE_OK.
 #include "exobox_test.h"
@@ -25,9 +25,9 @@ int main(void)
 	setvbuf(stdout, NULL, _IONBF, 0);
 	gate_fn gate = exobox_gate();
 	CHECK(gate, "no gate in the auxiliary vector: not sandboxed");
-	const char *t = getenv("EXOBOX_TEST_TARGET"), *a = getenv("EXOBOX_TEST_ALLOW_NR");
+	const char *t = getenv("EXOBOX_TEST_TARGET");
 	CHECK(t, "EXOBOX_TEST_TARGET unset");
-	long target = atol(t), allowed = a ? atol(a) : -1;
+	long target = atol(t);
 	int fork_mode = mode_is("fork"), threads = fork_mode || mode_is("threaded");
 
 	/* 1. Every number with zero arguments. Skipped: rt_sigreturn (allowed: through the gate it
@@ -43,9 +43,7 @@ int main(void)
 		    nr == SYS_read || (threads && nr == SYS_exit) || (nr > 334 && nr < 424))
 			continue;
 		long r = gate(nr, 0, 0, 0, 0, 0, 0);
-		if (nr == allowed) {
-			expect("the --allow'd number via gate", r, 1);
-		} else if (r == -EPERM) {
+		if (r == -EPERM) {
 			refused++;
 		} else {
 			printf("  nr %ld via gate -> %ld (not refused)\n", nr, r);

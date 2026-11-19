@@ -12,7 +12,7 @@
 use std::process::Stdio;
 use std::time::Instant;
 
-use exobox::{GuestConfig, Hooks, Mode, PreExec, Sandbox, setup};
+use exobox::{Mode, Sandbox, setup};
 use exobox_examples as ex;
 use exobox_fixtures as fx;
 
@@ -25,12 +25,15 @@ fn iterations() -> &'static str {
 fn sandbox(mode: Mode) -> ! {
     let run = || -> Result<std::convert::Infallible, exobox::Error> {
         let prog = fx::bin("par_compute");
-        let mut sb = Sandbox::boot(mode, GuestConfig::default())?;
+        let mut sb = Sandbox::builder().mode(mode).build()?;
         // The fixtures live outside the store: their directory is allowed as is, and brings the
         // closure of whatever its files reference (glibc).
-        let store = ex::mount_closure(&mut sb, &prog, &[fx::bin_dir()])?;
-        let hooks = Hooks { pre_exec: PreExec::new(move || setup::mount_closure(&store)), ..Default::default() };
-        sb.run(hooks, &ex::os(&[prog.to_str().unwrap(), THREADS, iterations()]), &[])
+        let store = sb.map_closure(&prog, &[fx::bin_dir()])?;
+        {
+            let _g = sb.intercept()?;
+            setup::mount_closure(&store)?;
+        }
+        sb.run(&ex::os(&[prog.to_str().unwrap(), THREADS, iterations()]), &[])
     };
     let Err(e) = run();
     ex::fail(e)

@@ -352,6 +352,9 @@ pub unsafe extern "C" fn net_sendto(
 
 async fn resolve_task(sock: usize, pid: i32, ns: SocketAddrV4, msg: Vec<u8>) {
     let reply = match dns::parse(&msg) {
+        // Only an A query asks the hook (its answer is IPv4 addresses): another (glibc's AAAA
+        // beside each A) is no data at once, not a second call of the hook for the same name.
+        Ok(q) if q.qtype != dns::TYPE_A => Some(dns::answer(&q, Rcode::NoError, &[])),
         Ok(q) => {
             let fut = {
                 let mut h = R.hooks.borrow_mut();

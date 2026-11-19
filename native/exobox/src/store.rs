@@ -358,6 +358,17 @@ impl Cache {
         Ok(cache.ok_or(Error::NoCacheDir)?.join("exobox/images"))
     }
 
+    /// The cache at [`Cache::default_dir`].
+    pub fn open_default() -> Result<Cache> {
+        Ok(Cache::new(&Cache::default_dir()?))
+    }
+
+    /// `program`'s closure (plus `allow_paths`, each with its own) as images: [`Cache::closure`]
+    /// then [`Cache::images`], each built where the cache lacks it.
+    pub fn store(&self, program: &Path, allow_paths: &[PathBuf]) -> Result<Store> {
+        self.images(&self.closure(program, allow_paths)?)
+    }
+
     /// How many images this `Cache` has built (rather than found).
     pub fn builds(&self) -> usize {
         self.builds.load(Ordering::Relaxed)
