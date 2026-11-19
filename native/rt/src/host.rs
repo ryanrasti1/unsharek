@@ -523,6 +523,12 @@ unsafe extern "C" fn time() -> c_ulonglong {
     sched().now()
 }
 
+/// The program has armed a timer that sends a signal (`alarm`, `setitimer`, `timer_settime`:
+/// the dispatcher sets it), so the kernel's timer firing may mean a signal ([`timer_fired`]).
+/// Shared by fork mode's processes: the timer runs wherever the CPU is.
+#[unsafe(link_section = "exobox_shared")]
+pub static SIGNAL_TIMERS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// The shim between `Timer`'s `fn(*mut c_void)` and LKL's `void (*)(void)`: `arg` is the slot.
 unsafe extern "C" fn timer_fired(arg: *mut c_void) {
     // SAFETY: timer_alloc passed its slot, which stays allocated while its coroutine runs.
@@ -535,8 +541,15 @@ unsafe extern "C" fn timer_fired(arg: *mut c_void) {
     ts.runner.set(None);
     // The timer may have sent a signal (an itimer's SIGALRM, a POSIX timer's): a program thread
     // parked in one of the runtime's own waits learns of it only at its next call into the kernel,
-    // so cut those waits short (they go back to waiting if there was nothing for them).
-    sched().interrupt_waits();
+    // so cut those waits short (they go back to waiting if there was nothing for them). Only once
+    // the program has armed such a timer: this is the kernel's one timer, which fires at every
+    // tick (1 ms) while the kernel isn't idle, and each interrupted waiter makes a call into the
+    // kernel to find nothing, which keeps the tick going. A parallel rustc's sixteen threads
+    // parked in futexes were woken every millisecond, each taking the CPU token to ask (and a
+    // sleeping coroutine-mode wait spun at the tick's rate: guest-tests' idle_cpu).
+    if SIGNAL_TIMERS.load(core::sync::atomic::Ordering::Relaxed) {
+        sched().interrupt_waits();
+    }
     if ts.release_on_return.replace(false) {
         // Freed by `f` itself. The coroutine returns to `timer_main`, which sees the timer freed
         // and ends without yielding first, so the slot can't be handed out under it.

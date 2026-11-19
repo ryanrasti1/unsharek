@@ -3,10 +3,13 @@
 //   sigprocmask  block and unblock a signal (the guest kernel's in every mode)
 //   signal       kill(self) and its handler's run, the round trip
 //   pingpong     one byte there and back between two threads over pipes
+//   futex        a turn there and back between two threads through a futex word (wait, wake)
 // argv[1]: iterations (default 20000).
 #include "exobox_test.h"
+#include <linux/futex.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
@@ -20,6 +23,24 @@ static double now_ns(void)
 	struct timespec t;
 	clock_gettime(CLOCK_MONOTONIC, &t);
 	return t.tv_sec * 1e9 + t.tv_nsec;
+}
+
+static _Atomic int turn;
+
+static void fx_wait(int v) { syscall(SYS_futex, &turn, FUTEX_WAIT_PRIVATE, v, NULL, NULL, 0); }
+static void fx_wake(void) { syscall(SYS_futex, &turn, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0); }
+
+/* The futex ping-pong's other side: waits for turn 1, passes it back as 0. */
+static void *fx_peer(void *a)
+{
+	(void)a;
+	for (long i = 0; i < n; i++) {
+		while (atomic_load(&turn) != 1)
+			fx_wait(0);
+		atomic_store(&turn, 0);
+		fx_wake();
+	}
+	return NULL;
 }
 
 static void on_usr1(int s) { (void)s; got++; }
@@ -71,6 +92,17 @@ int main(int argc, char **argv)
 	void *r;
 	pthread_join(th, &r);
 	CHECK(!r, "echo thread");
+
+	CHECK(pthread_create(&th, NULL, fx_peer, NULL) == 0, "pthread_create");
+	t = now_ns();
+	for (long i = 0; i < n; i++) {
+		atomic_store(&turn, 1);
+		fx_wake();
+		while (atomic_load(&turn) != 0)
+			fx_wait(1);
+	}
+	printf("futex %.0f\n", (now_ns() - t) / n);
+	pthread_join(th, NULL);
 	printf("SYSCALL_BENCH_OK\n");
 	return 0;
 }

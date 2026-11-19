@@ -40,8 +40,11 @@ What the numbers say, in order of size:
 3. **For Rust builds, after (1), the remaining gap is the emulated futex.** 98% of rustc's 100-140k
    trapped calls are `futex` and `mprotect`, which need no kernel, yet each takes the token, and
    every futex wake moves the token to the wakee's host thread by a sleeping hand-off (6-13 µs).
-   A futex ping-pong round trip is 24-27 µs in threaded/fork mode against 6 µs in coroutine mode
-   and 2.5-4.6 µs natively. The kernel's own work in a rustc run is ~0.13 s.
+   (A pipe ping-pong between two threads is 24-27 µs in threaded/fork mode against 6 µs in
+   coroutine mode and 2.5-4.6 µs natively; a futex ping-pong between two threads, measured later,
+   is close to native: 4-5 µs against 3-4. The cost is contention among many threads, not one
+   wait and wake.) The kernel's own work in a rustc run is ~0.13 s. *Later found* (see "Fixes"):
+   much of this traffic was the kernel's tick interrupting every parked waiter each millisecond.
 4. **The kernel idler keeps the token while it sleeps** (to a timer, and since `92def71` while it
    watches host fds), and every return to user mode with a timer armed (or an fd watched) hands
    the token to it: 30-40% of rustc's contended acquires found the idler holding it. Freeing it
@@ -58,6 +61,50 @@ For C builds the last 25% is per-process cost and the serialized kernel; an SMP 
 "CPU is a token" design) is the right shape for that and is evaluated below, but by these numbers it
 is the fourth thing to build, not the first: today it would parallelize ~0.3 s of make's 2.4 s gap
 and ~0.1 s of rustc's.
+
+## Fixes (phase 2) and where they leave each workload
+
+Commits on the branch after this analysis, each measured with `./test --vs-native` (A/B: an
+interleaved run with the commit before, `--variant`) and at the end with the full harness. The
+machine was shared and loaded through most of phase 2 (load 10-17 for the final runs, against 1-5
+for the analysis above), which slows sleeping hand-offs most: absolute ratios came out worse than
+the analysis's for every binary, the old one included. Compare within a run.
+
+| # | Commit | What | Measured |
+|---|---|---|---|
+| suite | `84de615`, `df3ce03` | `./test --vs-native` (native/bench/quick.py): rustc cgu16, rustc under make -j4, make -j4 of C, xz -T4, and syscall, futex/pipe ping-pong and fork+exec micro costs, scaled down, ratios against targets; `--variant` A/B | ~30 s a run (3 reps). The small workloads track the direction of the full-size ones but exaggerate per-process cost (small rustmake 1.36x when full-size is 1.12x; small make 3.4-3.9x for 2.2-3.2x) |
+| 1 | `26de534` | `sched_getaffinity` reports the host's CPUs (threaded, fork) | rustc 2.82x -> 1.2-1.4x; rustmake 1.82x -> 1.05-1.12x (full size, quiet machine) |
+| 2 | `6239209`, `203a295` | Exec without copies: the image zone is read-only on the host but for each ELF's writable segments (from the image's layout and the ELFs' program headers, made writable before lockdown); in place at every exec in every mode; library code faults when written, `mprotect(PROT_WRITE)` on it is EACCES. Then no `madvise` in any mode (one memory model), and ELF headers read with `pread` (reading them through the mapping cost 1.5 MB PSS) | make -j4: zeroing 764 -> 215 MiB, copies 2189 -> 1550 MiB, 2.45x -> 2.23x (1 rep). What is still copied is gcc's `cc1`/`collect2`, non-PIE: they must sit at their own addresses, 51 MB a compile; only a filter widening (a host `mmap` of an image fd at a fixed arena address) or a PIE gcc removes it. PSS per idle sandbox 4447/4479/4659 KB (budget 5120; 4321 before) |
+| - | `71ec27b` | A timed futex wait woken for nothing waits again to the same deadline (it returned 0 after ~1 ms, every mode) | guest-tests' `futex_timeout` runs in every mode |
+| - | `f68150c` | The kernel's timer interrupts the runtime's waits only once the program armed a signal timer (`alarm`, `setitimer`, `timer_settime`). It is the kernel's one timer, firing every tick while the kernel isn't idle: every parked futex waiter woke each millisecond and took the token to ask the kernel | vs-native, interleaved: rustc fork 2.47x/2.38x -> 1.97x/1.18x; rustc under make 2.40x/2.55x -> 1.75x/1.91x. `idle_cpu` passes in coroutine mode now (120 ms of CPU for 300 ms of sleeping before) |
+| 6 | not committed | The idler without the token | No gain once fix 1 was in (full-size rustc fork 1.35x either way; the small suite worse). Contended acquires fell 84k -> 33k but each hand-off got slower (6 -> 18-30 µs), the total held time unchanged. A variant that slept without the token after handing it off hung `stdout_full` in fork mode 3 runs in 5; not understood, set aside |
+| 3 | not committed (WIP) | Futexes off the token (per-bucket locks; a waiter blocks on its slot's futex eventfd, a waker writes it) | Hangs `group_exit_futex` (threaded, fork): with its host thread parked off the token, a thread's bound coroutine made runnable by the kernel is handed the token by directed hand-off, and nothing runs it. Needs the waiter to also watch its token eventfd and serve such a hand-off, or the kernel not to schedule a task whose thread is in user space. After the tick fix the futex's share is smaller; to be remeasured before going on |
+| 5, 4 | not started | Arena calls under a per-process lock; fewer and faster hand-offs | - |
+
+Before (main `c75ca78`) against after (`f68150c`), full size, fork mode, best of 3, interleaved,
+on the loaded machine (paired medians in brackets where they differ by more than 0.1):
+
+| workload | native | before | after |
+|---|---|---|---|
+| rustc cgu16 | 1.85-1.87 s | 2.34-2.48x | 1.73-2.06x |
+| xz -T4 | 0.17 s | 1.14x | 1.13x |
+| make -j4 of 32 C files | 1.56-1.57 s | 4.69-4.75x | 4.31-4.59x |
+| rustc under make -j4 | 7.54 s | 1.42x | 1.23x |
+| `cargo build -j4 --release` (6 crates, cargo works since main's statx fix) | 4.48-4.51 s | 2.96-3.07x | 1.41-1.42x |
+
+What is left, from the counters of the last runs (instrumented build of `f68150c`):
+
+- **make -j4: the token, and hand-offs above all.** Held 80% of the wall; of 5.6 s held, 4.1 s
+  was hand-off latency (61k hand-offs at ~66 µs each on the loaded host, 18-29 µs on a quiet
+  one), ~1 s exec (cc1's copies, 0.57 s, and the rest), ~0.5 s the kernel. Hand-offs (#4) are now
+  the first thing to fix for C builds; under host load they dominate.
+- **cargo / rustc: hand-offs and the idler.** rustc: token held 64%, 2.15 s of 2.2 s of it
+  hand-off latency; 20k of 56k contended acquires found the idler holding the token. cargo: held
+  84%, 11.5 s of hand-off latency over 187k hand-offs, 63k acquires from the idler. The idler fix
+  (#6) measured nothing on a quiet machine, but its share here says to retry it with #4.
+- **SMP for make -j4.** Not yet: the kernel's own work is still ~10% of the token's time. The
+  serialization that dominates is waiting for sleeping threads to wake, which N CPU tokens would
+  multiply rather than remove unless hand-offs get cheap first.
 
 ## How it was measured
 
@@ -109,7 +156,8 @@ processes works, and the questions were about waiting, which sampling doesn't sh
 | `getppid` (LKL-served) | 0.075 µs | 1.29 µs | 1.33 µs | 1.40 µs |
 | `rt_sigprocmask` | 0.094 µs | 0.99 µs | 1.05 µs | 0.89 µs |
 | signal delivered and returned | 1.1 µs | 1.74 µs | 1.79 µs | 1.94 µs |
-| futex ping-pong round trip | 2.5-4.6 µs | 6.0 µs | 23.9 µs | 26.7 µs |
+| pipe ping-pong round trip (two threads) | 2.5-4.6 µs | 6.0 µs | 23.9 µs | 26.7 µs |
+| futex ping-pong round trip (two threads; syscall_bench's `futex`, added later) | 3-4 µs | - | 3.7-5 µs | 3.6-5 µs |
 | fork + exec + exit of `true`, from bash | 0.68 ms | - | - | 4.9 ms |
 | ... of `bash -c :` | 1.6 ms | - | - | 6.4 ms |
 | ... of `cc1 --version` (51 MB binary) | 8.2 ms | - | - | 21.1 ms |
@@ -222,7 +270,7 @@ experiment exists, otherwise estimated from the counters (and says so).
 |---|---|---|---|---|---|
 | 1 | One CPU reported (`sched_getaffinity` → `1`) | rustc 2.9 of 2.9 s; rustmake 5.7 of 5.7 s; any pool sized from nproc | Report the host's affinity mask (read before lockdown; optionally capped by a config) | **Measured**: rustc 2.84x → 1.20-1.32x; rustmake 1.82x → 1.12x | Trivial. More threads also means more futex/token traffic (#3), which is why rustc doesn't reach 1.0x |
 | 2 | Exec copies programs and libraries, and zeroes the old image, under the token (fork/threaded are high-water: no in-place mapping) | make: ~1.2 s of token time (of 2.5 s held), ~1.2-1.5 s CPU | Map in place in high-water mode: track which image-zone pages are pristine (still the image's bytes) instead of relying on `madvise` to restore them; place an exec's new image on pages never touched (or freshly forked-clean) instead of zeroing the old one in place, zeroing lazily at reuse. Alternatively allow `madvise(DONTNEED)` in the arena in fork mode (capnix's fork mode did) and use release mode | Estimated make -j4 3.0x → ~2.0x (−1.2 s token time, −1.2 s CPU); per exec ~7 ms → ≤1 ms; also memory (page cache shared instead of 51 MB per cc1) | Medium (the arena's clean/dirty model, exec's layout). The madvise route is smaller code but widens the filter in fork mode: a policy call (the Dirty-COW argument is about host kernel bugs in concurrent `madvise` + faults, which every multithreaded native malloc does) |
-| 3 | Futexes emulated under the token; each wake a token hand-off to the wakee | rustc after #1: most of the remaining 0.35-0.7 s; rustmake after #1: most of 0.8 s; futex round trip 24-27 µs vs 6 (coroutine) | Futexes off the token: a futex table with per-bucket spinlocks, a waiter blocks on its own slot's wake eventfd (a second fd range, or the token's with a tag), a waker writes it directly; timeouts with `ppoll` on that fd; signals and group exit wake the waiter as `interrupt_waits` does now. Fork mode: per-process table (it already is per-process space) | Estimated rustc/rustmake to ~1.05x (removes ~100k token acquisitions and hand-offs per rustc); futex round trip to ~5-8 µs | Medium: signal interruption, exit and exec paths, timeouts, requeue/PI ops (keep them on the slow path) |
+| 3 | Futexes emulated under the token; each wake a token hand-off to the wakee | rustc after #1: most of the remaining 0.35-0.7 s; rustmake after #1: most of 0.8 s; pipe round trip 24-27 µs vs 6 (coroutine) | Futexes off the token: a futex table with per-bucket spinlocks, a waiter blocks on its own slot's wake eventfd (a second fd range, or the token's with a tag), a waker writes it directly; timeouts with `ppoll` on that fd; signals and group exit wake the waiter as `interrupt_waits` does now. Fork mode: per-process table (it already is per-process space) | Estimated rustc/rustmake to ~1.05x (removes ~100k token acquisitions and hand-offs per rustc); futex round trip to ~5-8 µs | Medium: signal interruption, exit and exec paths, timeouts, requeue/PI ops (keep them on the slow path) |
 | 4 | Hand-off latency: the token assigned to a sleeping thread sits idle until the host wakes it (6-29 µs) | make: 1.1-1.4 s of 2.5 s held; rustc: 0.7-0.8 s of 0.9 s held | (a) Fewer acquisitions (#3, #5); (b) release instead of assign: the releaser frees the token and wakes the next waiter, and a thread already awake may take it first (barging, bounded to keep FIFO fairness); (c) adaptive spinning only when cores are idle (measured harmful with oversubscription: rustc 1.2x → 2.0x) | Estimated make −0.5 to −1.0 s once #2 shortens holds; rustc follows #3 | Low-medium for (b); (c) needs a load signal and capnix saw a race on its spin path (`lkl_cpu_put: unbalanced put`) |
 | 5 | Memory calls take the token though they touch only the arena (`mprotect` 18-43k per Rust build, `mmap`/`munmap`) | 0.1-0.4 s of summed waits per run; more acquisitions feeding #4 | A per-process arena lock instead of the token for `mmap`/`munmap`/`mprotect`/`madvise`/`brk` (file-backed `mmap` still needs the kernel for its reads, outside the arena lock) | Estimated 2-5% on Rust builds | Low-medium: the arena's Backing calls into LKL for file maps |
 | 6 | The kernel idler keeps the token while it sleeps to a timer or watches host fds, and every return to user mode with a timer armed (or an fd watched) hands the token to it | 25-90k contended acquires per Rust run; half of rustc's token time | `idler` experiment: free the token while sleeping, hand it over only when a deadline is due or earlier than the idler's, or an fd wait begins | **Measured** (`92def71`): threaded rustc 1.38x → 1.21x, fork 1.31x → 1.28x; rustmake, make: within noise | Low. Must kick the idler when a timer earlier than its sleep is armed or the watched fds change (the experiment only half does the latter) |
@@ -339,10 +387,7 @@ Suggested order: #1 (hours), #6 (a day), #3 (a week), #5, #2 (two weeks), #4, th
 
 ## Bugs found while measuring
 
-- **cargo crashes the sandbox** in every mode: `.cargo-wrapped --version` dies of SIGSEGV (a NULL
-  dereference) right after two `statx` calls following `getcwd` and an `openat`, so
-  `cargo build` can't be measured. Reproduce: `exobox run -- $(dirname $(readlink -f $(which
-  cargo)))/.cargo-wrapped --version`.
+- **cargo crashed the sandbox** in every mode (a NULL dereference after Rust std's `statx(0, NULL, ...)` probe): fixed on main by `22f1bd0` (statx checks the program's pointers before LKL reads them); the `cargo` workload runs since.
 - `./test --perf`'s `xz::threaded` and `xz::fork` time out: the full-stdout-pipe hang (`xz -T2 |
   cat`), known and being fixed; the harness writes stdout to files.
 - In fork mode `wait4`'s rusage doesn't include the build's processes (init reaps them with

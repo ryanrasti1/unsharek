@@ -156,9 +156,9 @@ fn to_control(uc: &Ucontext) -> usize {
 static RUNTIME: AtomicUsize = AtomicUsize::new(0);
 
 /// Install the handler on this (child) thread and lock down: `mode`'s filter with deny=errno.
-fn lockdown(dispatch: Dispatch, target: Target, mode: Mode, arena: &[(u64, u64)], tokens: (u32, u32)) {
+fn lockdown(dispatch: Dispatch, target: Target, mode: Mode, tokens: (u32, u32)) {
     let mut prog = Box::new(Program::new());
-    let params = Params { policy: Policy::Mode(mode), deny: Deny::Errno, gate_ip: gate_ip(), arena, token_fds: tokens, pid: std::process::id(), extra: &[] };
+    let params = Params { policy: Policy::Mode(mode), deny: Deny::Errno, gate_ip: gate_ip(), token_fds: tokens, pid: std::process::id(), extra: &[] };
     filter::compile(&params, &mut prog).unwrap();
     RUNTIME.store(context::read_fs(), Ordering::Relaxed);
     // SAFETY: the child's own alternate stack; the dispatchers keep to the contract.
@@ -254,8 +254,8 @@ fn fake(uc: &mut Ucontext) {
     uc.set_return(r);
 }
 
-fn coroutine_lockdown(dispatch: Dispatch, arena: &[(u64, u64)]) {
-    lockdown(dispatch, to_control, Mode::Coroutine, arena, (0, 0));
+fn coroutine_lockdown(dispatch: Dispatch) {
+    lockdown(dispatch, to_control, Mode::Coroutine, (0, 0));
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -268,20 +268,7 @@ fn coroutine_lockdown(dispatch: Dispatch, arena: &[(u64, u64)]) {
 #[test]
 fn traps_and_the_gate() {
     run_child(|| {
-        // An arena for madvise: two chunks, as the filter's arena ranges are (inclusive).
-        // SAFETY: a fresh mapping, the child's.
-        let arena = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                2 * filter::MADV_CHUNK as usize,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        } as usize;
-        let ranges = [(arena as u64, arena as u64 + filter::MADV_CHUNK)];
-        coroutine_lockdown(fake, &ranges);
+        coroutine_lockdown(fake);
 
         let args = [7, 0x11, 0x22, 0x33, 0x44, 0x55];
         for nr in [39usize, 110, 102, 500] {
@@ -308,13 +295,9 @@ fn traps_and_the_gate() {
         check!(write(3, b"") == Err(Errno::PERM), 13);
         check!(read(0, &mut []) == Ok(0), 14);
         check!(ppoll(None, Some(&Timespec { tv_sec: 0, tv_nsec: 0 })) == Ok(0), 15);
-        // SAFETY: the arena is ours and unused.
-        unsafe {
-            (arena as *mut u8).write(1);
-            check!(madvise_dontneed(arena, 4096) == Ok(()), 16);
-            check!((arena as *const u8).read() == 0, 17);
-            check!(madvise_dontneed(arena + 2 * filter::MADV_CHUNK as usize, 4096) == Err(Errno::PERM), 18);
-        }
+        // No madvise from the gate, in any mode (memory stays at its peak).
+        // SAFETY: a denied call.
+        check!(unsafe { gate(28, 0x20_0000, 4096, 4, 0, 0, 0) } == -1, 16);
         0
     });
 }
@@ -346,7 +329,7 @@ fn small_stack() {
         #[repr(C, align(64))]
         struct Stack([u8; 4096]);
         static mut STACK: Stack = Stack([0; 4096]);
-        coroutine_lockdown(fake, &[]);
+        coroutine_lockdown(fake);
         let base = &raw mut STACK as *mut u8;
         let sp = base as usize + 256;
         for (i, nr) in [110usize, 39, 24].into_iter().enumerate() {
@@ -386,7 +369,7 @@ fn fs_switch() {
     run_child(|| {
         static TLS_A: [u64; 8] = [0; 8];
         static TLS_B: [u64; 8] = [0; 8];
-        coroutine_lockdown(fake, &[]);
+        coroutine_lockdown(fake);
         let (a, b) = (&raw const TLS_A as usize, &raw const TLS_B as usize);
         // The trap with FS = `fs`; returns (result, FS just after the trap). FS is the test's own
         // again before any Rust code can use TLS.
@@ -479,7 +462,7 @@ unsafe extern "C" fn syscall_with_regs(regs_in: *const Regs, regs_out: *mut Regs
 #[test]
 fn registers_preserved() {
     run_child(|| {
-        coroutine_lockdown(fake, &[]);
+        coroutine_lockdown(fake);
         let mut input = Regs { gpr: [0; 16], xmm: [[0; 2]; 16] };
         for (i, g) in input.gpr.iter_mut().enumerate() {
             *g = (0x0101_0101_0101_0101 * (i as u64 + 1)) ^ 0x8000_0000_0000_0000;
@@ -579,7 +562,7 @@ extern "C" fn program(i: usize) -> ! {
 #[test]
 fn coroutines_switch_inside_the_dispatcher() {
     run_child(|| {
-        lockdown(coroutine_dispatch, coroutine_target, Mode::Coroutine, &[], (0, 0));
+        lockdown(coroutine_dispatch, coroutine_target, Mode::Coroutine, (0, 0));
         for i in 0..2 {
             let top = &raw mut PROG as usize + (i + 1) * PROG_STACK;
             // SAFETY: a fresh coroutine on its own static stack.
@@ -606,7 +589,7 @@ fn threaded_wrappers() {
         let fd = unsafe { libc::eventfd(0, 0) };
         check!(fd >= 0, 1);
         let fd = fd as u32;
-        lockdown(fake, to_control, Mode::Threaded, &[], (fd, fd));
+        lockdown(fake, to_control, Mode::Threaded, (fd, fd));
         check!(eventfd_write(fd, 1) == Ok(()), 2);
         check!(eventfd_read(fd) == Ok(1), 3);
         extern "C" fn thread(fd: usize) -> ! {
@@ -651,7 +634,7 @@ fn throughput() {
             raw(110, [0; 6]);
         }
         put(0, t.elapsed().as_nanos() as u64);
-        coroutine_lockdown(fake, &[]);
+        coroutine_lockdown(fake);
         // Instant::now is the vDSO: no syscall.
         let t = Instant::now();
         for _ in 0..N {

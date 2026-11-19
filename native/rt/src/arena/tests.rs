@@ -1,6 +1,6 @@
 //! The arena against a model (proptest), and the regressions capnix's arena hit. Each test runs
-//! on a real `MAP_NORESERVE` reservation, and release mode's [`Backing::release`] really
-//! `madvise`s, so the host's `mincore` can say which pages a sequence of calls touched.
+//! on a real `MAP_NORESERVE` reservation, so the host's `mincore` can say which pages a sequence
+//! of calls touched.
 
 use super::*;
 use proptest::collection::vec;
@@ -58,13 +58,10 @@ fn mem(addr: usize, len: usize) -> &'static mut [u8] {
 /// Files in memory, and a record of what the arena asked of the host.
 #[derive(Default)]
 struct Fake {
-    base: usize,
-    end: usize,
     files: HashMap<u64, Vec<u8>>,
     /// Retained handles, to the file they stand for.
     alias: HashMap<u64, u64>,
     next: u64,
-    releases: Vec<(usize, usize)>,
     closed: Vec<u64>,
     writes: Vec<(u64, u64, usize)>,
     /// Bytes copied by `read`.
@@ -74,14 +71,11 @@ struct Fake {
 }
 
 impl Fake {
-    fn new(r: &Reservation) -> Self {
-        Fake { base: r.base, end: r.base + r.len, next: 1000, ..Default::default() }
+    fn new(_r: &Reservation) -> Self {
+        Fake { next: 1000, ..Default::default() }
     }
     fn file(&self, h: u64) -> u64 {
         *self.alias.get(&h).unwrap_or(&h)
-    }
-    fn released(&self) -> usize {
-        self.releases.iter().map(|r| r.1).sum()
     }
 }
 
@@ -121,15 +115,6 @@ impl Backing for Fake {
         assert!(!self.closed.contains(&file), "closed twice");
         self.closed.push(file);
     }
-    fn release(&mut self, addr: usize, len: usize) -> Result<()> {
-        assert!(len > 0 && len <= MADV_CHUNK, "release of {len:#x}");
-        assert!(addr >= self.base && addr + len <= self.end, "release outside the arena");
-        assert_eq!(addr % PAGE, 0);
-        // SAFETY: inside the reservation.
-        assert_eq!(unsafe { libc::madvise(addr as *mut _, len, libc::MADV_DONTNEED) }, 0);
-        self.releases.push((addr, len));
-        Ok(())
-    }
     fn locate(&mut self, file: u64, offset: u64) -> Option<(usize, u64)> {
         let &(at, len) = self.in_zone.get(&file)?;
         (offset <= len).then(|| (at + offset as usize, len - offset))
@@ -140,9 +125,9 @@ fn table(cap: usize) -> Vec<Extent> {
     vec![Extent::EMPTY; cap]
 }
 
-fn arena<'t>(r: &Reservation, mode: Mode, t: &'t mut [Extent]) -> Arena<'t> {
+fn arena<'t>(r: &Reservation, t: &'t mut [Extent]) -> Arena<'t> {
     // SAFETY: the reservation is read/write, zero, and the arena's alone.
-    unsafe { Arena::new(r.base, r.len, mode, t) }.unwrap()
+    unsafe { Arena::new(r.base, r.len, t) }.unwrap()
 }
 
 fn prot_at(a: &Arena, addr: usize) -> Option<u32> {
@@ -225,10 +210,10 @@ fn check_page(base: usize, p: usize, pg: Pg) -> std::result::Result<(), TestCase
     Ok(())
 }
 
-fn run(mode: Mode, ops: Vec<Op>) -> std::result::Result<(), TestCaseError> {
+fn run(ops: Vec<Op>) -> std::result::Result<(), TestCaseError> {
     let r = Reservation::new(PP * PAGE);
     let mut t = table(CAPACITY);
-    let mut a = arena(&r, mode, &mut t);
+    let mut a = arena(&r, &mut t);
     let mut b = Fake::new(&r);
     let mut model: BTreeMap<usize, Pg> = BTreeMap::new();
     let mut touched = BTreeSet::new();
@@ -411,15 +396,9 @@ fn run(mode: Mode, ops: Vec<Op>) -> std::result::Result<(), TestCaseError> {
     }
     // Freed space is reusable, and zero: unmap it all and map the whole arena again.
     prop_assert_eq!(a.munmap(&mut b, base, PP * PAGE), Ok(0));
-    if mode == Mode::Release {
-        prop_assert_eq!(a.stats().extents, 1);
-    }
     prop_assert_eq!(a.mmap(&mut b, 0, PP * PAGE, RW, ANON, None), Ok(base));
     for &q in &touched {
         prop_assert!(is_zero(addr(q), PAGE), "reused page {} not zero", q);
-    }
-    if mode == Mode::HighWater {
-        prop_assert!(b.releases.is_empty(), "high-water mode released");
     }
     Ok(())
 }
@@ -428,13 +407,8 @@ proptest! {
     #![proptest_config(ProptestConfig { cases: 256, failure_persistence: None, ..ProptestConfig::default() })]
 
     #[test]
-    fn model_release(ops in vec(op(), 1..64)) {
-        run(Mode::Release, ops)?;
-    }
-
-    #[test]
-    fn model_high_water(ops in vec(op(), 1..64)) {
-        run(Mode::HighWater, ops)?;
+    fn model(ops in vec(op(), 1..64)) {
+        run(ops)?;
     }
 }
 
@@ -446,10 +420,10 @@ proptest! {
 /// were ever written: ~66 MB per sandbox. Only the pages ever writable may cost anything.
 #[test]
 fn glibc_prot_none_heap_costs_nothing_untouched() {
-    for mode in [Mode::Release, Mode::HighWater] {
+    {
         let r = Reservation::new(1 << 30);
         let mut t = table(CAPACITY);
-        let mut a = arena(&r, mode, &mut t);
+        let mut a = arena(&r, &mut t);
         let mut b = Fake::new(&r);
         let heap_max = 64 * MB;
         let p = a.mmap(&mut b, 0, 2 * heap_max, PROT_NONE, ANON | MAP_NORESERVE, None).unwrap();
@@ -467,26 +441,16 @@ fn glibc_prot_none_heap_costs_nothing_untouched() {
         a.mprotect(h, MB, RW).unwrap();
         mem(h + MB - PAGE, 1)[0] = 2;
         assert_eq!(a.mmap(&mut b, h + (256 << 10), MB - (256 << 10), PROT_NONE, ANON | MAP_FIXED, None), Ok(h + (256 << 10)));
-        // The written page reads zero again: given back (not resident), or cleared in place. (Not
-        // read in release mode: reading faults in the host's zero page, spoiling the counts below.)
-        match mode {
-            Mode::Release => assert_eq!(r.resident(h + MB - PAGE, PAGE), 0),
-            Mode::HighWater => assert!(is_zero(h + MB - PAGE, PAGE)),
-        }
+        // The written page reads zero again: cleared in place.
+        assert!(is_zero(h + MB - PAGE, PAGE));
         a.munmap(&mut b, h, heap_max).unwrap();
         a.check();
 
-        // Releases only ever covered the megabyte that was writable.
-        assert!(b.releases.iter().all(|&(x, n)| x >= h && x + n <= h + MB), "{mode:?}: {:x?}", b.releases);
-        assert!(b.released() <= MB);
         // Cleared in place: only the one written page that was handed out again (the shrink).
-        assert_eq!(a.stats().zeroed, if mode == Mode::HighWater { PAGE as u64 } else { 0 });
-        // The host holds nothing outside it (release mode: nothing at all).
+        assert_eq!(a.stats().zeroed, PAGE as u64);
+        // The host holds nothing outside it.
         assert_eq!(r.resident(p, h - p), 0);
         assert_eq!(r.resident(h + MB, p + 2 * heap_max - (h + MB)), 0);
-        if mode == Mode::Release {
-            assert_eq!(r.resident(h, MB), 0);
-        }
 
         // The next thread's heap reuses it: still nothing outside the written megabyte.
         let q = a.mmap(&mut b, 0, 2 * heap_max, PROT_NONE, ANON | MAP_NORESERVE, None).unwrap();
@@ -499,10 +463,10 @@ fn glibc_prot_none_heap_costs_nothing_untouched() {
 /// MAP_FIXED over the program's own mapping replaces it (zero, new protection); the rest stays.
 #[test]
 fn map_fixed_replaces_existing_mapping() {
-    for mode in [Mode::Release, Mode::HighWater] {
+    {
         let r = Reservation::new(64 * MB);
         let mut t = table(CAPACITY);
-        let mut a = arena(&r, mode, &mut t);
+        let mut a = arena(&r, &mut t);
         let mut b = Fake::new(&r);
         b.files.insert(7, vec![b'f'; 2 * PAGE]);
         let p = a.mmap(&mut b, 0, 16 * PAGE, RW, ANON, None).unwrap();
@@ -534,10 +498,10 @@ fn map_fixed_replaces_existing_mapping() {
 /// mremap grows in place when it can, else moves with MREMAP_MAYMOVE, keeping the content.
 #[test]
 fn mremap_grow_and_move_preserve_content() {
-    for mode in [Mode::Release, Mode::HighWater] {
+    {
         let r = Reservation::new(64 * MB);
         let mut t = table(CAPACITY);
-        let mut a = arena(&r, mode, &mut t);
+        let mut a = arena(&r, &mut t);
         let mut b = Fake::new(&r);
         let pattern = |i: usize| (i % 251) as u8 + 1;
         let p = a.mmap(&mut b, 0, 4 * PAGE, RW, ANON, None).unwrap();
@@ -578,9 +542,6 @@ fn mremap_grow_and_move_preserve_content() {
         // Not mapped.
         assert_eq!(a.mremap(&mut b, s + PAGE, PAGE, 2 * PAGE, MREMAP_MAYMOVE, 0), Err(Errno::FAULT));
         a.check();
-        if mode == Mode::HighWater {
-            assert!(b.releases.is_empty());
-        }
     }
 }
 
@@ -590,7 +551,7 @@ fn mremap_grow_and_move_preserve_content() {
 fn shared_mapping_written_back() {
     let r = Reservation::new(64 * MB);
     let mut t = table(CAPACITY);
-    let mut a = arena(&r, Mode::Release, &mut t);
+    let mut a = arena(&r, &mut t);
     let mut b = Fake::new(&r);
     b.files.insert(7, vec![b'x'; 3 * PAGE]);
     let f = Some(FileMap { file: 7, offset: 0 });
@@ -643,14 +604,14 @@ fn shared_mapping_written_back() {
     a.check();
 }
 
-/// Threaded mode has no madvise: nothing is ever released, and reused pages (glibc's thread
+/// No mode has madvise: nothing is ever released, and reused pages (glibc's thread
 /// stacks: freed when a thread exits, mapped again for the next) read zero, cleared in place
 /// only where they were written.
 #[test]
 fn high_water_reuses_thread_stacks_zeroed() {
     let r = Reservation::new(256 * MB);
     let mut t = table(CAPACITY);
-    let mut a = arena(&r, Mode::HighWater, &mut t);
+    let mut a = arena(&r, &mut t);
     let mut b = Fake::new(&r);
     let stack = 8 * MB;
     let mut first = None;
@@ -667,7 +628,6 @@ fn high_water_reuses_thread_stacks_zeroed() {
         a.munmap(&mut b, s, stack).unwrap();
         a.check();
     }
-    assert!(b.releases.is_empty());
     // Each reuse cleared the three written pages, no more.
     assert_eq!(a.stats().zeroed, 3 * 3 * PAGE as u64);
     // madvise(DONTNEED) clears in place too.
@@ -679,38 +639,6 @@ fn high_water_reuses_thread_stacks_zeroed() {
     mem(p, 1)[0] = 9;
     a.madvise(&mut b, p, PAGE, MADV_FREE).unwrap();
     assert_eq!(mem(p, 1)[0], 9);
-    assert!(b.releases.is_empty());
-}
-
-/// Release mode gives pages back in calls of at most 1 MiB, inside the arena (all the filter
-/// allows), and the host then holds none of them.
-#[test]
-fn release_chunks_inside_arena() {
-    let r = Reservation::new(64 * MB);
-    let mut t = table(CAPACITY);
-    let mut a = arena(&r, Mode::Release, &mut t);
-    let mut b = Fake::new(&r);
-    let len = 5 * MB + MB / 2;
-    let p = a.mmap(&mut b, 0, len, RW, ANON, None).unwrap();
-    mem(p, len).fill(1);
-    assert_eq!(r.resident(p, len), len / PAGE);
-
-    a.madvise(&mut b, p + PAGE, 3 * MB, MADV_DONTNEED).unwrap();
-    assert!(is_zero(p + PAGE, 3 * MB));
-    assert_eq!(mem(p, 1)[0], 1);
-    assert_eq!(b.released(), 3 * MB);
-
-    a.munmap(&mut b, p, len).unwrap();
-    assert_eq!(b.released(), 3 * MB + len);
-    assert_eq!(a.stats().released, (3 * MB + len) as u64);
-    assert!(b.releases.iter().all(|&(_, n)| n <= MADV_CHUNK)); // (Fake::release checks bounds too)
-    assert_eq!(r.resident(p, len), 0);
-    assert_eq!(a.stats().zeroed, 0);
-    // Reused at once, zero, and nothing more to release.
-    let q = a.mmap(&mut b, 0, len, RW, ANON, None).unwrap();
-    assert_eq!(q, p);
-    assert!(is_zero(q, len));
-    assert_eq!(b.released(), 3 * MB + len);
 }
 
 /// PROT_EXEC is an ordinary protection: mapped and mprotect'd like any other.
@@ -719,7 +647,7 @@ fn prot_exec_is_ordinary() {
     let rwx = PROT_READ | PROT_WRITE | PROT_EXEC;
     let r = Reservation::new(16 * MB);
     let mut t = table(CAPACITY);
-    let mut a = arena(&r, Mode::Release, &mut t);
+    let mut a = arena(&r, &mut t);
     let mut b = Fake::new(&r);
     let p = a.mmap(&mut b, 0, PAGE, rwx, ANON, None).unwrap();
     assert_eq!(prot_at(&a, p), Some(rwx));
@@ -734,7 +662,7 @@ fn prot_exec_is_ordinary() {
 fn full_table_is_enomem_not_corruption() {
     let r = Reservation::new(16 * MB);
     let mut t = table(8);
-    let mut a = arena(&r, Mode::Release, &mut t);
+    let mut a = arena(&r, &mut t);
     let mut b = Fake::new(&r);
     let p = a.mmap(&mut b, 0, 64 * PAGE, RW, ANON, None).unwrap();
     mem(p, 64 * PAGE).fill(3);
@@ -762,9 +690,9 @@ fn full_table_is_enomem_not_corruption() {
     assert_eq!(a.stats(), before);
     assert!(mem(p, 64 * PAGE).iter().all(|&x| x == 3));
     a.check();
-    // Unmapping whole extents needs no room, and frees it.
+    // Unmapping whole extents needs no room, and frees it (one dirty run, then the clean rest).
     a.munmap(&mut b, p, 64 * PAGE).unwrap();
-    assert_eq!(a.stats().extents, 1);
+    assert_eq!(a.stats().extents, 2);
     assert_eq!(a.mmap(&mut b, 0, PAGE, RW, ANON, None), Ok(p));
     a.check();
 }
@@ -774,7 +702,7 @@ fn full_table_is_enomem_not_corruption() {
 fn brk_mincore_madvise_and_errors() {
     let r = Reservation::new(16 * MB);
     let mut t = table(CAPACITY);
-    let mut a = arena(&r, Mode::Release, &mut t);
+    let mut a = arena(&r, &mut t);
     let mut b = Fake::new(&r);
     b.files.insert(7, vec![b'f'; PAGE + 10]);
 
@@ -824,130 +752,102 @@ fn brk_mincore_madvise_and_errors() {
     a.check();
 }
 
-/// High-water mode's image zone (threaded and fork mode give nothing back): a library's pages are
-/// in place while never written; its data, written and freed, is no longer the image's, and the
-/// next mapping of the file is a copy of the file's bytes, not the written pages. (Mapping them in
-/// place again gave a forked compiler's linker a relocated libc: ld.so's "Inconsistency
-/// detected".) Nothing is placed in the freed dirty part either.
-#[test]
-fn high_water_zone_maps_only_unwritten_pages_in_place() {
-    let r = Reservation::new(16 * MB);
-    let mut t = table(64);
-    let mut a = arena(&r, Mode::Release, &mut t);
-    let zone = r.base + 8 * MB;
-    let file: Vec<u8> = (0..3 * PAGE).map(|i| (i % 251) as u8 + 1).collect();
-    // SAFETY: a fresh memfd, mapped privately over the reservation's top (the runtime's zone).
-    unsafe {
-        let fd = libc::memfd_create(c"image".as_ptr(), 0);
-        assert!(fd >= 0);
-        let mut img = vec![0u8; 4 * PAGE];
-        img[..file.len()].copy_from_slice(&file);
-        assert_eq!(libc::write(fd, img.as_ptr().cast(), img.len()), img.len() as isize);
-        let p = libc::mmap(zone as *mut _, img.len(), libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_FIXED, fd, 0);
-        assert_eq!(p as usize, zone);
-        libc::close(fd);
-    }
-    // As the runtime does: the zone set at boot, then threaded mode's switch.
-    a.set_image_zone(zone).unwrap();
-    a.set_mode(Mode::HighWater);
-    let mut b = Fake::new(&r);
-    b.files.insert(7, file.clone());
-    b.in_zone.insert(7, (zone, file.len() as u64));
-    let f7 = |offset| Some(FileMap { file: 7, offset });
-    // ld.so: the span, the code where it is, the data (laid out at its file offset) where it is.
-    assert_eq!(a.mmap(&mut b, 0, 3 * PAGE, PROT_READ, MAP_PRIVATE, f7(0)), Ok(zone));
-    assert_eq!(a.mmap(&mut b, zone + 2 * PAGE, PAGE, RW, MAP_PRIVATE | MAP_FIXED, f7(2 * PAGE as u64)), Ok(zone + 2 * PAGE));
-    assert_eq!(b.read, 0, "all in place");
-    mem(zone + 2 * PAGE, 1)[0] = 0x55; // a relocation
-    a.munmap(&mut b, zone, 3 * PAGE).unwrap();
-    a.check();
-    // Again: the written page isn't the image's any more, so the span is a copy, of the file.
-    let again = a.mmap(&mut b, 0, 3 * PAGE, PROT_READ, MAP_PRIVATE, f7(0)).unwrap();
-    assert!(again < zone, "mapped in place over a written page");
-    assert_eq!(&mem(again, file.len())[..], &file[..]);
-    // The code alone, never written, is still in place.
-    assert_eq!(a.mmap(&mut b, 0, 2 * PAGE, PROT_READ, MAP_PRIVATE, f7(0)), Ok(zone));
-    // And a big mapping isn't placed in the zone's dirty page.
-    let big = a.mmap(&mut b, 0, 7 * MB, RW, ANON, None).unwrap();
-    assert!(big + 7 * MB <= zone);
-    assert!(a.mmap(&mut b, 0, PAGE, RW, ANON, None).unwrap() < zone);
-    a.check();
-}
-
 /// The image zone: a host file mapped privately into the arena's top, the way the runtime maps
-/// the store's images. ld.so's sequence on a library there maps it in place (no copy); what it
-/// writes is its own; anything freed there holds the image's bytes again, and other mappings
-/// never land in it.
+/// the store's images, read-only but for its ELFs' writable segments (`add_zone_writable`).
+/// ld.so's sequence on a library there maps it in place, and again after its data was written
+/// and freed: the read-only pages are always the image's bytes, and the writable
+/// ones get the file's bytes copied in at each mapping. (With a writable zone, high-water mode
+/// never mapped a library in place again once its data was written: fork mode copied nearly
+/// every exec's libraries whole.) Nothing else lands on the read-only pages.
 #[test]
 fn image_zone_maps_files_in_place() {
-    let r = Reservation::new(16 * MB);
-    let mut t = table(64);
-    let mut a = arena(&r, Mode::Release, &mut t);
-    let zone = r.base + 8 * MB;
-    // The image: a file of 2.5 pages at block 2, a nonzero byte after its slot (the next file).
-    let mut img = vec![0u8; 8 * PAGE];
-    let file: Vec<u8> = (0..5 * PAGE / 2).map(|i| (i % 251) as u8 + 1).collect();
-    img[2 * PAGE..2 * PAGE + file.len()].copy_from_slice(&file);
-    img[6 * PAGE] = 0xee;
-    // SAFETY: a fresh memfd, mapped privately over the reservation's top (the runtime's zone).
-    unsafe {
-        let fd = libc::memfd_create(c"image".as_ptr(), 0);
-        assert!(fd >= 0);
-        assert_eq!(libc::write(fd, img.as_ptr().cast(), img.len()), img.len() as isize);
-        let p = libc::mmap(zone as *mut _, img.len(), libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_FIXED, fd, 0);
-        assert_eq!(p as usize, zone);
-        libc::close(fd);
+    {
+        let r = Reservation::new(16 * MB);
+        let mut t = table(64);
+        let mut rw = vec![(0usize, 0usize); 8];
+        let mut a = arena(&r, &mut t);
+        let zone = r.base + 8 * MB;
+        // The image: a file of 2.5 pages at block 2 whose data and .bss are its pages 2 and 3
+        // (its slot, writable), a nonzero byte after the slot (the next file).
+        let mut img = vec![0u8; 8 * PAGE];
+        let file: Vec<u8> = (0..5 * PAGE / 2).map(|i| (i % 251) as u8 + 1).collect();
+        img[2 * PAGE..2 * PAGE + file.len()].copy_from_slice(&file);
+        img[6 * PAGE] = 0xee;
+        let at = zone + 2 * PAGE;
+        // SAFETY: a fresh memfd, mapped privately over the reservation's top (the runtime's zone),
+        // read-only but the writable pages.
+        unsafe {
+            let fd = libc::memfd_create(c"image".as_ptr(), 0);
+            assert!(fd >= 0);
+            assert_eq!(libc::write(fd, img.as_ptr().cast(), img.len()), img.len() as isize);
+            let p = libc::mmap(zone as *mut _, img.len(), libc::PROT_READ, libc::MAP_PRIVATE | libc::MAP_FIXED, fd, 0);
+            assert_eq!(p as usize, zone);
+            assert_eq!(libc::mprotect((at + 2 * PAGE) as *mut _, 2 * PAGE, libc::PROT_READ | libc::PROT_WRITE), 0);
+            libc::close(fd);
+        }
+        a.set_image_zone(zone).unwrap();
+        a.set_zone_writable_table(&mut rw);
+        a.add_zone_writable(at + 2 * PAGE, at + 4 * PAGE).unwrap();
+        assert_eq!(a.stats().size, 8 * MB, "the zone isn't the program's memory");
+        let mut b = Fake::new(&r);
+        b.files.insert(7, file.clone());
+        b.in_zone.insert(7, (at, file.len() as u64));
+        let f7 = |offset| Some(FileMap { file: 7, offset });
+
+        for round in 0..2 {
+            b.read = 0;
+            // ld.so: the span (3 pages of file, then 1 of .bss) from the file, in place: only the
+            // writable pages' share of the file copied (half a page), zeros after it...
+            assert_eq!(a.mmap(&mut b, 0, 4 * PAGE, PROT_READ, MAP_PRIVATE, f7(0)), Ok(at), "round {round}");
+            assert_eq!(b.read, PAGE / 2);
+            assert_eq!(&mem(at, file.len())[..], &file[..], "round {round}: the file's bytes");
+            assert!(is_zero(at + file.len(), 4 * PAGE - file.len()));
+            // ...each read-only segment where it already is...
+            assert_eq!(a.mmap(&mut b, at, 2 * PAGE, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_FIXED, f7(0)), Ok(at));
+            assert_eq!(b.read, PAGE / 2, "nothing more copied");
+            // ...the writable one copied (its offset differs from its address's), .bss anonymous.
+            assert_eq!(a.mmap(&mut b, at + 2 * PAGE, PAGE, RW, MAP_PRIVATE | MAP_FIXED, f7(PAGE as u64)), Ok(at + 2 * PAGE));
+            assert_eq!(mem(at + 2 * PAGE, PAGE), &file[PAGE..2 * PAGE]);
+            assert_eq!(a.mmap(&mut b, at + 3 * PAGE, PAGE, RW, ANON | MAP_FIXED, None), Ok(at + 3 * PAGE));
+            assert!(is_zero(at + 3 * PAGE, PAGE));
+            // The program relocates its data and uses its .bss...
+            mem(at + 2 * PAGE, 1)[0] = 0x55;
+            mem(at + 3 * PAGE, 1)[0] = 0x66;
+            // ...can't make its code writable (no host mprotect after lockdown)...
+            assert_eq!(a.mprotect(at, PAGE, RW), Err(Errno::ACCESS));
+            assert_eq!(a.mprotect(at + 2 * PAGE, PAGE, PROT_READ), Ok(0), "RELRO");
+            // ...and can't put memory of its own over the image.
+            assert_eq!(a.mmap(&mut b, zone, 8 * PAGE, RW, ANON | MAP_FIXED, None), Err(Errno::NOMEM));
+            a.check();
+            // A second mapping of the file while the first lives: a copy, elsewhere.
+            let copy = a.mmap(&mut b, 0, 3 * PAGE, PROT_READ, MAP_PRIVATE, f7(0)).unwrap();
+            assert!(copy < zone);
+            assert_eq!(&mem(copy, file.len())[..], &file[..]);
+            a.munmap(&mut b, copy, 3 * PAGE).unwrap();
+            // Nothing else is placed in the zone, however big.
+            let big = a.mmap(&mut b, 0, 7 * MB, RW, ANON, None).unwrap();
+            assert!(big + 7 * MB <= zone);
+            a.munmap(&mut b, big, 7 * MB).unwrap();
+            // The process's end of it (an exec, or the program's munmap): next round, in place
+            // again with the file's bytes, whatever its data pages hold now.
+            a.munmap(&mut b, at, 4 * PAGE).unwrap();
+            a.check();
+        }
+        // Past its slot it can't be (the next file's byte would show where zeros belong): copied.
+        let long = a.mmap(&mut b, 0, 5 * PAGE, PROT_READ, MAP_PRIVATE, f7(0)).unwrap();
+        assert!(long < zone);
+        assert!(is_zero(long + file.len(), 5 * PAGE - file.len()));
+        // Anonymous memory over the writable pages alone reads zero.
+        assert_eq!(a.mmap(&mut b, at + 2 * PAGE, 2 * PAGE, RW, ANON | MAP_FIXED, None), Ok(at + 2 * PAGE));
+        assert!(is_zero(at + 2 * PAGE, 2 * PAGE));
+        a.munmap(&mut b, at + 2 * PAGE, 2 * PAGE).unwrap();
+        // Moved, an in-place mapping is a copy that keeps its bytes.
+        assert_eq!(a.mmap(&mut b, 0, 3 * PAGE, PROT_READ, MAP_PRIVATE, f7(0)), Ok(at));
+        // (Grown past its slot's writable pages: the image is in the way.)
+        let moved = a.mremap(&mut b, at, 3 * PAGE, 5 * PAGE, MREMAP_MAYMOVE, 0).unwrap();
+        assert!(moved < zone);
+        assert_eq!(&mem(moved, file.len())[..], &file[..]);
+        assert_eq!(mem(zone + 6 * PAGE, 1)[0], 0xee, "the image is never written");
+        a.check();
     }
-    a.set_image_zone(zone).unwrap();
-    assert_eq!(a.stats().size, 8 * MB, "the zone isn't the program's memory");
-    let mut b = Fake::new(&r);
-    b.files.insert(7, file.clone());
-    let at = zone + 2 * PAGE;
-    b.in_zone.insert(7, (at, file.len() as u64));
-    let f7 = |offset| Some(FileMap { file: 7, offset });
-
-    // ld.so: the span (3 pages of file, then 1 of .bss: the slot's zero block) from the file...
-    assert_eq!(a.mmap(&mut b, 0, 4 * PAGE, PROT_READ, MAP_PRIVATE, f7(0)), Ok(at));
-    // ...each read-only segment where it already is...
-    assert_eq!(a.mmap(&mut b, at, 2 * PAGE, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_FIXED, f7(0)), Ok(at));
-    assert_eq!(b.read, 0, "nothing copied");
-    assert_eq!(&mem(at, file.len())[..], &file[..]);
-    // ...the writable one copied (its offset differs from its address's), and .bss anonymous.
-    assert_eq!(a.mmap(&mut b, at + 2 * PAGE, PAGE, RW, MAP_PRIVATE | MAP_FIXED, f7(PAGE as u64)), Ok(at + 2 * PAGE));
-    assert_eq!(b.read, PAGE);
-    assert_eq!(mem(at + 2 * PAGE, PAGE), &file[PAGE..2 * PAGE]);
-    mem(at + 2 * PAGE, 1)[0] = 0x55;
-    assert_eq!(a.mmap(&mut b, at + 3 * PAGE, PAGE, RW, ANON | MAP_FIXED, None), Ok(at + 3 * PAGE));
-    assert!(is_zero(at + 3 * PAGE, PAGE));
-    mem(at + 3 * PAGE, 1)[0] = 0x66;
-    a.check();
-
-    // A second mapping of the file while the first lives: a copy, elsewhere.
-    let copy = a.mmap(&mut b, 0, 3 * PAGE, PROT_READ, MAP_PRIVATE, f7(0)).unwrap();
-    assert!(copy < zone);
-    assert_eq!(&mem(copy, file.len())[..], &file[..]);
-    // Nothing else is placed in the zone, however big.
-    let big = a.mmap(&mut b, 0, 7 * MB, RW, ANON, None).unwrap();
-    assert!(big + 7 * MB <= zone);
-    // Unmapped, the zone holds the image again: mapped in place once more, unwritten.
-    a.munmap(&mut b, at, 4 * PAGE).unwrap();
-    assert_eq!(&mem(at, file.len())[..], &file[..]);
-    assert!(is_zero(at + file.len(), 4 * PAGE - file.len()));
-    assert_eq!(a.mmap(&mut b, 0, 4 * PAGE, PROT_READ, MAP_PRIVATE, f7(0)), Ok(at));
-    a.munmap(&mut b, at, 4 * PAGE).unwrap();
-    // Past its slot it can't be (the next file's byte would show where zeros belong): copied.
-    let long = a.mmap(&mut b, 0, 5 * PAGE, PROT_READ, MAP_PRIVATE, f7(0)).unwrap();
-    assert!(long < zone);
-    assert!(is_zero(long + file.len(), 5 * PAGE - file.len()));
-    // An anonymous mapping put in the zone by hand reads zero, and the image is back after it.
-    assert_eq!(a.mmap(&mut b, zone, 8 * PAGE, RW, ANON | MAP_FIXED, None), Ok(zone));
-    assert!(is_zero(zone, 8 * PAGE));
-    a.munmap(&mut b, zone, 8 * PAGE).unwrap();
-    assert_eq!(mem(zone + 6 * PAGE, 1)[0], 0xee);
-    assert_eq!(a.mmap(&mut b, 0, 3 * PAGE, PROT_READ, MAP_PRIVATE, f7(0)), Ok(at));
-    // Moved, an in-place mapping is a copy that keeps its bytes.
-    let moved = a.mremap(&mut b, at, 3 * PAGE, 4 * PAGE, MREMAP_MAYMOVE, 0).unwrap();
-    assert!(moved < zone);
-    assert_eq!(&mem(moved, file.len())[..], &file[..]);
-    a.check();
 }

@@ -70,12 +70,6 @@ pub const PPOLL_FDS: u64 = 8;
 pub const SIGCHLD: u64 = 17;
 /// `CLONE_PARENT`: the new process is a sibling of the caller's (a child of its parent).
 pub const CLONE_PARENT: u64 = 0x8000;
-/// `MADV_DONTNEED` (include/uapi/asm-generic/mman-common.h).
-pub const MADV_DONTNEED: u64 = 4;
-/// The most one `madvise` from the gate may cover. Each arena reservation has this much padding
-/// past its end, so an address inside the arena plus a length up to this stays inside the
-/// reservation.
-pub const MADV_CHUNK: u64 = 1 << 20;
 
 // Return values (include/uapi/linux/seccomp.h).
 pub const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
@@ -175,8 +169,6 @@ pub struct Params<'a> {
     /// The address just past the gate's `syscall` instruction (what the kernel reports):
     /// `trap::gate_ip()`.
     pub gate_ip: u64,
-    /// Inclusive address ranges `madvise` may start in (coroutine mode).
-    pub arena: &'a [(u64, u64)],
     /// The CPU-token eventfds, an inclusive range (threaded and fork mode; ignored otherwise).
     pub token_fds: (u32, u32),
     /// The sandbox's own host pid: the one process `kill` from the gate may signal (coroutine and
@@ -190,7 +182,7 @@ pub struct Params<'a> {
 pub enum Error {
     /// The program doesn't fit in [`MAX_INSNS`].
     TooLong,
-    /// A condition (or the token fds, or an arena range) with `lo > hi`.
+    /// A condition (or the token fds) with `lo > hi`.
     EmptyRange,
     /// A condition on an argument past 5.
     NoSuchArg,
@@ -250,8 +242,6 @@ enum Is {
     TokenFd,
     /// Exactly `Params::pid`.
     Pid,
-    /// Within one of `Params::arena`'s ranges: the entry becomes one rule per range.
-    Arena,
 }
 
 struct Entry {
@@ -288,16 +278,11 @@ const HOST: &[Entry] = &[
     // the process's fds tells a compromised program nothing it couldn't learn by timing the
     // reads the filter does allow, and changes nothing.
     Entry { modes: ALL, nr: NR_PPOLL, conds: &[(1, Is::In(0, PPOLL_FDS)), (3, Is::Eq(0))] },
-    // Freed arena pages back to the host: arena addresses only, one chunk at a time (the
-    // reservation's padding keeps address + length inside it), only MADV_DONTNEED. Only with one
-    // host thread: madvise concurrent with page faults on other threads is the Dirty-COW race
-    // class, so where there are host threads (threaded and fork mode) memory is high-water and
-    // an exec reuses the old image's pages in place.
-    Entry {
-        modes: COROUTINE,
-        nr: NR_MADVISE,
-        conds: &[(0, Is::Arena), (1, Is::In(0, MADV_CHUNK)), (2, Is::Eq(MADV_DONTNEED))],
-    },
+    // No madvise in any mode: memory stays at its peak, freed pages cleared on reuse (arena.rs).
+    // Where there are host threads, madvise concurrent with page faults on other threads is the
+    // Dirty-COW race class; exec needs none (the image zone is read-only); and one memory model
+    // for every mode is simpler than two. (Coroutine mode had MADV_DONTNEED on the arena, one
+    // MiB at a time.)
     // Block on (read) and hand over (write) the CPU token: the eventfds, made before lockdown.
     Entry { modes: THREADED | FORK, nr: NR_READ, conds: &[(0, Is::TokenFd)] },
     Entry { modes: THREADED | FORK, nr: NR_WRITE, conds: &[(0, Is::TokenFd)] },
@@ -445,39 +430,23 @@ impl Emit<'_> {
     /// A table entry with its lockdown-time bounds filled in.
     fn entry(&mut self, e: &Entry, params: &Params) -> Result<(), Error> {
         let mut conds = [Cond { arg: 0, lo: 0, hi: 0 }; MAX_CONDS];
-        let mut arena_at = None;
         for (i, &(arg, is)) in e.conds.iter().enumerate() {
             let (lo, hi) = match is {
                 Is::In(lo, hi) => (lo, hi),
                 Is::Eq(v) => (v, v),
                 Is::TokenFd => (params.token_fds.0 as u64, params.token_fds.1 as u64),
                 Is::Pid => (params.pid as u64, params.pid as u64),
-                Is::Arena => {
-                    arena_at = Some(i);
-                    (0, 0) // per range, below
-                }
             };
             conds[i] = Cond { arg, lo, hi };
         }
-        let conds = &mut conds[..e.conds.len()];
-        match arena_at {
-            None => self.rule(e.nr, conds),
-            Some(i) => {
-                for &(lo, hi) in params.arena {
-                    conds[i].lo = lo;
-                    conds[i].hi = hi;
-                    self.rule(e.nr, conds)?;
-                }
-                Ok(())
-            }
-        }
+        self.rule(e.nr, &conds[..e.conds.len()])
     }
 }
 
 /// Compile `params` into `out` (overwritten). Pure: no syscalls, no allocation.
 pub fn compile(params: &Params, out: &mut Program) -> Result<(), Error> {
     out.len = 0;
-    if params.token_fds.0 > params.token_fds.1 || params.arena.iter().any(|&(lo, hi)| lo > hi) {
+    if params.token_fds.0 > params.token_fds.1 {
         return Err(Error::EmptyRange);
     }
     let mut e = Emit { p: out, a_is_nr: false };

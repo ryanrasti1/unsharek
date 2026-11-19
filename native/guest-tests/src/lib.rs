@@ -92,19 +92,14 @@ macro_rules! group {
 /// the fix un-ignores it.
 #[macro_export]
 macro_rules! all {
-    (native) => { $crate::all!(@one []); $crate::all!(@processes); };
-    (coroutine) => { $crate::all!(@one [ignore = "guest: a timed FUTEX_WAIT returns 0 early"]); };
-    (threaded) => { $crate::all!(@one [ignore = "guest: a timed FUTEX_WAIT returns 0 early"]); };
-    (fork) => {
-        $crate::all!(@one [ignore = "guest: a timed FUTEX_WAIT returns 0 early"]);
-        $crate::all!(@processes);
-    };
-    // `futex`: the attributes of the tests a timed futex wait's early return breaks (every mode:
-    // FUTEX_WAIT with a timeout returns 0 after ~1 ms).
-    (@one [$($futex:meta)*]) => {
+    (native) => { $crate::all!(@one); $crate::all!(@processes); };
+    (coroutine) => { $crate::all!(@one); };
+    (threaded) => { $crate::all!(@one); };
+    (fork) => { $crate::all!(@one); $crate::all!(@processes); };
+    (@one) => {
         $crate::group!(files: file_rw, dirs, shmap, statx_probe, devnodes);
         $crate::group!(memory: big_alloc, rwx, small_stack, gsbase);
-        $crate::group!(threads: thread_fds, futex_wake, std_sync, sleepy, threadpoll, $(#[$futex])* futex_timeout);
+        $crate::group!(threads: thread_fds, futex_wake, std_sync, sleepy, threadpoll, futex_timeout);
         $crate::group!(signals:
             handler_at_raise, blocked_pending, kill_process, sigqueue_info, timer_eintr, altstack,
             sa_restart, longjmp_out, nested_and_vector_regs, thread_in_waits, every_signal, sigsys,
@@ -115,7 +110,7 @@ macro_rules! all {
         $crate::group!(time: clock);
         $crate::group!(exec: exec_reset, exec_then_threads);
         $crate::group!(host_side:
-            $(#[$futex])* idle_cpu,
+            idle_cpu,
             #[should_panic(expected = "boom")] should_panic,
             // Run by hand (--run-ignored only) to see how failures look.
             #[ignore] demo_assert_fails,

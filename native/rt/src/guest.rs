@@ -97,6 +97,10 @@ fn futexes() -> &'static Futexes {
     unsafe { &*FUTEXES.0.get() }
 }
 static ARENA_TABLE: Local<[Extent; arena::CAPACITY]> = Local::new([Extent::EMPTY; arena::CAPACITY]);
+/// The image zone's writable ranges (`Arena::add_zone_writable`): one or two per ELF in the
+/// closure's images (python's closure has ~1,500 ELFs). 256 KiB of bss, touched as used.
+static ZONE_RW: Local<[(usize, usize); ZONE_RW_CAP]> = Local::new([(0, 0); ZONE_RW_CAP]);
+const ZONE_RW_CAP: usize = 16 << 10;
 static ARENA: Local<Option<Arena<'static>>> = Local::new(None);
 static SCRATCH: Local<Scratch> = Local::new(Scratch::new());
 static FILTER: Local<Filter> = Local::new(Filter::new());
@@ -188,7 +192,14 @@ struct State {
     aux: Cell<Aux>,
     /// The running program's absolute path (STOPGAP(item 10): `/proc/self/exe`).
     exe_len: Cell<usize>,
+    /// The host thread's CPU affinity mask at boot (`sched_getaffinity`'s bytes, `cpus_len` of
+    /// them): what threaded and fork mode report, since their threads run on the host's CPUs.
+    cpus: [Cell<u64>; CPU_WORDS],
+    cpus_len: Cell<usize>,
 }
+
+/// The CPU mask's capacity, in words: 1024 CPUs (glibc's `cpu_set_t`).
+const CPU_WORDS: usize = 16;
 
 static S: State = State {
     phase: Cell::new(Phase::Booted),
@@ -220,6 +231,8 @@ static S: State = State {
     routed: Cell::new(false),
     aux: Cell::new(Aux { hwcap: 0, hwcap2: 0, sysinfo_ehdr: 0, minsigstksz: 0 }),
     exe_len: Cell::new(0),
+    cpus: [const { Cell::new(0) }; CPU_WORDS],
+    cpus_len: Cell::new(0),
 };
 
 // SAFETY: one host thread (see `Local`).
@@ -230,8 +243,7 @@ unsafe impl Sync for State {}
 
 /// What [`boot`] needs: memory the caller reserved before (host `mmap`, `MAP_NORESERVE`).
 pub struct Boot<'a> {
-    /// The program's arena, `(base, len)`: page-aligned, read/write/execute, zero, with
-    /// `filter::MADV_CHUNK` bytes of the reservation past `len` (the filter's `madvise` bound).
+    /// The program's arena, `(base, len)`: page-aligned, read/write/execute, zero.
     pub arena: (usize, usize),
     /// How much of the arena, at its end, is the image zone (`arena::Arena::set_image_zone`,
     /// `memblk`): where the caller maps images to be mapped in place from. 0 for none.
@@ -274,12 +286,14 @@ pub unsafe fn boot(b: Boot) -> Result<(), Error> {
         host::install(&SCHED, b.heap.0, b.heap.1);
         crate::executor::install(&SCHED);
         let table: &'static mut [Extent] = &mut ARENA_TABLE.get()[..];
-        let mut a = Arena::new(b.arena.0, b.arena.1, arena::Mode::Release, table).map_err(err("arena"))?;
+        let mut a = Arena::new(b.arena.0, b.arena.1, table).map_err(err("arena"))?;
         if b.image_zone != 0 {
             a.set_image_zone(b.arena.0 + b.arena.1 - b.image_zone).map_err(err("the image zone"))?;
+            a.set_zone_writable_table(&mut ZONE_RW.get()[..]);
         }
         *ARENA.get() = Some(a);
     }
+    host_cpus();
     S.arena_lo.set(b.arena.0);
     S.arena_hi.set(b.arena.0 + b.arena.1);
     let key = TlsKey::alloc(&SCHED, None).ok_or(Error { what: "a TLS key", errno: Errno::NOMEM })?;
@@ -321,7 +335,7 @@ pub fn route() -> Result<(), Error> {
     if S.routed.get() {
         return Ok(());
     }
-    let p = Params { policy: Policy::RouteOnly, deny: Deny::Kill, gate_ip: trap::gate_ip(), arena: &[], token_fds: (0, 0), pid: 0, extra: &[] };
+    let p = Params { policy: Policy::RouteOnly, deny: Deny::Kill, gate_ip: trap::gate_ip(), token_fds: (0, 0), pid: 0, extra: &[] };
     // SAFETY: the static program, used only here and in `lock`, one at a time.
     let prog = unsafe { FILTER.get() };
     filter::compile(&p, prog).map_err(|_| Error { what: "the routing filter", errno: Errno::INVAL })?;
@@ -407,12 +421,10 @@ pub fn fork_child(token: Option<u16>, spawn_idler: impl FnOnce()) -> Result<(), 
 }
 
 /// Switch the runtime to threaded mode (a host thread per program thread): bind the main thread,
-/// make the CPU-token eventfds (before lockdown), set memory high-water (the mode filter refuses
-/// `madvise`), and install the scheduler driver. Returns the token eventfds' inclusive fd range,
+/// make the CPU-token eventfds (before lockdown), and install the scheduler driver. Returns the token eventfds' inclusive fd range,
 /// for the mode filter. Call once, after [`boot`] and before [`route`], on the main thread. The
 /// caller must also start the kernel idler host thread on [`threaded_kernel_main`].
 pub fn enable_threaded() -> Result<(u32, u32), Error> {
-    with_arena(|a, _| a.set_mode(arena::Mode::HighWater));
     // SAFETY: once, on the main (boot) thread, before lockdown.
     unsafe { par::enable(&SCHED, SCHED.current()) }.map_err(err("enabling threaded mode"))
 }
@@ -429,9 +441,11 @@ pub fn threaded_wait_ready() {
     par::wait_kernel_ready()
 }
 
-/// The arena as the mode filter's `madvise` range (inclusive): `filter::Params::arena`.
-pub fn arena_range() -> (u64, u64) {
-    (S.arena_lo.get() as u64, S.arena_hi.get() as u64 - 1)
+/// `[lo, hi)` of the image zone is writable on the host (an ELF's writable segments in its slot;
+/// the rest of an image is mapped read-only there): `arena::Arena::add_zone_writable`. Before
+/// lockdown, as each image is mapped.
+pub fn zone_writable(lo: usize, hi: usize) -> Result<(), Error> {
+    with_arena(|a, _| a.add_zone_writable(lo, hi)).map_err(err("the image zone's writable pages"))
 }
 
 /// Whether setup-phase memory calls may still go to the host (false just before the mode's
@@ -681,11 +695,6 @@ impl Backing for Guest {
 
     fn close(&mut self, file: u64) {
         lkl_quiet(l::__lkl__NR_close, [file as usize, 0, 0, 0, 0, 0]);
-    }
-
-    fn release(&mut self, addr: usize, len: usize) -> arena::Result<()> {
-        // SAFETY: the arena gives back only pages nothing relies on.
-        unsafe { trap::madvise_dontneed(addr, len) }
     }
 
     fn locate(&mut self, file: u64, offset: u64) -> Option<(usize, u64)> {
@@ -1004,6 +1013,7 @@ unsafe extern "C" fn task_exit(pid: core::ffi::c_int, status: core::ffi::c_int) 
 // Numbers the dispatcher looks at before routing.
 
 const NR_READLINK: usize = 89;
+const NR_SCHED_GETAFFINITY: usize = 204;
 const NR_READLINKAT: usize = 267;
 const NR_RT_SIGRETURN: u64 = 15;
 /// The test hook's call ([`serve`]; debug builds): out of the x86-64 table, so ENOSYS natively.
@@ -1622,6 +1632,11 @@ fn serve(uc: &mut Ucontext, nr: usize, a: [usize; 6]) -> isize {
         }
         panic!("runtime_panic.c's test hook");
     }
+    // alarm, setitimer, timer_settime: from now on the kernel's timer may send a signal, so its
+    // firing interrupts the runtime's waits (`host::timer_fired`).
+    if matches!(nr, 37 | 38 | 223) {
+        host::SIGNAL_TIMERS.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
     // STOPGAP(item 10): readlink, readlinkat(AT_FDCWD) of /proc/self/exe.
     let exe = match nr {
         NR_READLINK => readlink_exe(a[0], a[1], a[2]),
@@ -1920,12 +1935,7 @@ fn emulate(uc: &mut Ucontext, e: Emulate, nr: usize, a: [usize; 6]) -> isize {
             SCHED.yield_now();
             0
         }
-        E::SchedGetaffinity => {
-            if a[1] < 8 {
-                return -(Errno::INVAL.raw_os_error() as isize);
-            }
-            ret(write_user(a[2], 1u64).map(|_| 8))
-        }
+        E::SchedGetaffinity => sched_getaffinity(a[1], a[2]),
         E::SchedSetaffinity => 0,
         E::Getcpu => {
             for p in [a[0], a[1]] {
@@ -1985,18 +1995,72 @@ fn emulate(uc: &mut Ucontext, e: Emulate, nr: usize, a: [usize; 6]) -> isize {
     }
 }
 
+/// The host's CPU mask, read at boot (before lockdown: a plain syscall through the gate). Every
+/// program thread may run on any of them in threaded and fork mode, and programs size their
+/// thread pools from it (rustc's codegen ran one unit at a time when this said one CPU).
+fn host_cpus() {
+    let mut m = [0u64; CPU_WORDS];
+    // SAFETY: sched_getaffinity(0, len, buf) writes at most `len` bytes into `m`.
+    let r = unsafe { trap::gate(NR_SCHED_GETAFFINITY, 0, size_of_val(&m), m.as_mut_ptr() as usize, 0, 0, 0) };
+    let len = if r > 0 && m.iter().any(|&w| w != 0) { r as usize } else { 0 };
+    for (c, w) in S.cpus.iter().zip(m) {
+        c.set(w);
+    }
+    S.cpus_len.set(len);
+}
+
+/// `sched_getaffinity(pid, len, mask)` (of any thread: they all run anywhere): the host's CPUs in
+/// threaded and fork mode, one CPU in coroutine mode (one host thread runs everything). Returns
+/// the bytes written, as the kernel does.
+fn sched_getaffinity(len: usize, mask: usize) -> isize {
+    let n = if par::enabled() { S.cpus_len.get() } else { 0 };
+    if n == 0 {
+        if len < 8 {
+            return -(Errno::INVAL.raw_os_error() as isize);
+        }
+        return ret(write_user(mask, 1u64).map(|_| 8));
+    }
+    // The kernel's checks: the buffer holds the whole mask, in longs.
+    if len < n || !len.is_multiple_of(8) {
+        return -(Errno::INVAL.raw_os_error() as isize);
+    }
+    if !user(mask, n) {
+        return -(Errno::FAULT.raw_os_error() as isize);
+    }
+    for (i, c) in S.cpus.iter().enumerate().take(n.div_ceil(8)) {
+        // SAFETY: inside the program's memory (checked), possibly unaligned.
+        unsafe { core::ptr::write_unaligned((mask as *mut u64).add(i), c.get()) };
+    }
+    n as isize
+}
+
 fn futex_call(a: [usize; 6]) -> isize {
     let (uaddr, op, val, tp, val3) = (a[0], a[1] as u32, a[2] as u32, a[3], a[5] as u32);
     if !user(uaddr, 4) {
         return -(Errno::FAULT.raw_os_error() as isize);
     }
     let cmd = op & !(futex::FUTEX_PRIVATE_FLAG | futex::FUTEX_CLOCK_REALTIME);
+    let (mut op, mut val3) = (op, val3);
     let mut ts = None;
     if (cmd == futex::FUTEX_WAIT || cmd == futex::FUTEX_WAIT_BITSET) && tp != 0 {
         match read_user::<futex::Timespec>(tp) {
             Ok(t) => ts = Some(t),
             Err(e) => return -(e.raw_os_error() as isize),
         }
+    }
+    // A relative timeout made absolute once (FUTEX_WAIT_BITSET on CLOCK_MONOTONIC, any bit): a
+    // wait woken for nothing below waits again until the same deadline. (It returned 0 instead,
+    // and a timed wait came back after ~1 ms, its timeout cut short by whatever woke it: three
+    // 60 ms waits returned at 0.2-1 ms. glibc's loops hide it; std's Condvar::wait_timeout
+    // doesn't: guest-tests' threads::futex_timeout.)
+    if cmd == futex::FUTEX_WAIT
+        && let Some(t) = ts
+    {
+        let Ok(rel) = t.to_ns() else { return -(Errno::INVAL.raw_os_error() as isize) };
+        let d = SCHED.now().saturating_add(rel);
+        ts = Some(futex::Timespec { tv_sec: (d / 1_000_000_000) as i64, tv_nsec: (d % 1_000_000_000) as i64 });
+        op = futex::FUTEX_WAIT_BITSET | (op & futex::FUTEX_PRIVATE_FLAG);
+        val3 = futex::FUTEX_BITSET_MATCH_ANY;
     }
     loop {
         // A wait of the runtime's own, not the kernel's: a group exit, an exec's kill or a signal
@@ -2010,9 +2074,9 @@ fn futex_call(a: [usize; 6]) -> isize {
             return ret(r);
         }
         // Ask the kernel: one call, at whose start a killed task ends (the task_exit host op) and
-        // at whose return a caught signal's handler runs. Neither: nothing for this thread, and an
-        // untimed wait on an unchanged word waits again (the wake is invisible); otherwise a
-        // wakeup for nothing, which a futex wait may return (0). A handler ran: EINTR, as Linux's
+        // at whose return a caught signal's handler runs. Neither: nothing for this thread, and a
+        // wait on an unchanged word waits again (the wake is invisible; a timed one to its
+        // deadline); otherwise a wakeup for nothing, which a futex wait may return (0). A handler ran: EINTR, as Linux's
         // (or the wait again, for an untimed wait under SA_RESTART: Linux's -ERESTARTSYS).
         let t = cur();
         let before = t.handled.get();
@@ -2021,7 +2085,7 @@ fn futex_call(a: [usize; 6]) -> isize {
             // SAFETY: program memory (checked), 4-aligned (futex checked), read atomically.
             let now = unsafe { core::sync::atomic::AtomicU32::from_ptr(uaddr as *mut u32) }
                 .load(core::sync::atomic::Ordering::SeqCst);
-            if ts.is_none() && now == val {
+            if now == val {
                 continue;
             }
             return 0;

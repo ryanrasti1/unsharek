@@ -38,8 +38,8 @@
 //!   through the gate ([`trap::clone_thread`]); the slot frees when the host kernel clears its tid
 //!   word (`CLONE_CHILD_CLEARTID`). The thread ends with `exit(0)` through the gate.
 //!
-//! Memory is high-water (the filter refuses `madvise` here: concurrent `madvise` and page faults
-//! is the Dirty-COW race class).
+//! Memory is high-water, as in every mode (no `madvise`: concurrent `madvise` and page faults is
+//! the Dirty-COW race class).
 //!
 //! - **Fork mode** (`guest`'s `fork`): the same, across host processes. [`PAR`] (the token, every
 //!   process's slots) is in the shared section (`share`), the eventfds are inherited by every fork,

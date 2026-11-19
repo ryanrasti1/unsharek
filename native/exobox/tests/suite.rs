@@ -349,6 +349,20 @@ fn cases() -> Vec<Case> {
                 ])
                 .uses(&["EXOBOX_TEST_GCC", "EXOBOX_TEST_COREUTILS"])
         },
+        // Libraries mapped in place at every exec, from a forked child too, their code never
+        // writable (native/fixtures/c/libcode.c).
+        case("libcode_inplace", Prog::Fixture("libcode"), ALL, ok("LIBCODE_OK")).args(vec![Arg::Lit("inplace"), Arg::Lit("4")]),
+        case("libcode_inplace_fork", Prog::Fixture("libcode"), FORK, ok("LIBCODE_OK"))
+            .args(vec![Arg::Lit("inplace"), Arg::Lit("6"), Arg::Lit("fork")]),
+        case("libcode_write", Prog::Fixture("libcode"), ALL, Expect { not_stdout: vec!["LIBCODE_WROTE"], ..status(Status::Signal(11)) })
+            .args(vec![Arg::Lit("write")]),
+        case("libcode_mprotect", Prog::Fixture("libcode"), ALL, ok("MPROTECT_EACCES"))
+            .args(vec![Arg::Lit("mprotect")])
+            .native(Some(ok("MPROTECT_OK"))),
+        // The CPUs a program is told: the host's where its threads run in parallel, one in
+        // coroutine mode (rustc sized its codegen from it).
+        Case { check: Some(nproc_is_hosts), ..case("nproc", Prog::Fixture("nproc"), THREADED_FORK, ok("NPROC ")) },
+        case("nproc_one", Prog::Fixture("nproc"), &[Mode::Coroutine], ok("NPROC 1")).native(None),
         // cargo, rustup-less: Rust's std probes statx with NULLs (statx_probe), which crashed every
         // cargo at startup. Its build in fork mode: cargo, rustc and cc, each a process of its own.
         case("cargo_version", Prog::External("EXOBOX_TEST_CARGO"), ALL, ok("cargo ")).args(vec![Arg::Lit("--version")]),
@@ -388,6 +402,12 @@ fn cases() -> Vec<Case> {
 /// sysaudit's outcome for every number, against docs/syscalls.md's classes (as capnix's tier A
 /// measured them): these two lists, and everything else not skipped served (neither ENOSYS nor
 /// EPERM, and no crash or hang).
+/// The count is this process's own (the sandbox's host threads run where it may).
+fn nproc_is_hosts(out: &str) -> Result<(), String> {
+    let want = std::thread::available_parallelism().map_err(|e| e.to_string())?.get();
+    if out.lines().any(|l| l == format!("NPROC {want}")) { Ok(()) } else { Err(format!("want NPROC {want} in:\n{out}")) }
+}
+
 fn sysaudit_check(out: &str) -> Result<(), String> {
     const EPERM: &[&str] = &[
         "swapon", "swapoff", "sethostname", "setdomainname", "acct",
