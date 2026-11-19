@@ -32,10 +32,10 @@
 //! succeeds, and its own later mapping of that page may not read zero.
 //!
 //! # Giving pages back: two modes
-//! - [`Mode::Release`] (coroutine and fork modes): freed dirty pages go back to the host at once
+//! - [`Mode::Release`] (coroutine mode): freed dirty pages go back to the host at once
 //!   through [`Backing::release`] (`madvise(MADV_DONTNEED)`), in calls of at most [`MADV_CHUNK`]
 //!   bytes inside the arena: the filter allows only that. Free memory is then always clean.
-//! - [`Mode::HighWater`] (threaded mode): the filter allows no `madvise` at all (concurrent
+//! - [`Mode::HighWater`] (threaded and fork mode): the filter allows no `madvise` at all (concurrent
 //!   `madvise` and page faults is the Dirty-COW race class), so nothing is released and memory stays
 //!   at its peak. Freed dirty pages stay dirty and are cleared in place when they are handed out
 //!   again, only the pages that actually hold a nonzero byte: reading a page the program never
@@ -49,10 +49,14 @@
 //! when the range still holds the image's bytes and what it covers past the file's end is zero:
 //! ld.so's reservation of a library, then its read-only segments `MAP_FIXED` where they already
 //! are. The program's code is then the host's page cache, shared by every sandbox and by the
-//! host's own processes, as a native libc is. Only in release mode: what was mapped there is
-//! given back when freed, which restores the image's bytes (the file's, under the private
-//! mapping); that is how the zone knows it still holds them (`Kind::Image`). Nothing is placed
-//! in the zone; a mapping put there `MAP_FIXED` is cleared first, like any reuse.
+//! host's own processes, as a native libc is. In release mode what was mapped there is given back
+//! when freed, which restores the image's bytes (the file's, under the private mapping); that is
+//! how the zone knows it still holds them (`Kind::Image`). In high-water mode nothing is given
+//! back: a range is in place while it was never written (a library's code, again and again; its
+//! data only the first time), and a written one stays dirty when freed, copied from instead. A
+//! fork mode child's zone is its parent's, written pages and all, with the parent's table.
+//! Nothing is placed in the zone; a mapping put there `MAP_FIXED` is cleared first, like any
+//! reuse.
 //!
 //! # What is not Linux
 //! - **No protections after lockdown.** `mprotect` records the protection (for `/proc/self/maps`
@@ -290,15 +294,19 @@ impl Kind {
     }
 }
 
-/// `k` as it must be at `s` with the image zone from `zone`: there, unmapped is [`Kind::Image`]
-/// and a mapping is dirty unless mapped in place (a zero anonymous page there was written zero,
-/// over the image's bytes, so it must be given back when freed).
+/// `k` as it must be at `s` with the image zone from `zone`: there, unmapped and clean is
+/// [`Kind::Image`] and a mapping is dirty unless mapped in place (a zero anonymous page there was
+/// written zero, over the image's bytes, so it must be given back when freed). Unmapped and dirty
+/// stays so: high-water mode gives nothing back, so a freed page that was written (a library's
+/// data, relocated) no longer holds the image's bytes, and mapping it in place again handed the
+/// next program a relocated copy (fork mode: ld.so's "Inconsistency detected ...
+/// elf_machine_rela_relative", in a compiler run's linker; also a second exec in threaded mode).
 fn in_zone(zone: usize, s: usize, k: Kind) -> Kind {
     if s < zone {
         return k;
     }
     match k {
-        Kind::Free { .. } => Kind::Image,
+        Kind::Free { dirty: false } => Kind::Image,
         Kind::Mapped { prot, anon: true, shared, .. } => Kind::Mapped { prot, dirty: true, anon: true, shared },
         k => k,
     }
@@ -361,8 +369,8 @@ impl<'t> Arena<'t> {
     /// the address of its bytes ([`Backing::locate`]) instead of copying them. The program's code
     /// is then the host's page cache, shared by every sandbox, not a copy in each (libc alone is
     /// 2 MB). Nothing is placed in the zone; a mapping put there `MAP_FIXED` works, cleared
-    /// first. In place only in release mode: a range is mapped in place only while it holds the
-    /// image's bytes, which giving pages back restores and nothing else does.
+    /// first. A range is mapped in place only while it holds the image's bytes: never written,
+    /// or given back since (release mode).
     ///
     /// Not counted in [`Stats::size`]: it is the images', not the program's memory.
     pub fn set_image_zone(&mut self, zone: usize) -> Result<()> {
@@ -372,7 +380,7 @@ impl<'t> Arena<'t> {
         self.room(1)?;
         self.zone = zone;
         self.apply(zone, self.end, &|_, _| Kind::Image);
-        self.in_place = self.mode == Mode::Release;
+        self.in_place = true;
         Ok(())
     }
 
@@ -897,6 +905,7 @@ impl<'t> Arena<'t> {
         if hint != 0
             && hint.is_multiple_of(PAGE)
             && let Some(hi) = self.range(hint, len)
+            && hi <= self.zone
             && self.all(hint, hi, Kind::is_free)
         {
             return Ok(hint);
@@ -916,7 +925,8 @@ impl<'t> Arena<'t> {
 
     fn first_fit(&self, len: usize, align: usize) -> Option<usize> {
         let mut i = 0;
-        while i < self.n {
+        // Nothing is placed in the image zone (where high-water mode leaves freed dirty pages).
+        while i < self.n && self.table[i].start < self.zone {
             if !self.table[i].kind.is_free() {
                 i += 1;
                 continue;
@@ -927,7 +937,7 @@ impl<'t> Arena<'t> {
                 j += 1;
             }
             let a = self.table[i].start.checked_add(align - 1)? & !(align - 1);
-            if a.checked_add(len).is_some_and(|e| e <= self.ext_end(j)) {
+            if a.checked_add(len).is_some_and(|e| e <= self.ext_end(j).min(self.zone)) {
                 return Some(a);
             }
             i = j + 1;

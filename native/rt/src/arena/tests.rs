@@ -824,6 +824,56 @@ fn brk_mincore_madvise_and_errors() {
     a.check();
 }
 
+/// High-water mode's image zone (threaded and fork mode give nothing back): a library's pages are
+/// in place while never written; its data, written and freed, is no longer the image's, and the
+/// next mapping of the file is a copy of the file's bytes, not the written pages. (Mapping them in
+/// place again gave a forked compiler's linker a relocated libc: ld.so's "Inconsistency
+/// detected".) Nothing is placed in the freed dirty part either.
+#[test]
+fn high_water_zone_maps_only_unwritten_pages_in_place() {
+    let r = Reservation::new(16 * MB);
+    let mut t = table(64);
+    let mut a = arena(&r, Mode::Release, &mut t);
+    let zone = r.base + 8 * MB;
+    let file: Vec<u8> = (0..3 * PAGE).map(|i| (i % 251) as u8 + 1).collect();
+    // SAFETY: a fresh memfd, mapped privately over the reservation's top (the runtime's zone).
+    unsafe {
+        let fd = libc::memfd_create(c"image".as_ptr(), 0);
+        assert!(fd >= 0);
+        let mut img = vec![0u8; 4 * PAGE];
+        img[..file.len()].copy_from_slice(&file);
+        assert_eq!(libc::write(fd, img.as_ptr().cast(), img.len()), img.len() as isize);
+        let p = libc::mmap(zone as *mut _, img.len(), libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_FIXED, fd, 0);
+        assert_eq!(p as usize, zone);
+        libc::close(fd);
+    }
+    // As the runtime does: the zone set at boot, then threaded mode's switch.
+    a.set_image_zone(zone).unwrap();
+    a.set_mode(Mode::HighWater);
+    let mut b = Fake::new(&r);
+    b.files.insert(7, file.clone());
+    b.in_zone.insert(7, (zone, file.len() as u64));
+    let f7 = |offset| Some(FileMap { file: 7, offset });
+    // ld.so: the span, the code where it is, the data (laid out at its file offset) where it is.
+    assert_eq!(a.mmap(&mut b, 0, 3 * PAGE, PROT_READ, MAP_PRIVATE, f7(0)), Ok(zone));
+    assert_eq!(a.mmap(&mut b, zone + 2 * PAGE, PAGE, RW, MAP_PRIVATE | MAP_FIXED, f7(2 * PAGE as u64)), Ok(zone + 2 * PAGE));
+    assert_eq!(b.read, 0, "all in place");
+    mem(zone + 2 * PAGE, 1)[0] = 0x55; // a relocation
+    a.munmap(&mut b, zone, 3 * PAGE).unwrap();
+    a.check();
+    // Again: the written page isn't the image's any more, so the span is a copy, of the file.
+    let again = a.mmap(&mut b, 0, 3 * PAGE, PROT_READ, MAP_PRIVATE, f7(0)).unwrap();
+    assert!(again < zone, "mapped in place over a written page");
+    assert_eq!(&mem(again, file.len())[..], &file[..]);
+    // The code alone, never written, is still in place.
+    assert_eq!(a.mmap(&mut b, 0, 2 * PAGE, PROT_READ, MAP_PRIVATE, f7(0)), Ok(zone));
+    // And a big mapping isn't placed in the zone's dirty page.
+    let big = a.mmap(&mut b, 0, 7 * MB, RW, ANON, None).unwrap();
+    assert!(big + 7 * MB <= zone);
+    assert!(a.mmap(&mut b, 0, PAGE, RW, ANON, None).unwrap() < zone);
+    a.check();
+}
+
 /// The image zone: a host file mapped privately into the arena's top, the way the runtime maps
 /// the store's images. ld.so's sequence on a library there maps it in place (no copy); what it
 /// writes is its own; anything freed there holds the image's bytes again, and other mappings
