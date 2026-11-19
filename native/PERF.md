@@ -106,6 +106,38 @@ What is left, from the counters of the last runs (instrumented build of `f68150c
   serialization that dominates is waiting for sleeping threads to wake, which N CPU tokens would
   multiply rather than remove unless hand-offs get cheap first.
 
+## Phase 3: hand-offs and the idler
+
+| Commit | What | Measured |
+|---|---|---|
+| `a918918`, `ee33a7c` | busy_sleep (from the SMP work): a busy thread kept another's `nanosleep` from ending in threaded and fork mode. Arming the kernel's timer wakes its coroutine to re-read the deadline, which is on no heap until it runs; nobody ran it. A release now hands the idler the token while a timer is being re-read (`Timer::is_rereading`, from `b001710` on) | busy_sleep{,_calls} green; f68150c hadn't cured it |
+| `e03b4f4` | Fix 4: the token is offered, not assigned. A release leaves it free and invites the target; a running thread that wants it takes it at once; the invited thread takes it if still free when it wakes, else goes first in line and is assigned it at the next hand-off (and pokes the holder: an offer lost to the sleeping idler hung guest_fork's `time::clock` 2 runs in 80 until it did) | vs-native, A/B: make -j4 3.74x -> 2.53x; rustc 1.31x -> 1.16x (fork), 1.32x -> 1.20x (threaded). Strict two-thread ping-pongs pay: pipe 20.7 -> 26 µs |
+| `b001710` | Fix 6, retried: the idler sleeps to its timer without the token (handing it on or leaving it free) and takes it back after; a release hands it the token only for an earlier deadline or a timer being re-read. With host fds to watch it keeps the token, as before. After fix 4, nearly every contended acquire of the Rust builds found the token asleep in the idler | vs-native, A/B: rustc 1.14x -> 1.08x (threaded), 1.12x -> 1.09x (fork); rustc under make 1.36x -> 1.22x; getppid 3.0 -> 0.84 µs; futex ping-pong 6.3 -> 1.0-1.3 µs |
+| fix 3 | Futexes off the token | Not built: after fixes 4 and 6 a rustc's token is held 7% of its wall, contended acquires fell 79k -> 16k, and a futex round trip is 1 µs (native 3) |
+
+Full size, quiet machine (load ~1), best of 3, interleaved; `c75ca78` is main before any phase-2
+fix (its numbers here differ from the loaded runs above):
+
+| workload | native | `c75ca78` | before fix 4 (`ee33a7c`) | after fix 4 (`e03b4f4`) | now (`b001710`) |
+|---|---|---|---|---|---|
+| rustc cgu16, threaded | 1.61 s | 1.33x | 1.41x | - | **1.04x** |
+| rustc cgu16, fork | | 1.13x | 1.24x | 1.15x | **1.05x** |
+| make -j4, 32 C files | 1.21 s | 2.61x | 2.81x | 2.10x | **2.05x** |
+| rustc under make -j4 | 7.10 s | 1.10x | 1.12x | 1.10x | **1.04x** |
+| cargo build -j4 --release | 3.75 s | 1.25x | 1.16x | 1.13x | **1.07x** |
+| xz -T4 | 0.14 s | 1.08x | 1.11-1.14x | 1.11x | **1.07-1.08x** |
+
+What is left (counters of `b001710`):
+- **Rust builds are at 4-9%.** rustc: token held 7% of the wall, hand-off latency 7 ms, the
+  idler behind 247 of 16k contended acquires. The rest is CPU: 4.8 s against 4.5 natively
+  (traps, the dispatcher).
+- **make -j4 is at 2.05x, and the token is the bottleneck again, for work now:** held 52%; of its
+  1.25 s, ~0.94 s is exec (cc1's and collect2's copies, 0.59 s: non-PIE, at their own
+  addresses; clearing their old pages, 0.39 s), hand-offs only 0.09 s. The kernel's own work is
+  the rest. Next: exec off the token (the copy and the clearing are the process's own memory), or
+  a PIE gcc / a filter that lets exec map an image fd at a fixed address; then per-process cost
+  (fork+exec+exit of `true`: 4 ms against 0.6). SMP is still not the lever: 0.3 s of kernel work.
+
 ## How it was measured
 
 **Machine.** Intel Core Ultra 9 275HX: 8 P-cores (CPUs 0-7) and 16 E-cores, no SMT, 62 GB. Shared
