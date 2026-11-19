@@ -842,6 +842,9 @@ fn exit_thread(code: usize) -> ! {
 /// other thread waited in a futex, or read a silent stdin, never ended.
 unsafe extern "C" fn task_exit(pid: core::ffi::c_int, status: core::ffi::c_int) {
     if pid == 1 {
+        // The program's sockets were closed by its exit: what they still hold reaches the hooks
+        // first (bounded).
+        crate::tsi::drain();
         if status & 0x7f == 0 {
             finish((status >> 8) & 0xff);
         }

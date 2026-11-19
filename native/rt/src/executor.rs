@@ -85,6 +85,8 @@ struct Exec {
     /// Of those, the ones found ready: the kernel is told by the executor's coroutine.
     hostfds_ready: RefCell<Vec<i32>>,
     last_busy_poll: Cell<u64>,
+    /// The sandbox's end, waiting for the executor to settle ([`settled`]): woken when it parks.
+    drainer: Cell<Option<Tid>>,
 }
 
 /// A cell behind a spin lock: the ready queue, pushed to by wakers from wherever they run.
@@ -125,6 +127,7 @@ static E: Exec = Exec {
     hostfds: RefCell::new(Vec::new()),
     hostfds_ready: RefCell::new(Vec::new()),
     last_busy_poll: Cell::new(0),
+    drainer: Cell::new(None),
 };
 
 /// Run the executor on `sched` (the guest's, at boot). Its coroutine starts with the first task.
@@ -146,6 +149,22 @@ pub fn installed() -> bool {
 /// (`tsi::host_syscall`), never as a thread of the program's.
 pub fn on_executor() -> bool {
     installed() && E.tid.get().is_some_and(|t| t == sched().current())
+}
+
+/// Whether the executor has nothing left to do but wait for the outside: parked (or never
+/// started), nothing ready, and no task waiting to write to a held fd (a provider's session still
+/// flushing). Waits for reads (a session's reader, forever) and timers don't count.
+pub fn settled() -> bool {
+    let writing = E.watches.try_borrow().map_or(true, |w| w.iter().any(|x| x.events & POLLOUT != 0));
+    (E.tid.get().is_none() || E.parked.get()) && E.ready.with(|q| q.is_empty()) && !writing
+}
+
+/// Block the calling coroutine (not the executor's) until the executor parks, or `deadline`.
+pub fn wait_parked(deadline: u64) {
+    let s = sched();
+    E.drainer.set(Some(s.current()));
+    s.block(Some(deadline));
+    E.drainer.set(None);
 }
 
 // ---- tasks and wakers ----
@@ -283,6 +302,9 @@ fn run(_: usize) -> usize {
         let deadline = E.timers.borrow().iter().map(|t| t.deadline).min();
         // Woken by a waker (`sched.wake`), its timer, or the idle wait's fds (their wakers).
         E.parked.set(true);
+        if let Some(d) = E.drainer.get() {
+            s.wake(d);
+        }
         s.block(deadline);
         E.parked.set(false);
     }

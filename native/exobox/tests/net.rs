@@ -668,5 +668,65 @@ fn main() {
             Ok(())
         }));
     }
+    // Bytes the program writes and shuts down just before it exits reach the hook's stream, all of
+    // them and then the EOF, as a closed socket's data is still sent on Linux (capnix's
+    // `bytes_written_just_before_exit_arrive`). They were lost: the sandbox ended at init's exit,
+    // before the copy ran. 1 MiB: more than the kernel's socket buffers hold at the exit.
+    for n in [5usize, 1 << 20] {
+        let argv = vec![fx::bin("net_exit").display().to_string(), "write".into(), "10.0.0.1".into(), "9".into(), n.to_string()];
+        trials.push(Trial::test(format!("net_exit_flush_{n}::coroutine"), move || {
+            let got = Arc::new(Mutex::new(Sunk::default()));
+            let g = got.clone();
+            let (code, out, err) = run("provider", &argv, move |sock| sink(sock, &g))?;
+            let got = got.lock().unwrap();
+            let want: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+            if code != 0 || !out.contains("NET_EXIT_WRITTEN") || got.data != want || !got.eof || got.reset {
+                return Err(format!(
+                    "exit {code}; the stream got {} of {n} bytes (matching: {}), eof {}, reset {}\n--- stdout:\n{out}\n--- stderr:\n{err}",
+                    got.data.len(),
+                    got.data == want[..got.data.len().min(n)],
+                    got.eof,
+                    got.reset
+                )
+                .into());
+            }
+            Ok(())
+        }));
+    }
     libtest_mimic::run(&args, trials).exit();
+}
+
+/// What a [`sink`] got on its one connection.
+#[derive(Default)]
+struct Sunk {
+    data: Vec<u8>,
+    eof: bool,
+    reset: bool,
+}
+
+/// The provider's other end as a sink: every connect accepted, its bytes and its end noted.
+fn sink(sock: UnixStream, got: &Mutex<Sunk>) {
+    let mut w = sock.try_clone().unwrap();
+    let mut sock = sock;
+    let mut buf = Vec::new();
+    let mut chunk = vec![0u8; 64 << 10];
+    loop {
+        let n = match sock.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        while let Some((id, op, p)) = take_frame(&mut buf) {
+            let mut g = got.lock().unwrap();
+            match op {
+                CONNECT => {
+                    let _ = w.write_all(&frame(id, CONNECTED, &[]));
+                }
+                DATA => g.data.extend_from_slice(&p),
+                CLOSE => g.eof = true,
+                RESET => g.reset = true,
+                _ => {}
+            }
+        }
+    }
 }
