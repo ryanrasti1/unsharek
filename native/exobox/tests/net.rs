@@ -321,8 +321,16 @@ impl futures_core::Stream for OneConn {
     }
 }
 
+/// The `provider_syscall` child's: the connect hook makes a syscall of its own first, as
+/// capnweb-rs's stacker does (it reads /proc/self/maps for the stack's bounds).
+static STRAY_SYSCALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn provider(fd: HeldFd) -> (OnConnect, OnResolve, OnListen) {
     let connect = OnConnect::new(move |cx: Cx, _pid, addr: SocketAddr| async move {
+        if STRAY_SYSCALL.load(std::sync::atomic::Ordering::Relaxed) {
+            // SAFETY: getpid has no arguments.
+            unsafe { libc::getpid() };
+        }
         let s = session(cx, fd);
         let SocketAddr::V4(a) = addr else { return Err(NetError::Unsupported) };
         let mut p = a.ip().octets().to_vec();
@@ -367,7 +375,8 @@ fn child(kind: &str) -> ! {
     let fd3 = unsafe { OwnedFd::from_raw_fd(3) };
     let mut hooks = Hooks::default();
     match kind {
-        "provider" => {
+        "provider" | "provider_syscall" => {
+            STRAY_SYSCALL.store(kind == "provider_syscall", std::sync::atomic::Ordering::Relaxed);
             let held = sb.hold_fd(fd3).unwrap();
             (hooks.on_connect, hooks.on_resolve, hooks.on_listen) = provider(held);
         }
@@ -642,5 +651,22 @@ fn main() {
         }
         Ok(())
     }));
+    // The sandbox's end with a hook's session still waiting on its held fd: the program connects
+    // once (the connect hook making a syscall of its own, as capnweb-rs's stacker does) and exits
+    // 3 at once, its socket open. It must end with 3, promptly. It hung when the hook's syscall
+    // made the executor a thread of init's process (capnix's `the_default_net_refuses_without_caps`).
+    let echo = s.echo.to_string();
+    for kind in ["provider", "provider_syscall"] {
+        let argv = vec![fx::bin("net_exit").display().to_string(), "connect".into(), "10.0.0.1".into(), echo.clone(), "3".into()];
+        trials.push(Trial::test(format!("net_exit_code_{kind}::coroutine"), move || {
+            let t0 = std::time::Instant::now();
+            let (code, out, err) = run(kind, &argv, proxy)?;
+            let took = t0.elapsed();
+            if code != 3 || !out.contains("NET_EXIT_CONNECTED") || took > Duration::from_secs(3) {
+                return Err(format!("exit {code} after {took:?}, wanted 3\n--- stdout:\n{out}\n--- stderr:\n{err}").into());
+            }
+            Ok(())
+        }));
+    }
     libtest_mimic::run(&args, trials).exit();
 }

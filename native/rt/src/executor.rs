@@ -141,6 +141,13 @@ pub fn installed() -> bool {
     E.sched.get().is_some()
 }
 
+/// Whether the calling coroutine is the executor's. Its syscalls (a hook's library's: capnweb-rs's
+/// stacker reads /proc/self/maps) are the host's own, made as the kernel's tsi task
+/// (`tsi::host_syscall`), never as a thread of the program's.
+pub fn on_executor() -> bool {
+    installed() && E.tid.get().is_some_and(|t| t == sched().current())
+}
+
 // ---- tasks and wakers ----
 
 /// Run `f` to completion on the executor, in the background.

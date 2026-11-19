@@ -656,6 +656,10 @@ fn me() -> &'static Thread {
 
 /// `lkl_syscall` as the current coroutine's task (attaching a new thread's first).
 fn lkl_call(nr: c_long, a: [usize; 6]) -> isize {
+    if crate::executor::on_executor() {
+        // The hooks' own calls (a library's) are the host's, never a thread of init's.
+        return crate::tsi::host_syscall(nr, a);
+    }
     // Threaded mode keeps the per-thread attach word in the host-thread record (the bound
     // coroutine is reached by a trap, not the per-coroutine TLS `me()`).
     let tid = if par::enabled() { par::take_attach() } else { me().attach.replace(0) };

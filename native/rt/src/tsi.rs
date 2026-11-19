@@ -54,6 +54,19 @@ pub fn kernel<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// A syscall the hooks' own code made on the executor (a library's: capnweb-rs's stacker reads
+/// /proc/self/maps for its stack's bounds), as the kernel's tsi task (`lkl_net_syscall`): no
+/// thread of the program's. Made as the executor coroutine's own guest task, the first such call
+/// made the executor a thread of init's process, which nothing ever ended (it waits for its tasks,
+/// not in the kernel): after the program's exit_group init's process lived on, its files open,
+/// and the sandbox never ended (capnix's `the_default_net_refuses_without_caps`;
+/// `net_exit_code_provider_syscall`). Exits and the host-task calls are EINVAL.
+pub fn host_syscall(nr: core::ffi::c_long, a: [usize; 6]) -> isize {
+    let mut p = a.map(|v| v as core::ffi::c_long);
+    // SAFETY: the kernel runs; the arguments are the hooks' code's (LKL reads its pointers).
+    kernel(|| unsafe { l::lkl_net_syscall(nr, p.as_mut_ptr()) as isize })
+}
+
 // ---- what the hooks give back ----
 
 /// A hook's byte stream, both directions (exobox adapts futures-io's and tokio's traits).
