@@ -97,15 +97,11 @@ fn threads() {
 
 #[test]
 fn escape() {
-    let out = expect("escape", &[], &["killed by SIGSYS", "Operation not permitted", "survived"]);
+    let out = expect("escape", &[], &["killed by SIGSYS", "getppid(), trapped"]);
     if out.starts_with("skipped:") {
         return;
     }
-    // Without the restriction the program's own getppid is the guest's (0); with it, a kill
-    // before the program can print its answer.
-    let restricted = out.split("restrict(getppid: kill)").nth(1).unwrap_or_default();
-    assert!(
-        restricted.contains("killed by SIGSYS") && !restricted.contains("getppid(), trapped"),
-        "the restriction didn't take getppid away:\n{out}"
-    );
+    // Each attempt's forbidden call kills its sandbox: none survives, and each was killed.
+    assert!(!out.contains("survived"), "an attempt survived:\n{out}");
+    assert_eq!(out.matches("killed by SIGSYS").count(), 3, "every attempt killed:\n{out}");
 }

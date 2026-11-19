@@ -1339,8 +1339,7 @@ fn restore_registers(to: &mut Ucontext, f: &Ucontext, fp_len: usize) {
 /// only, with a signal; the host's dispositions are the defaults but for SIGSYS (the trap's) and
 /// SIGPIPE (ignored, so a closed stdout is EPIPE): SIGSYS comes from the filter itself (a call
 /// it kills: any number with the x32 bit), SIGPIPE can't, and ends as 128 + 13, a shell's
-/// number for it. The same if a death by signal fails (the filter's `--deny=errno`, or before
-/// any filter).
+/// number for it. The same if a death by signal fails (before any filter).
 fn die(sig: i32) -> ! {
     if par::forked() {
         // A fork's child process: only it dies, as the guest's (its parent sees the signal in
@@ -1403,7 +1402,7 @@ pub fn runtime_panic(info: &dyn core::fmt::Display) -> ! {
     let _ = trap::write(2, &m.b[..m.n]);
     // Init's process (fork mode: a fork's child kills it, whose end is the sandbox's: the other
     // processes see its pidfd), with the default action (as `die`). Then the exit, if the signal
-    // didn't end it (every thread blocking it, or the filter's `--deny=errno`).
+    // didn't end it (every thread blocking it).
     // SAFETY: a signal to the sandbox's process; nothing after it needs the runtime's state.
     unsafe { trap::gate(trap::NR_KILL as usize, S.host_pid.get() as usize, SIGABRT as usize, 0, 0, 0, 0) };
     if !par::forked() {

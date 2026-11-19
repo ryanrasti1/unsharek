@@ -206,9 +206,9 @@ No new crates in the library. `syscalls` leaves it (its `--allow` rules are gone
 it as a dev-dependency for the audit's table). A new workspace crate, `exobox-build`
 (`native/build`), holds the fixed-address link that was `native/exobox/build.rs`'s, for any
 embedder's build script: its one dependency is `cc` (already in the tree), and it is a
-build-dependency only, of exobox and of the examples. `Builder::restrict`'s rustdoc shows
-seccompiler, which stayed the caller's dependency, not exobox's (until the TCB split below made
-it exobox's own: the security filter is compiled with it).
+build-dependency only, of exobox and of the examples. Seccompiler stayed the caller's
+dependency, not exobox's, until the TCB split below made it exobox-tcb's own: the security filter
+is compiled with it.
 
 | Crate | For | Where | Cost noted |
 |---|---|---|---|

@@ -46,7 +46,6 @@ g.run(|| -> std::io::Result<()> {                      // this thread's syscalls
 })??;                                                  // and the host's again
 let locked = g.lockdown(|s| {                          // exobox-tcb's lockdown, with the grants
     s.grant(0, Access::Read).grant(1, Access::Write).grant(2, Access::Write);
-    s.restrict(my_seccomp_program);                    // optional, repeatable: can only take away
     Ok(())
 })?;
 locked.exec(&argv, &env)                               // the program; never returns
@@ -81,9 +80,9 @@ locked.exec(&argv, &env)                               // the program; never ret
   For tests and for programs written in Rust against exobox; single-threaded (the escape example
   is one). The runtime's loader refuses to exec before lockdown.
 - **`pass_fd(fd, n)`** gives the guest host fd `fd` as its fd `n`, now, and `hold_fd(fd)` keeps
-  one for the hooks; lockdown grants each `read` and `write`. Grants are the only ways to widen
-  the filter: `s.restrict(prog)` stacks a seccomp program of the caller's (seccompiler's,
-  libseccomp's) that can only take away.
+  one for the hooks; lockdown grants each `read` and `write`. Grants are the only way to widen
+  the filter. A caller that wants it narrower installs a seccomp filter of its own before
+  lockdown: filters stack, and the strictest answer wins.
 - **Templates.** `fork()` (or `spawn(|g| { setup; g.lockdown(..)?.exec(..) })`) forks the guest's
   process before lockdown: the child is a guest of its own, a copy of this one as it is (the booted
   kernel, its mounts and files, shared copy-on-write), to set up further (its own images, fds,
@@ -121,7 +120,7 @@ locked.exec(&argv, &env)                               // the program; never ret
   order: checks there is exactly one thread; checks the guest's fds are eventfds (and in fork mode
   a pidfd); checks every mapping is private, read-only, or fork mode's shared anonymous memory;
   closes every fd neither granted nor the guest's; turns core dumps and dumpability off; drops
-  every capability; sets `no_new_privs`; installs the caller's restrictions and then **one
+  every capability; sets `no_new_privs`; and installs **one
   seccomp filter** with TSYNC: a hand-written gate check (a call not from the runtime's one
   syscall instruction is TRAP, served in-process, in every thread and process made after; another
   ABI is KILL) and then seccompiler's allowlist for the mode, each argument pinned, KILL for the
@@ -165,7 +164,7 @@ against threaded mode (`threads`), and the host filter refusing a hostile progra
   the sandbox's own pid), judges the gate's. The gate check answers only TRAP or KILL, so the
   gate's address stays routing, not security: a compromised program can jump to the gate, and
   then only the list applies. SUD is switched off at lockdown; no SUD or `prctl` rule is in the
-  filter. A caller's restrictions are more filters under it: the strictest answer still wins.
+  filter.
 - **Lockdown.** Before anything the program brings runs (its exec, its interpreter, a `run`
   closure, the hooks' first task), exobox-tcb checks there is one thread, the guest's fds and
   every mapping, closes every fd not granted (`close_range`), turns core dumps off, drops
@@ -365,9 +364,8 @@ the unit tests of exobox and exobox-erofs.
 the sandbox's own pid (fork mode: init's process's; a guest init that dies of a signal makes the
 sandbox die of the same, and in fork mode so does a process that dies on the host); the program's
 own `rt_sigreturn` traps, as it returns from a handler the runtime ran. Anything else from the gate
-kills the sandbox (the CLI's hidden `--deny=errno` returns `EPERM` instead, for the escape tests'
-probes). The list is only widened by the typed calls (`pass_fd`, `hold_fd`: `read` and `write` on
-exactly that fd), and narrowed by restrictions (`Builder::restrict`).
+kills the sandbox. The list is only widened by grants (`pass_fd`, `hold_fd`, `s.grant`: `read`
+and `write`, as granted, on exactly that fd).
 
 ## License
 

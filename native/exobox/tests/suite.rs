@@ -202,9 +202,7 @@ fn cases() -> Vec<Case> {
         case("stderr", Prog::Fixture("exit_status"), ALL, Expect { stderr: vec!["to stderr"], ..status(Status::Code(3)) })
             .args(vec![Arg::Lit("stderr")]),
         // The filter.
-        fixture("escape", ALL).args(vec![Arg::Secret]).flags(&["--deny=errno"]).native(None),
-        fixture("escape_gate", ALL).flags(&["--deny=errno"]).native(None),
-        // A restriction (tcb::Config::restrict) on top of the mode's list: tests/guest.rs.
+        fixture("escape", ALL).args(vec![Arg::Secret]).native(None),
         case(
             "escape_kill",
             Prog::Fixture("escape_kill"),
@@ -403,8 +401,47 @@ fn cases() -> Vec<Case> {
         ]),
     ];
     c.extend(static_programs());
+    c.extend(escape_gate());
     c.sort_by_key(|c| c.name);
     c
+}
+
+/// The filter in a real sandbox: each forbidden host call through the gate (escape_gate.c's
+/// probes) kills the sandbox with SIGSYS before it can say it survived. Every number's verdict is
+/// exobox-tcb's (tests/filter.rs, against its model); these are the calls an escape would try.
+fn escape_gate() -> Vec<Case> {
+    const THREADS: &[Mode] = &[Mode::Threaded, Mode::Fork];
+    let probes: &[(&'static str, &'static str, &'static [Mode])] = &[
+        ("escape_gate_openat", "openat", ALL),
+        ("escape_gate_socket", "socket", ALL),
+        ("escape_gate_getppid", "getppid", ALL),
+        ("escape_gate_write_4000", "write_4000", ALL),
+        ("escape_gate_read_stdout", "read_stdout", ALL),
+        ("escape_gate_writev_stderr", "writev_stderr", ALL),
+        ("escape_gate_kill_other", "kill_other", ALL),
+        ("escape_gate_tgkill_other", "tgkill_other", ALL),
+        ("escape_gate_madvise_arena", "madvise_arena", ALL),
+        ("escape_gate_madvise_vdso", "madvise_vdso", ALL),
+        ("escape_gate_mmap", "mmap", ALL),
+        ("escape_gate_clone_vm_sigchld", "clone_vm_sigchld", ALL),
+        ("escape_gate_clone_newuser", "clone_newuser", ALL),
+        ("escape_gate_clone_sigchld_stack", "clone_sigchld_stack", ALL),
+        ("escape_gate_clone_thread_settls", "clone_thread_settls", THREADS),
+        ("escape_gate_clone_thread_high_bit", "clone_thread_high_bit", THREADS),
+        ("escape_gate_clone3", "clone3", ALL),
+        ("escape_gate_exit_1", "exit_1", THREADS),
+        ("escape_gate_sigaltstack", "sigaltstack", ALL),
+        ("escape_gate_prctl", "prctl", ALL),
+        ("escape_gate_seccomp", "seccomp", ALL),
+    ];
+    probes
+        .iter()
+        .map(|&(name, probe, modes)| {
+            case(name, Prog::Fixture("escape_gate"), modes, Expect { not_stdout: vec!["ESCAPE_GATE_SURVIVED"], ..status(Status::Signal(SIGSYS)) })
+                .args(vec![Arg::Lit(probe)])
+                .native(None)
+        })
+        .collect()
 }
 
 /// Static programs from three toolchains (nix/test-programs.nix): no interpreter, nothing but the

@@ -131,26 +131,22 @@ A hostile program, a closure run as the sandbox's program (`Locked::run`), calls
 syscalls through the runtime's own syscall instruction, the "gate", which it finds by scanning
 the binary's code (it shares the address space: nothing in it is hidden), with a few lines of
 `asm!`. It also tries an fd the process had open before lockdown, which lockdown closed. As a
-sandbox is, its first forbidden call kills it; with `Deny::Errno` (a hidden debugging knob, the escape tests')
-each call gets EPERM; a restriction (`tcb::Config::restrict` in lockdown's grants, a seccomp program of the caller's)
-that kills `getppid` takes even the program's own, the guest's, away. The filter can only be
-narrowed: the host fds a sandbox may use are its grants (`s.grant`, and `pass_fd`, `hold_fd`).
+sandbox is, its first forbidden call kills it: each attempt runs in a sandbox of its own, and
+each is killed. The host fds a sandbox may use are its grants (`s.grant`, and `pass_fd`,
+`hold_fd`).
 
 ```
 this process (the sandbox's host parent) is pid 1471082
 
-a sandbox as it is
+getppid
   getppid(), trapped: the guest's        -> 0
   => killed by SIGSYS (the host filter)
 
-s.deny(Deny::Errno)
+openat
   getppid(), trapped: the guest's        -> 0
-  getppid() via the gate: the host's     -> Operation not permitted (os error 1)
-  openat("/etc/passwd") via the gate     -> Operation not permitted (os error 1)
-  read(an fd from before) via the gate   -> Operation not permitted (os error 1)
-  survived
-  => exit 0
+  => killed by SIGSYS (the host filter)
 
-s.deny(Deny::Errno).restrict(getppid: kill)
+stale-fd
+  getppid(), trapped: the guest's        -> 0
   => killed by SIGSYS (the host filter)
 ```

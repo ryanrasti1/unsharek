@@ -1,132 +1,71 @@
-// The filter itself: call every x86-64 syscall number through the runtime's gate instruction (the
-// one a compromised app would jump to) and check each is refused. Then probe argument checks
-// every mode shares (tests/guest.rs runs it under a restriction too: it changes none of this). Run with
-// --deny=errno so refusals return EPERM. EXOBOX_TEST_TARGET: a pid outside the sandbox.
-// Prints ESCAPE_GATE_OK.
+// One forbidden host call through the runtime's own syscall instruction (the gate, found in the
+// auxiliary vector, as a compromised program that found it would call it): argv[1] names it. The
+// filter must kill the sandbox (SIGSYS) before ESCAPE_GATE_SURVIVED prints. Every number's
+// verdict is checked against the filter's model in exobox-tcb (tests/filter.rs); these are the
+// installed filter, in a real sandbox, for the calls an escape would try.
 #include "exobox_test.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/auxv.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
-static int fails;
+/* A host thread's exact clone flags (exobox-tcb's CLONE_THREAD_FLAGS). */
+#define T (CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM | CLONE_CHILD_CLEARTID)
 
-static void expect(const char *what, long got, int want_ok)
-{
-	int ok = want_ok ? got >= 0 : got == -EPERM;
-	printf("%-50s -> %ld %s\n", what, got, ok ? "ok" : "FAIL");
-	fails += !ok;
-}
-
-int main(void)
+int main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
+	CHECK(argc == 2, "usage: escape_gate <probe>");
 	gate_fn gate = exobox_gate();
 	CHECK(gate, "no gate in the auxiliary vector: not sandboxed");
+	const char *p = argv[1];
 	const char *t = getenv("EXOBOX_TEST_TARGET");
-	CHECK(t, "EXOBOX_TEST_TARGET unset");
-	long target = atol(t);
-	int fork_mode = mode_is("fork"), threads = fork_mode || mode_is("threaded");
-
-	/* 1. Every number with zero arguments. Skipped: rt_sigreturn (allowed: through the gate it
-	 * would unwind a frame that isn't there), exit_group (allowed: would end the test), ppoll
-	 * (allowed: a NULL timeout blocks), read (stdin, fd 0, is the host's in every mode: filter::HOST),
-	 * exit where threads are host threads
-	 * (exit(0) is allowed: it would end this thread), and the unassigned 335-423 gap
-	 * (this host kernel raises SIGILL for those, even natively). An allowed number that takes an
-	 * fd or address still refuses here, since fd 0 and address 0 are outside every rule. */
-	int refused = 0, leaked = 0;
-	for (long nr = 0; nr < 470; nr++) {
-		if (nr == SYS_rt_sigreturn || nr == SYS_exit_group || nr == SYS_ppoll ||
-		    nr == SYS_read || (threads && nr == SYS_exit) || (nr > 334 && nr < 424))
-			continue;
-		long r = gate(nr, 0, 0, 0, 0, 0, 0);
-		if (r == -EPERM) {
-			refused++;
-		} else {
-			printf("  nr %ld via gate -> %ld (not refused)\n", nr, r);
-			leaked++;
-		}
-	}
-	printf("%-50s -> refused=%d leaked=%d %s\n", "every number via gate, zero args", refused, leaked,
-	       leaked ? "FAIL" : "ok");
-	fails += leaked != 0;
-
-	/* 2. Signals to another process. */
-	char buf[96];
-	snprintf(buf, sizeof(buf), "tgkill(%ld, %ld, 0) via gate", target, target);
-	expect(buf, gate(SYS_tgkill, target, target, 0, 0, 0, 0), 0);
-	snprintf(buf, sizeof(buf), "kill(%ld, 0) via gate", target);
-	expect(buf, gate(SYS_kill, target, 0, 0, 0, 0, 0), 0);
-	long r = syscall(SYS_kill, target, 0);
-	snprintf(buf, sizeof(buf), "kill(%ld, 0) via libc", target);
-	printf("%-50s -> %ld %s\n", buf, r < 0 ? -errno : r, r < 0 ? "ok" : "FAIL");
-	fails += r >= 0;
-
-	/* 3. A host process: in fork mode clone(SIGCHLD) with no stack, and nothing more. */
-	if (fork_mode) {
-		expect("clone(SIGCHLD | CLONE_VM) via gate", gate(SYS_clone, SIGCHLD | CLONE_VM, 0, 0, 0, 0, 0), 0);
-		expect("clone(SIGCHLD, stack) via gate", gate(SYS_clone, SIGCHLD, (long)buf, 0, 0, 0, 0), 0);
-		expect("clone(CLONE_NEWUSER | SIGCHLD) via gate",
-		       gate(SYS_clone, CLONE_NEWUSER | SIGCHLD, 0, 0, 0, 0, 0), 0);
-	}
-
-	/* 4. A host thread is clone with exactly one flag set: a bit more or less, a namespace, or
-	 * garbage in the high half is refused. (The exact set itself is allowed; not probed, as its
-	 * child would run this code with no stack of its own.) */
-	if (threads) {
-		const long T = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD |
-			       CLONE_SYSVSEM | CLONE_CHILD_CLEARTID;
-		static const struct { const char *what; long flags; } cl[] = {
-			{"clone(thread set & ~CLONE_CHILD_CLEARTID)", T & ~CLONE_CHILD_CLEARTID},
-			{"clone(thread set & ~CLONE_THREAD)", T & ~CLONE_THREAD},
-			{"clone(thread set & ~CLONE_VM)", T & ~CLONE_VM},
-			{"clone(thread set | CLONE_SETTLS)", T | CLONE_SETTLS},
-			{"clone(thread set | CLONE_PTRACE)", T | CLONE_PTRACE},
-			{"clone(thread set | CLONE_NEWNS)", T | CLONE_NEWNS},
-			{"clone(thread set | CLONE_NEWUSER)", T | CLONE_NEWUSER},
-			{"clone(thread set | CLONE_NEWPID)", T | CLONE_NEWPID},
-			{"clone(thread set | CLONE_NEWNET)", T | CLONE_NEWNET},
-			{"clone(thread set | CLONE_PIDFD)", T | CLONE_PIDFD},
-			{"clone(thread set | CLONE_VFORK)", T | CLONE_VFORK},
-			{"clone(thread set | 1 << 32)", T | (1L << 32)},
-			{"clone(CLONE_VM | SIGCHLD)", CLONE_VM | SIGCHLD},
-			{"clone(0)", 0},
-		};
-		for (size_t i = 0; i < sizeof(cl) / sizeof(cl[0]); i++) {
-			snprintf(buf, sizeof(buf), "%s via gate", cl[i].what);
-			expect(buf, gate(SYS_clone, cl[i].flags, (long)buf, 0, 0, 0, 0), 0);
-		}
-		expect("clone3 via gate", gate(SYS_clone3, 0, 0, 0, 0, 0, 0), 0);
-		expect("exit(1) via gate", gate(SYS_exit, 1, 0, 0, 0, 0, 0), 0);
-		expect("sigaltstack via gate", gate(SYS_sigaltstack, 0, 0, 0, 0, 0, 0), 0);
-	}
-
-	/* 5. Memory outside the arena; fds nobody was given. */
-	/* No madvise in any mode, the arena included (coroutine mode had DONTNEED there, a MiB at a
-	 * time): a heap page of the program's, which must keep its byte. And the host's vDSO. */
+	long target = t ? atol(t) : 1;
+	char buf[64];
 	char *heap = malloc(1 << 20);
-	char *page = (char *)(((long)heap + 4095) & ~4095L);
-	*page = 7;
-	expect("madvise(arena page, DONTNEED) via gate", gate(SYS_madvise, (long)page, 4096, MADV_DONTNEED, 0, 0, 0), 0);
-	if (*page != 7) {
-		printf("madvise via gate zeroed an arena page: FAIL\n");
-		fails++;
+	long page = ((long)heap + 4095) & ~4095L;
+	struct { const char *name; long nr, a0, a1, a2; } probes[] = {
+		{"openat", SYS_openat, AT_FDCWD, (long)"/etc/passwd", O_RDONLY},
+		{"socket", SYS_socket, AF_INET, SOCK_STREAM, 0},
+		{"getppid", SYS_getppid, 0, 0, 0},
+		/* Fds nobody was given: 4000 is open nowhere (the guest's token eventfds are 3 and up);
+		 * stdout is granted for write only. */
+		{"write_4000", SYS_write, 4000, (long)"x", 1},
+		{"read_stdout", SYS_read, 1, (long)buf, 1},
+		{"writev_stderr", SYS_writev, 2, 0, 0},
+		/* Signals to another process; the sandbox's own pid only, and kill only. */
+		{"kill_other", SYS_kill, target, 0, 0},
+		{"tgkill_other", SYS_tgkill, target, target, 0},
+		/* No memory call: the arena's own pages, and the host's vDSO. */
+		{"madvise_arena", SYS_madvise, page, 4096, MADV_DONTNEED},
+		{"madvise_vdso", SYS_madvise, (long)getauxval(AT_SYSINFO_EHDR) & ~4095L, 4096, MADV_DONTNEED},
+		{"mmap", SYS_mmap, 0, 4096, PROT_READ},
+		/* A host process or thread with flags other than the mode's exact sets. */
+		{"clone_vm_sigchld", SYS_clone, CLONE_VM | SIGCHLD, 0, 0},
+		{"clone_newuser", SYS_clone, CLONE_NEWUSER | SIGCHLD, 0, 0},
+		{"clone_sigchld_stack", SYS_clone, SIGCHLD, (long)buf, 0},
+		{"clone_thread_settls", SYS_clone, T | CLONE_SETTLS, (long)buf, 0},
+		{"clone_thread_high_bit", SYS_clone, T | (1L << 32), (long)buf, 0},
+		{"clone3", SYS_clone3, 0, 0, 0},
+		{"exit_1", SYS_exit, 1, 0, 0},
+		{"sigaltstack", SYS_sigaltstack, 0, 0, 0},
+		{"prctl", SYS_prctl, PR_SET_DUMPABLE, 1, 0},
+		{"seccomp", SYS_seccomp, 0, 0, 0},
+	};
+	for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {
+		if (strcmp(probes[i].name, p) == 0) {
+			long r = gate(probes[i].nr, probes[i].a0, probes[i].a1, probes[i].a2, 0, 0, 0);
+			printf("ESCAPE_GATE_SURVIVED %s -> %ld\n", p, r);
+			return 1;
+		}
 	}
-	expect("madvise(vDSO page, DONTNEED) via gate",
-	       gate(SYS_madvise, (long)getauxval(AT_SYSINFO_EHDR) & ~4095L, 4096, MADV_DONTNEED, 0, 0, 0), 0);
-	expect("write(1, \"\") via gate", gate(SYS_write, 1, (long)"", 0, 0, 0, 0), 1);
-	expect("read(1) via gate", gate(SYS_read, 1, (long)buf, 1, 0, 0, 0), 0);
-	/* Not a low number: in threaded and fork mode the guest's CPU-token eventfds are fresh fds the
-	 * kernel numbered at lockdown (3 and up, as many as there are host-thread slots), granted read
-	 * and write. 4000 is open nowhere. */
-	expect("write(4000) via gate", gate(SYS_write, 4000, (long)"x", 1, 0, 0, 0), 0);
-	expect("write(1099) via gate", gate(SYS_write, 1099, (long)"x", 1, 0, 0, 0), 0);
-	expect("writev(2) via gate", gate(SYS_writev, 2, 0, 0, 0, 0, 0), 0);
-
-	CHECK(!fails, "%d probes not refused", fails);
-	printf("ESCAPE_GATE_OK\n");
-	return 0;
+	CHECK(0, "unknown probe %s", p);
 }

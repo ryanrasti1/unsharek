@@ -4,14 +4,12 @@
 //! - `Guest`, set up in a `run` closure, locked down, exec'd: a program runs and its syscalls are
 //!   the guest's (hello: files, TCP, threads, memory); the loader refuses before lockdown (a
 //!   `run` closure's exec is EPERM); and the gate is filtered (escape_kill's `openat` through it
-//!   is refused: deny=errno's EPERM, the program survives to say so).
+//!   kills the sandbox: SIGSYS).
 //! - `Guest::pass_fd`: a host socket as guest fd 1000 (fd_echo answers on it); and a thread
 //!   blocked reading it doesn't keep its process from ending (group_exit), in each mode.
 //! - `Guest::run` before lockdown: what a closure routes (getpid, files, ids, the hostname) and
 //!   that the host code between closures is an ordinary process's (files, a thread, a signal
 //!   handler, the signal mask, a fork, an exec), several closures in a row.
-//! - `tcb::Config::restrict`: a restriction makes a call the mode allows fail (write to fd 2,
-//!   from the gate: killed, or EPERM), and leaves the mode's own probes as they were (escape_gate).
 //! - `Cache::images` and `setup::mount_closure` with store paths that are a file and a symlink
 //!   (`store_entries`): each shown at its store path as it is.
 //! - Templates (`Guest::spawn`): children of one setup, each running its own fixture and its own
@@ -24,7 +22,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use exobox::{Access, Deny, Guest, GuestConfig, Mode, SockFilter};
+use exobox::{Access, Guest, GuestConfig, Mode};
 use exobox_fixtures as fx;
 use libtest_mimic::{Arguments, Failed, Trial};
 
@@ -60,29 +58,14 @@ fn check(what: &str, ok: bool) {
     println!("{what}: {}", if ok { "ok" } else { "FAIL" });
 }
 
-/// `write` to fd 2 from anywhere: killed (or EPERM, with `errno`), everything else allowed. A
-/// restriction as a caller writes one: classic BPF over seccomp_data (nr at 0, args[0] at 16).
-fn no_stderr(errno: bool) -> Vec<SockFilter> {
-    let i = |code, jt, jf, k| SockFilter { code, jt, jf, k };
-    let deny = if errno { 0x0005_0000 | 1 } else { 0x8000_0000 };
-    vec![
-        i(0x20, 0, 0, 0),                                // nr
-        i(0x15, 0, 3, libc::SYS_write as u32),           // write? else allow
-        i(0x20, 0, 0, 16),                               // args[0], low half
-        i(0x15, 0, 1, 2),                                // fd 2? else allow
-        i(0x06, 0, 0, deny),
-        i(0x06, 0, 0, 0x7fff_0000),
-    ]
-}
-
 /// A guest for mode `m`.
 fn boot(m: Mode) -> Guest {
     Guest::boot(GuestConfig { mode: m, ..Default::default() }).unwrap()
 }
 
-/// The program's stdio granted (stdin read, stdout and stderr write), and `deny`.
-fn stdio(s: &mut exobox::tcb::Config, deny: Deny) -> exobox::tcb::Result<()> {
-    s.grant(0, Access::Read).grant(1, Access::Write).grant(2, Access::Write).deny(deny);
+/// The program's stdio granted: stdin read, stdout and stderr write.
+fn stdio(s: &mut exobox::tcb::Config) -> exobox::tcb::Result<()> {
+    s.grant(0, Access::Read).grant(1, Access::Write).grant(2, Access::Write);
     Ok(())
 }
 
@@ -97,7 +80,7 @@ fn child(layer: &str, name: &str) -> ! {
             let mounts = g.map_closure(&program, &allow).unwrap();
             g.run(|| exobox::setup::mount_closure(&mounts)).unwrap().unwrap();
             let (argv, env) = (argv(name), env());
-            g.lockdown(|s| stdio(s, Deny::Kill)).unwrap().exec(&argv, &env).unwrap_err()
+            g.lockdown(stdio).unwrap().exec(&argv, &env).unwrap_err()
         }
         "exec_before" => {
             // The loader refuses before lockdown, in a setup closure as anywhere.
@@ -129,19 +112,7 @@ fn child(layer: &str, name: &str) -> ! {
             // The program's argv and env before lockdown: after it, `getppid` (env's target) is
             // the guest's.
             let (argv, env) = (argv(name), env());
-            let locked = g
-                .lockdown(|s| match layer {
-                    "restrict_kill" => {
-                        s.restrict(no_stderr(false));
-                        stdio(s, Deny::Kill)
-                    }
-                    "restrict_errno" => {
-                        s.restrict(no_stderr(true));
-                        stdio(s, Deny::Errno)
-                    }
-                    _ => stdio(s, Deny::Errno),
-                })
-                .unwrap();
+            let locked = g.lockdown(stdio).unwrap();
             locked.exec(&argv, &env).unwrap_err()
         }
     };
@@ -243,7 +214,7 @@ fn setup_closures(m: Mode, name: &str) -> exobox::Error {
     .unwrap();
     check("after 2: getpid is the host's", getpid() == pid);
     let (argv, env) = (argv(name), env());
-    g.lockdown(|s| stdio(s, Deny::Kill)).unwrap().exec(&argv, &env).unwrap_err()
+    g.lockdown(stdio).unwrap().exec(&argv, &env).unwrap_err()
 }
 
 /// Store-like paths (`ENTRIES`, in a temporary directory: the suite can't count on a store path
@@ -267,18 +238,16 @@ fn entries(m: Mode) -> exobox::Error {
     let mut argv = argv("paths");
     argv.extend(ENTRIES.iter().map(|n| format!("/nix/store/{n}").into()));
     let env = env();
-    g.lockdown(|s| stdio(s, Deny::Kill)).unwrap().exec(&argv, &env).unwrap_err()
+    g.lockdown(stdio).unwrap().exec(&argv, &env).unwrap_err()
 }
 
 /// A template: one setup, then four children in turn, each with setup of its own and its own
 /// fixture. Prints each one's status; their output is theirs (stdout, in turn).
 /// `Locked::run`: a closure run as the program, after lockdown. `ok`: its calls are the
 /// guest's (init's pid, the guest's files, no host path), a host fd from before lockdown is
-/// closed, and its return value is the status (42). `gate`: a host call from the gate is the
-/// filter's (EPERM with deny=errno, which `ok` doesn't set: the kill is checked by
-/// `run_fn_gate_kills`).
+/// closed, and its return value is the status (42). `kill`: a host call from the gate the filter
+/// refuses kills the sandbox (`run_fn_gate_kills`).
 fn run_fn(m: Mode, what: &str) -> exobox::Error {
-    let deny = if what == "errno" { Deny::Errno } else { Deny::Kill };
     let g = boot(m);
     // A host fd opened now, before lockdown: the closure finds it closed.
     let before = std::fs::File::open(env!("CARGO_MANIFEST_DIR")).unwrap();
@@ -286,7 +255,7 @@ fn run_fn(m: Mode, what: &str) -> exobox::Error {
     std::mem::forget(before);
     let host_path = env!("CARGO_MANIFEST_DIR");
     let what = what.to_owned();
-    let locked = match g.lockdown(|s| stdio(s, deny)) {
+    let locked = match g.lockdown(stdio) {
         Ok(l) => l,
         Err(e) => return e,
     };
@@ -307,11 +276,6 @@ fn run_fn(m: Mode, what: &str) -> exobox::Error {
         };
         check("run_fn: a host fd from before lockdown is closed", poll(before_fd) == (1, libc::POLLNVAL));
         check("run_fn: stdin is open", poll(0).1 & libc::POLLNVAL == 0);
-        if what == "errno" {
-            // Not on the list: EPERM.
-            check("run_fn: the gate's getppid is refused", gate_call(gate, libc::SYS_getppid, 0, 0) == -(libc::EPERM as isize));
-            return 42;
-        }
         if what == "kill" {
             gate_call(gate, libc::SYS_getppid, 0, 0);
             println!("run_fn: survived the gate");
@@ -375,7 +339,7 @@ fn template(m: Mode) -> exobox::Error {
                 let mut argv: Vec<OsString> = vec![fx::bin(fixture).into()];
                 argv.extend(args.iter().map(OsString::from));
                 let env = env();
-                g.lockdown(|s| stdio(s, Deny::Kill))?.exec(&argv, &env)
+                g.lockdown(stdio)?.exec(&argv, &env)
             })
             .unwrap();
         let st = child.wait().unwrap();
@@ -470,10 +434,11 @@ fn main() {
             Ok(())
         }),
         Trial::test("sandbox_gate_is_filtered", || {
-            // The filter: openat("/") through the gate is EPERM (deny=errno).
+            // The filter: openat("/") through the gate kills the sandbox.
+            use std::os::unix::process::ExitStatusExt;
             let (st, out, err) = run("sandbox", "escape_kill", "coroutine", &[])?;
-            if st.code() != Some(1) || out.trim() != "ESCAPE_KILL_SURVIVED -1" {
-                return fail(st, &out, &err, "wanted EPERM from the gate");
+            if st.signal() != Some(libc::SIGSYS) || out.contains("SURVIVED") {
+                return fail(st, &out, &err, "wanted SIGSYS from the gate's openat");
             }
             Ok(())
         }),
@@ -483,13 +448,6 @@ fn main() {
             let (st, out, err) = run("run_fn", "ok", mode, &[])?;
             if st.code() != Some(42) || out.contains("FAIL") || out.matches(": ok").count() != 6 {
                 return fail(st, &out, &err, "wanted the closure's checks and status 42");
-            }
-            Ok(())
-        }));
-        trials.push(Trial::test(format!("run_fn_gate_errno::{mode}"), move || {
-            let (st, out, err) = run("run_fn", "errno", mode, &[])?;
-            if st.code() != Some(42) || out.contains("FAIL") || out.matches(": ok").count() != 7 {
-                return fail(st, &out, &err, "wanted the gate's calls refused (EPERM)");
             }
             Ok(())
         }));
@@ -547,29 +505,6 @@ fn main() {
             ];
             if st.code() != Some(0) || !out.contains("PATHS_OK") || want.iter().any(|w| !out.contains(w.as_str())) {
                 return fail(st, &out, &err, &format!("wanted {want:?}"));
-            }
-            Ok(())
-        }));
-        trials.push(Trial::test(format!("restrict_kills::{mode}"), move || {
-            // write(2) from the gate is the mode's; the restriction kills it.
-            use std::os::unix::process::ExitStatusExt;
-            let (st, out, err) =
-                run("restrict_kill", "exit_status", mode, &[(CHILD_ARGS, "stderr")])?;
-            if st.signal() != Some(libc::SIGSYS) || err.contains("to stderr") {
-                return fail(st, &out, &err, "wanted the write to stderr killed");
-            }
-            Ok(())
-        }));
-        trials.push(Trial::test(format!("restrict_errno::{mode}"), move || {
-            // The same, as EPERM: the program goes on (its stderr line lost), and the mode's own
-            // probes (escape_gate, deny=errno) are as without the restriction.
-            let (st, out, err) = run("restrict_errno", "exit_status", mode, &[(CHILD_ARGS, "stderr")])?;
-            if st.code() != Some(3) || err.contains("to stderr") {
-                return fail(st, &out, &err, "wanted exit 3 with stderr refused");
-            }
-            let (st, out, err) = run("restrict_errno", "escape_gate", mode, &[])?;
-            if st.code() != Some(0) || !out.contains("ESCAPE_GATE_OK") {
-                return fail(st, &out, &err, "wanted escape_gate's probes to pass under the restriction");
             }
             Ok(())
         }));

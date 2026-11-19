@@ -49,14 +49,10 @@ pub use image::Image;
 pub use net::{Cx, GuestSocket, HeldFd, NetError, OnConnect, OnListen, OnResolve};
 /// What may be done on a granted fd ([`tcb::Config::grant`]).
 pub use tcb::Access;
-/// What the filter does to a refused host syscall: a debugging knob for the escape tests (a
-/// sandbox kills, the default, always).
-#[doc(hidden)]
-pub use tcb::Deny;
 /// How the sandbox runs the program's threads and processes. Each mode's host allowlist is a
 /// superset of the one before.
 pub use tcb::Mode;
-/// One classic-BPF instruction (`struct sock_filter`), for [`tcb::Config::restrict`].
+/// One classic-BPF instruction (`struct sock_filter`): [`tcb::filter`]'s output.
 pub use tcb::SockFilter;
 /// The auxiliary-vector tag under which a sandboxed program finds the gate's address (what the
 /// escape tests call, as a compromised program that found the gate would).
@@ -184,9 +180,6 @@ impl std::fmt::Debug for Guest {
 impl tcb::Confined for Guest {
     fn host_fds(&self) -> &[RawFd] {
         &self.host_fds
-    }
-    fn mode(&self) -> Mode {
-        self.mode
     }
     fn gate_ip(&self) -> u64 {
         exobox_rt::trap::gate_ip()
@@ -692,8 +685,10 @@ impl Guest {
         // Seccomp's trap takes over from syscall user dispatch.
         guest::sud_off()?;
         let (passed, held) = (self.passed.clone(), self.held.clone());
+        let mode = self.mode;
         tcb::Sandbox::configure_and_lockdown(
             |s| {
+                s.mode = mode;
                 for &fd in passed.iter().chain(&held) {
                     s.grant(fd, Access::ReadWrite);
                 }
@@ -844,8 +839,6 @@ impl FromStr for ImageArg {
 #[derive(Clone, Debug, Default)]
 pub struct Config {
     pub mode: Mode,
-    #[doc(hidden)]
-    pub deny: Deny,
     /// More host paths the program may see and map, besides its own closure: a store path
     /// brings its closure; a path outside the store is shown as is, read-only.
     pub allow_paths: Vec<PathBuf>,
@@ -898,11 +891,7 @@ pub fn run(config: Config) -> Result<Infallible, Error> {
     let mut argv = config.argv.clone();
     argv[0] = std::path::absolute(&argv[0]).map_err(Error::io("the program's path"))?.into_os_string();
     g.run(|| setup::mount_closure(&mounts))??;
-    let deny = config.deny;
-    let locked = g.lockdown(|s| {
-        s.deny(deny);
-        stdio(s)
-    })?;
+    let locked = g.lockdown(stdio)?;
     locked.exec(&argv, &config.env)
 }
 

@@ -201,7 +201,7 @@ pub fn ppoll_fds(fds: &mut [PollFd], timeout: Option<&Timespec>) -> Result<usize
 pub fn exit_group(status: i32) -> ! {
     // SAFETY: ends the process; nothing after it runs.
     unsafe { gate(NR_EXIT_GROUP as usize, status as usize, 0, 0, 0, 0, 0) };
-    // Only if the filter denied it (deny=errno with a broken list): never return into the caller.
+    // Only if the call failed (a broken list kills first): never return into the caller.
     loop {
         core::hint::spin_loop()
     }
