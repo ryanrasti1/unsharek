@@ -90,6 +90,13 @@ sb.run(Hooks {
 Anything setup needs beyond that is code: in the closure, or in the guest itself (a first program
 that mounts `/dev/exobox/<name>` with `mount(2)` and execs the next one).
 
+**Examples.** `examples/` has small, runnable programs that use the library this way
+([examples/README.md](examples/README.md)): a Nix program with its closure and its startup and
+memory measured (`nix-program`), composing the guest in `pre_exec` (`setup`), a host channel at
+fd 1000 (`channel`), networking through a proxy that holds the policy (`net-policy`), coroutine
+against threaded mode (`threads`), and the host filter refusing a hostile program (`escape`).
+`cargo run -p exobox-examples --release --bin <name>`, from the devshell.
+
 ## How it works
 
 - **Routing and security are two stacked seccomp filters.** The first (installed by `run`) traps

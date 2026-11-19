@@ -253,6 +253,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "exobox-examples"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "exobox",
+ "exobox-erofs",
+ "exobox-fixtures",
+ "futures-io",
+ "libc",
+ "tempfile",
+]
+
+[[package]]
 name = "exobox-fixtures"
 version = "0.0.0"
 dependencies = [

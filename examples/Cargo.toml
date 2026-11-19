@@ -1,0 +1,24 @@
+[package]
+name = "exobox-examples"
+version = "0.0.0"
+description = "Small programs showing exobox's library API (examples/README.md walks through them)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+exobox = { path = "../native/exobox" }
+# setup: an image built from a directory
+exobox-erofs = { path = "../native/erofs" }
+# threads: par_compute, a small C guest
+exobox-fixtures = { path = "../native/fixtures" }
+# the parents' side: fds into children, wait4 for the sandbox's rusage
+libc.workspace = true
+# net-policy: the provider's streams
+futures-io = "0.3"
+tempfile.workspace = true
+
+# escape: the hostile guest program (c/gate_probe.c)
+[build-dependencies]
+cc.workspace = true
