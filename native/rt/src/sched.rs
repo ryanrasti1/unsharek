@@ -739,6 +739,19 @@ impl Sched {
         None
     }
 
+    /// Whether a runnable coroutine may run on `host` (bound there, or to no host).
+    pub fn par_runnable_here(&self, host: u16) -> bool {
+        let mut i = self.run_head.get();
+        while i != NONE {
+            let home = self.slots[i as usize].home.get();
+            if home == NONE || home == host {
+                return true;
+            }
+            i = self.slots[i as usize].run_next.get();
+        }
+        false
+    }
+
     /// Whether a runnable coroutine is bound to no host (threaded mode: the kernel thread can run
     /// it).
     pub fn par_unbound_ready(&self) -> bool {

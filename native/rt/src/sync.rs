@@ -155,6 +155,8 @@ pub struct Timer {
     state: Cell<TimerState>,
     deadline: Cell<u64>,
     tid: Cell<Option<Tid>>,
+    /// Poked to re-read its state, not yet run since: its deadline is on no heap meanwhile.
+    rereading: Cell<bool>,
 }
 
 impl Timer {
@@ -162,6 +164,11 @@ impl Timer {
     /// puts it there when it next runs).
     pub fn is_armed(&self) -> bool {
         self.state.get() == TimerState::Armed
+    }
+
+    /// Changed since its coroutine last looked: the deadline (if any) is on no heap until it runs.
+    pub fn is_rereading(&self) -> bool {
+        self.rereading.get()
     }
 }
 
@@ -179,6 +186,7 @@ impl Timer {
             state: Cell::new(TimerState::Idle),
             deadline: Cell::new(0),
             tid: Cell::new(None),
+            rereading: Cell::new(false),
         }
     }
 
@@ -211,6 +219,7 @@ impl Timer {
         let s = self.sched();
         self.deadline.set(s.now().saturating_add(delta_ns));
         self.state.set(TimerState::Armed);
+        self.rereading.set(true);
         self.poke();
     }
 
@@ -249,6 +258,7 @@ fn timer_main(p: usize) -> usize {
     let t = unsafe { &*(p as *const Timer) };
     let s = t.sched();
     loop {
+        t.rereading.set(false);
         match t.state.get() {
             TimerState::Freed => return 0,
             TimerState::Idle => {

@@ -53,7 +53,7 @@
 
 use core::cell::Cell;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use rustix::fd::AsRawFd;
 
@@ -180,6 +180,9 @@ pub struct Threaded {
     live_procs: AtomicU32,
     max_procs: AtomicU32,
     next_proc: AtomicU32,
+    /// The deadline the idler sleeps to without the token (under `spin`; u64::MAX: it isn't, so a
+    /// release with any deadline pending hands it the token, as before).
+    idler_until: AtomicU64,
 }
 
 // SAFETY: the scheduler fields are touched only by the token holder (one at a time). The atomics
@@ -210,6 +213,7 @@ pub static PAR: Threaded = Threaded {
     live_procs: AtomicU32::new(1),
     max_procs: AtomicU32::new(0),
     next_proc: AtomicU32::new(0),
+    idler_until: AtomicU64::new(u64::MAX),
 };
 
 fn sched() -> &'static Sched {
@@ -464,7 +468,11 @@ fn give(id: u16, allow_none: bool) -> u32 {
         home as u32
     } else if let Some(w) = pop_waiter() {
         w as u32
-    } else if !allow_none || sched().par_next_deadline().is_some() || idle_watching() || crate::host::timer_armed() {
+    } else if !allow_none
+        || idle_watching()
+        || crate::host::timer_rereading()
+        || sched().par_next_deadline().is_some_and(|d| d < PAR.idler_until.load(Ordering::Relaxed))
+    {
         KERNEL as u32
     } else {
         NONE_SLOT
@@ -534,7 +542,44 @@ fn sched_loop(arg: usize) -> usize {
             }
         }
         lock();
+        if s.par_runnable_here(id) {
+            // Something of ours or no one's became runnable (a timer that just fired, the look
+            // above): run it first.
+            unlock();
+            continue;
+        }
         let target = s.par_bound_elsewhere(id).map(|h| h as u32).or_else(|| pop_waiter().map(|w| w as u32));
+        let deadline = s.par_next_deadline();
+        if let Some(d) = deadline
+            && !idle_watching()
+        {
+            // Sleep to the next deadline without the token (handed on, or left free): a release
+            // hands it back only for a deadline earlier than this one (or a timer being set). It
+            // kept the token while it slept, so a thread wanting the kernel woke it to be handed
+            // it, and every release with a timer pending handed it back: with fix 4's offers,
+            // nearly every contended acquire of a parallel rustc's or cargo's found the token
+            // asleep in the idler (PERF.md).
+            match target {
+                Some(t) => hand(t as u16),
+                None => PAR.owner.store(NONE_SLOT, Ordering::Release),
+            }
+            PAR.idler_until.store(d, Ordering::Relaxed);
+            unlock();
+            if let Some(t) = target {
+                poke(t as u16);
+            }
+            let ns = d.saturating_sub(s.now());
+            let ts = Timespec { tv_sec: (ns / 1_000_000_000) as i64, tv_nsec: (ns % 1_000_000_000) as i64 };
+            let mut p = PollFd { fd: h.efd as i32, events: POLLIN, revents: 0 };
+            if trap::ppoll(Some(&mut p), Some(&ts)).is_ok_and(|n| n > 0) {
+                let _ = trap::eventfd_read(h.efd);
+            }
+            lock();
+            PAR.idler_until.store(u64::MAX, Ordering::Relaxed);
+            unlock();
+            acquire(id);
+            continue;
+        }
         if let Some(t) = target {
             hand(t as u16);
             unlock();
@@ -542,7 +587,6 @@ fn sched_loop(arg: usize) -> usize {
             wait_token(id);
             continue;
         }
-        let deadline = s.par_next_deadline();
         if deadline.is_none() && !idle_watching() {
             // Nothing to wait for but a hand-off: leave the token free and sleep until handed it
             // (a new timer or fd wait is made under the token, and handed here on that thread's
@@ -1171,6 +1215,7 @@ pub fn after_fork(s: &'static Sched) -> Result<(), rustix::io::Errno> {
     k.running.set(0);
     k.used.store(false, Ordering::Release);
     PAR.k_ready.store(false, Ordering::Release);
+    PAR.idler_until.store(u64::MAX, Ordering::Relaxed);
     PAR.owner.store(0, Ordering::Release);
     Ok(())
 }
