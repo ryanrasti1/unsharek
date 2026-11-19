@@ -204,19 +204,16 @@ fn ppoll() {
     }
 }
 
-/// `kill` from the gate: the sandbox's own pid and a signal number, in coroutine and threaded mode
-/// only (a fork mode process's pid isn't the one pinned).
+/// `kill` from the gate: the sandbox's own pid (fork mode: init's process's) and a signal number.
 #[test]
 fn kill_self() {
     let ok = [PID as u64, 6, 0, 0, 0, 0];
-    for mode in [Mode::Coroutine, Mode::Threaded] {
+    for mode in MODES {
         edges(mode, NR_KILL, ok, 0, &[(PID as u64, PID as u64)]);
         edges(mode, NR_KILL, ok, 1, &[(1, 64)]);
         // The rest are anything (kill has two arguments).
         edges(mode, NR_KILL, ok, 2, &[(0, u64::MAX)]);
     }
-    let prog = build(Mode::Fork, Deny::Errno, &[]);
-    assert_eq!(check(&prog, gate(NR_KILL, ok)), DENY);
 }
 
 #[test]
@@ -264,26 +261,33 @@ fn madvise() {
 fn clone_and_exit() {
     for mode in [Mode::Threaded, Mode::Fork] {
         let fork = mode == Mode::Fork;
+        const SIBLING: u64 = CLONE_PARENT | SIGCHLD;
         let clone0: &[(u64, u64)] = if fork {
-            &[(CLONE_HOST_THREAD, CLONE_HOST_THREAD), (SIGCHLD, SIGCHLD)]
+            &[(CLONE_HOST_THREAD, CLONE_HOST_THREAD), (SIGCHLD, SIGCHLD), (SIBLING, SIBLING)]
         } else {
             &[(CLONE_HOST_THREAD, CLONE_HOST_THREAD)]
         };
         edges(mode, NR_CLONE, [0; 6], 0, clone0);
         edges(mode, NR_EXIT, [0; 6], 0, &[(0, 0)]);
         let prog = build(mode, Deny::Errno, &[]);
-        // Each flag bit added or removed: refused (in fork mode, none of these is SIGCHLD).
+        // Each flag bit added or removed: refused (in fork mode, only CLONE_PARENT's turns
+        // SIGCHLD into the other allowed set, and back).
         for bit in 0..64 {
             let flags = CLONE_HOST_THREAD ^ (1 << bit);
             assert_eq!(check(&prog, gate(NR_CLONE, [flags, 0, 0, 0, 0, 0])), DENY, "bit {bit}");
-            let flags = SIGCHLD ^ (1 << bit);
-            assert_eq!(check(&prog, gate(NR_CLONE, [flags, 0, 0, 0, 0, 0])), DENY, "bit {bit}");
+            for base in [SIGCHLD, SIBLING] {
+                let flags = base ^ (1 << bit);
+                if !(fork && (flags == SIGCHLD || flags == SIBLING)) {
+                    assert_eq!(check(&prog, gate(NR_CLONE, [flags, 0, 0, 0, 0, 0])), DENY, "{base:#x} bit {bit}");
+                }
+            }
         }
         // The thread clone takes any stack, tid pointers and TLS argument (the flags make TLS
         // unused); the fork clone only no stack.
         edges(mode, NR_CLONE, [CLONE_HOST_THREAD, 0, 0, 0, 0, 0], 1, &[(0, u64::MAX)]);
         let fork_stack: &[(u64, u64)] = if fork { &[(0, 0)] } else { &[] };
         edges(mode, NR_CLONE, [SIGCHLD, 0, 0, 0, 0, 0], 1, fork_stack);
+        edges(mode, NR_CLONE, [SIBLING, 0, 0, 0, 0, 0], 1, fork_stack);
         assert_eq!(check(&prog, gate(NR_EXIT, [1, 0, 0, 0, 0, 0])), DENY);
     }
     let prog = build(Mode::Coroutine, Deny::Errno, &[]);

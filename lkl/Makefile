@@ -107,10 +107,24 @@ kernel:
 # has one, but the vmlinux link script's DISCARDS drops it, and an object without it tells ld the
 # binary needs an executable stack: ld warns and makes the whole program's stack executable unless
 # the link says -z noexecstack (rustc's does; a plain gcc link doesn't).
+#
+# The kernel's writable data (.data, .bss, .data.rel, .data.rel.local: what it writes after boot)
+# becomes one section, exobox_shared, which ends on a page boundary (the 4 KiB pad after it, its
+# alignment the section's): fork mode maps the binary's exobox_shared shared between its processes
+# before the first fork, so that the processes run one kernel (exobox_rt::share). The runtime's
+# own shared state (its scheduler, the CPU token, the host ops' pools) is put in the same section
+# by its statics' #[link_section]; in the binary, the Rust objects come before this one, so the
+# section starts (its alignment) and ends (the pad) on a page and holds nothing else. Boot-only
+# data (.init.data, __param, .data..ro_after_init) stays where it was: a fork copies it as it is.
+SHARED := .data .bss .data.rel .data.rel.local
 $(KOUT)/liblkl-kernel.a: kernel
 	@if [ ! -e $@ ] || [ $(LKL)/lib/lkl.o -nt $@ ]; then \
+		printf '\t.section exobox_shared,"aw",@progbits\n\t.balign 4096\n\t.zero 4096\n\t.section .note.GNU-stack,"",@progbits\n' \
+			| as -o $(KOUT)/shared_end.o - && \
 		objcopy --add-section .note.GNU-stack=/dev/null --set-section-flags .note.GNU-stack=noload,readonly \
-			$(LKL)/lib/lkl.o $(KOUT)/lkl.o && \
+			$(foreach s,$(SHARED),--rename-section $(s)=exobox_shared,alloc,load,contents,data) \
+			$(LKL)/lib/lkl.o $(KOUT)/lkl-renamed.o && \
+		ld -r -o $(KOUT)/lkl.o $(KOUT)/lkl-renamed.o $(KOUT)/shared_end.o && \
 		rm -f $@ && ar rcs $@ $(KOUT)/lkl.o && echo "  AR      $@"; fi
 $(KOUT)/liblkl-posix.a: kernel
 	@if [ ! -e $@ ] || [ $(LKL)/lib/liblkl-in.o -nt $@ ]; then rm -f $@ && ar rcs $@ $(LKL)/lib/liblkl-in.o && echo "  AR      $@"; fi

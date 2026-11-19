@@ -14,7 +14,7 @@
 //!
 //! The process becomes the sandbox: one guest per process, booted from the thread that will run
 //! it, and setup is single-threaded (the closure's threads would be host threads the guest can't
-//! route). Coroutine mode only so far.
+//! route). In fork mode the sandbox is this process and the host processes its guest forks make.
 
 pub mod alloc;
 pub mod net;
@@ -255,13 +255,19 @@ const COROUTINE_STACK: usize = 128 << 10;
 const ARENA_AT: usize = 0x20_0000;
 
 fn reserve(at: usize, len: usize, prot: i32) -> Result<*mut u8, Error> {
-    let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
+    reserve_as(at, len, prot, libc::MAP_PRIVATE)
+}
+
+/// `reserve`, `MAP_SHARED` or `MAP_PRIVATE`: fork mode's kernel memory is shared by the
+/// processes' host forks (`exobox_rt::share`).
+fn reserve_as(at: usize, len: usize, prot: i32, share: i32) -> Result<*mut u8, Error> {
+    let flags = share | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
     let fixed = if at != 0 { libc::MAP_FIXED_NOREPLACE } else { 0 };
     // SAFETY: a fresh anonymous mapping; FIXED_NOREPLACE never replaces one.
     let p = unsafe { libc::mmap(at as *mut _, len, prot, flags | fixed, -1, 0) };
     if p == libc::MAP_FAILED {
         if at != 0 {
-            return reserve(0, len, prot);
+            return reserve_as(0, len, prot, share);
         }
         return Err(Error::Io { what: format!("reserving {len} bytes"), source: std::io::Error::last_os_error() });
     }
@@ -275,6 +281,12 @@ impl Guest {
     /// the guest's basics ([`setup::defaults`]: `/proc`, `/dev`, `/tmp`, stdio, loopback,
     /// entropy). Host code, no filter. Once per process.
     pub fn boot(config: GuestConfig) -> Result<Guest, Error> {
+        Guest::boot_as(config, false)
+    }
+
+    /// [`Guest::boot`]; with `shared`, the kernel's memory (its pool, the coroutine stacks, the
+    /// runtime's shared section) is mapped shared, for fork mode's host forks.
+    fn boot_as(config: GuestConfig, shared: bool) -> Result<Guest, Error> {
         if BOOTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return Err(Error::NotImplemented("a second guest in one process"));
         }
@@ -298,9 +310,21 @@ impl Guest {
         let arena = reserve(ARENA_AT, memory + zone + filter::MADV_CHUNK as usize, rwx)?;
         let mem_mb = config.kernel_memory.div_ceil(1 << 20).max(16);
         let heap_len = (mem_mb << 20) + PAGE;
-        let heap = reserve(0, heap_len, rw)?;
+        let share = if shared {
+            // The kernel's and the runtime's statics, before anything of them is used. Before
+            // any other thread exists.
+            // SAFETY: this thread is the process's only one.
+            unsafe { exobox_rt::share::remap() }.map_err(|e| Error::Io {
+                what: "sharing the kernel's data (fork mode)".into(),
+                source: std::io::Error::from_raw_os_error(e.raw_os_error()),
+            })?;
+            libc::MAP_SHARED
+        } else {
+            libc::MAP_PRIVATE
+        };
+        let heap = reserve_as(0, heap_len, rw, share)?;
         let stacks_len = COROUTINES * COROUTINE_STACK;
-        let stacks = reserve(0, stacks_len, rw)?;
+        let stacks = reserve_as(0, stacks_len, rw, share)?;
         let loglevel = std::env::var("EXOBOX_KERNEL_LOGLEVEL").unwrap_or_else(|_| "1".into());
         // program_mem: what sysinfo and /proc/meminfo report (the kernel series' item 13): the
         // program's memory is the arena, not the kernel's pool (V8 sizes its heap from it).
@@ -464,13 +488,12 @@ pub struct Sandbox {
 }
 
 impl Sandbox {
-    /// Boot a guest for `mode` (coroutine and threaded; fork is not implemented yet).
+    /// Boot a guest for `mode`. Fork mode's processes share the kernel's memory, mapped shared
+    /// here; a fork has no bound but the runtime's host-thread slots until
+    /// [`Sandbox::max_procs`].
     pub fn boot(mode: Mode, config: GuestConfig) -> Result<Sandbox, Error> {
-        if mode == Mode::Fork {
-            return Err(Error::NotImplemented("fork mode"));
-        }
-        let guest = Guest::boot(config)?;
-        let token_fds = if mode == Mode::Threaded {
+        let guest = Guest::boot_as(config, mode == Mode::Fork)?;
+        let token_fds = if mode != Mode::Coroutine {
             // Make the CPU-token eventfds and switch the runtime to threaded (before lockdown),
             // then start the kernel idler host thread and wait for it to install its signal stack
             // (the routing filter is synced to it).
@@ -481,11 +504,23 @@ impl Sandbox {
                 .spawn(|| guest::threaded_kernel_main())
                 .map_err(Error::io("the kernel idler thread"))?;
             guest::threaded_wait_ready();
+            if mode == Mode::Fork {
+                guest::enable_fork(0)?;
+            }
             range
         } else {
             (0, 0)
         };
         Ok(Sandbox { guest, mode, deny: Deny::Kill, rules: vec![], fds: vec![], token_fds })
+    }
+
+    /// Fork mode: at most `n` processes alive at once, the first one included; a fork past it
+    /// fails with EAGAIN. Ignored in the other modes.
+    pub fn max_procs(&mut self, n: u32) -> &mut Self {
+        if self.mode == Mode::Fork {
+            exobox_rt::par::set_max_procs(n);
+        }
+        self
     }
 
     /// What a refused host syscall gets (default: kill).
@@ -660,6 +695,9 @@ pub fn run(config: Config) -> Result<Infallible, Error> {
     let guest = GuestConfig::default();
     let mut sb = Sandbox::boot(config.mode, guest)?;
     sb.deny(config.deny);
+    if let Some(n) = config.max_procs {
+        sb.max_procs(n);
+    }
     for r in &config.rules {
         sb.allow(r.clone());
     }

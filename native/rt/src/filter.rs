@@ -68,6 +68,8 @@ pub const CLONE_HOST_THREAD: u64 = 0x100 | 0x200 | 0x400 | 0x800 | 0x1_0000 | 0x
 pub const PPOLL_FDS: u64 = 8;
 /// `SIGCHLD` (arch/x86/include/uapi/asm/signal.h): clone's flags for a plain fork.
 pub const SIGCHLD: u64 = 17;
+/// `CLONE_PARENT`: the new process is a sibling of the caller's (a child of its parent).
+pub const CLONE_PARENT: u64 = 0x8000;
 /// `MADV_DONTNEED` (include/uapi/asm-generic/mman-common.h).
 pub const MADV_DONTNEED: u64 = 4;
 /// The most one `madvise` from the gate may cover. Each arena reservation has this much padding
@@ -272,9 +274,11 @@ const HOST: &[Entry] = &[
     Entry { modes: ALL, nr: NR_EXIT_GROUP, conds: &[] },
     // Ending it by a signal: the guest's process died of one (its default action), and the
     // sandbox dies of the same, as the program would natively (abort's SIGABRT). Only this
-    // process, only a signal number: the program can end the sandbox anyway. Not fork mode yet:
-    // its processes' pids differ from the one pinned here.
-    Entry { modes: COROUTINE | THREADED, nr: NR_KILL, conds: &[(0, Is::Pid), (1, Is::In(1, 64))] },
+    // process, only a signal number: the program can end the sandbox anyway. In fork mode the
+    // pinned pid is init's process's, the sandbox's: only its death by a signal is the
+    // sandbox's (a forked process's is the guest's, seen by its parent in wait), and so is the
+    // death of any process on the host (init's SIGCHLD, `guest`'s fork mode).
+    Entry { modes: ALL, nr: NR_KILL, conds: &[(0, Is::Pid), (1, Is::In(1, 64))] },
     // The one wait: idle to the next timer (coroutine), a thread's timed sleep on its eventfd
     // (threaded), the program's nanosleep; and the fds it waits for: stdin, the fds the hooks
     // hold and passed fds the guest polls (`executor`). Up to PPOLL_FDS pollfds and no signal
@@ -302,8 +306,11 @@ const HOST: &[Entry] = &[
     Entry { modes: THREADED | FORK, nr: NR_CLONE, conds: &[(0, Is::Eq(CLONE_HOST_THREAD))] },
     // A host thread's end, after its program thread's: status 0 only.
     Entry { modes: THREADED | FORK, nr: NR_EXIT, conds: &[(0, Is::Eq(0))] },
-    // The host fork behind a program's fork: flags exactly SIGCHLD and no new stack.
+    // The host fork behind a program's fork: flags exactly SIGCHLD and no new stack; from a
+    // forked process, CLONE_PARENT too, so that every process is a host child of init's, whose
+    // SIGCHLD sees any of them die on the host (a sibling, not a new authority).
     Entry { modes: FORK, nr: NR_CLONE, conds: &[(0, Is::Eq(SIGCHLD)), (1, Is::Eq(0))] },
+    Entry { modes: FORK, nr: NR_CLONE, conds: &[(0, Is::Eq(CLONE_PARENT | SIGCHLD)), (1, Is::Eq(0))] },
 ];
 
 // ------------------------------------------------------------------------------------------------

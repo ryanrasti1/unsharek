@@ -56,6 +56,15 @@ use crate::sysmap::{self, Emulate, Rewrite, Route, StatForm, k, lkl};
 use crate::trap::{self, StackT, Ucontext};
 use crate::xabi::{self, Itimerval, LklSigaction, LklStat, Timespec, Timeval, X86Sigaction, X86Stat};
 
+mod fork;
+pub use fork::enable_fork;
+
+/// The `thread_exit` host op's fork-mode case (`fork::bootstrap_exit`): a fork's child whose clone
+/// failed ends its process. Returns otherwise.
+pub(crate) fn fork_thread_exit() {
+    fork::bootstrap_exit()
+}
+
 /// A static only this host thread touches (coroutine mode: one host thread, cooperative).
 struct Local<T>(UnsafeCell<T>);
 // SAFETY: one host thread uses the guest's state (see the module comment).
@@ -74,8 +83,11 @@ impl<T> Local<T> {
     }
 }
 
+// The scheduler and the futex table: fork mode's processes share them (`share`).
+#[unsafe(link_section = "exobox_shared")]
 static SCHED: Sched = Sched::new();
 static SYS: SysHost = SysHost;
+#[unsafe(link_section = "exobox_shared")]
 static FUTEXES: Local<Futexes> = Local::new(Futexes::new());
 
 /// The program's futexes (shared references only: its methods take `&self`).
@@ -128,6 +140,10 @@ struct Thread {
     /// whether its probe ran one ([`futex_call`]).
     handled: Cell<u32>,
     handled_restart: Cell<bool>,
+    /// Fork mode, during a clone that makes a process: the child's stack (0: the parent's) and FS
+    /// base, for the `fork` host op inside the call (`fork::fork_op`).
+    fork_sp: Cell<usize>,
+    fork_fs: Cell<usize>,
 }
 
 impl Thread {
@@ -183,6 +199,8 @@ static S: State = State {
             quiet: Cell::new(None),
             handled: Cell::new(0),
             handled_restart: Cell::new(false),
+            fork_sp: Cell::new(0),
+            fork_fs: Cell::new(0),
         }
     }; THREADS],
     restorers: [const { Cell::new(0) }; 65],
@@ -720,8 +738,12 @@ const CLONE_CHILD_SETTID: usize = 0x100_0000;
 /// `newsp`, its first LKL call `attach_thread`. Processes (fork, vfork): coroutine mode has none.
 fn clone(uc: &Ucontext, a: [usize; 6]) -> Result<usize, Errno> {
     let (flags, newsp, ptid, ctid, tls) = (a[0], a[1], a[2], a[3], a[4]);
+    if flags & CLONE_THREAD == 0 && fork::enabled() {
+        // A process: a host fork (fork mode).
+        return fork::clone_process(uc, a);
+    }
     if flags & (CLONE_VM | CLONE_THREAD) != CLONE_VM | CLONE_THREAD || flags & CLONE_VFORK != 0 {
-        // TODO(fork mode): a guest fork is a host fork.
+        // Processes: only fork mode has them.
         return Err(Errno::NOSYS);
     }
     if newsp == 0 {
@@ -781,8 +803,13 @@ fn clone(uc: &Ucontext, a: [usize; 6]) -> Result<usize, Errno> {
     Ok(tid)
 }
 
-/// The sandbox ends with `code`: the host's exit.
+/// The sandbox ends with `code`: the host's exit. In a fork's child process, only that process
+/// ends, and as the guest's: its exit_group, whose status its parent waits for (`task_exit` then
+/// ends the host process).
 fn finish(code: i32) -> ! {
+    if par::forked() {
+        lkl_call(l::__lkl__NR_exit_group, [code as usize, 0, 0, 0, 0, 0]);
+    }
     trap::exit_group(code)
 }
 
@@ -798,11 +825,13 @@ fn writeback() {
 /// `task_exit`, init's last (pid 1) with the status.
 fn exit_group(code: usize) -> ! {
     writeback();
-    if par::enabled() {
+    if par::enabled() && !par::forked() {
         // Threaded mode: end the whole sandbox at once (the gate's `exit_group` ends every host
         // thread), the status the program's own. Through the kernel, a thread running user code
         // would hold the end up until its next call (threads in the runtime's own waits are
         // woken, as in coroutine mode: `task_exit`), and only this process is in the sandbox.
+        // Fork mode's init too: its end is the sandbox's (the other processes see its pidfd).
+        // A fork's child goes through the kernel: its parent waits for the status.
         finish(code as i32 & 0xff);
     }
     lkl_call(l::__lkl__NR_exit_group, [code, 0, 0, 0, 0, 0]);
@@ -815,7 +844,7 @@ fn exit_group(code: usize) -> ! {
 fn exit_thread(code: usize) -> ! {
     let ct = if par::enabled() { par::take_clear_tid() } else { me().clear_tid.replace(0) };
     if ct != 0 && write_user(ct, 0u32).is_ok() {
-        futexes().wake(&SCHED, ct, 1, futex::FUTEX_BITSET_MATCH_ANY);
+        futexes().wake_in(&SCHED, par::proc_id(), ct, 1, futex::FUTEX_BITSET_MATCH_ANY);
     }
     if !par::enabled() && S.threads.iter().filter(|t| t.used.get()).count() == 1 {
         // The process's last thread: its exit is the process's. (Threaded mode writes back when
@@ -846,6 +875,10 @@ unsafe extern "C" fn task_exit(pid: core::ffi::c_int, status: core::ffi::c_int) 
     SCHED.interrupt_waits();
     cur().reset_signals();
     if par::enabled() {
+        if pid != 0 && par::forked() {
+            // A fork's child process's last task: the host process ends (fork mode).
+            par::process_exited(par::my_id());
+        }
         // A program thread's guest task ended: end its host thread (its Sched coroutine is freed
         // when the slot is reused). Never returns.
         par::thread_exited(par::my_id());
@@ -1179,6 +1212,18 @@ fn restore_registers(to: &mut Ucontext, f: &Ucontext, fp_len: usize) {
 /// number for it. The same if a death by signal fails (the filter's `--deny=errno`, or before
 /// any filter).
 fn die(sig: i32) -> ! {
+    if par::forked() {
+        // A fork's child process: only it dies, as the guest's (its parent sees the signal in
+        // wait). The default action, unblocked, sent to itself: the call's return ends the task.
+        const SIG_UNBLOCK: usize = 1;
+        let dfl = LklSigaction::default();
+        let set = 1u64 << (sig - 1);
+        lkl_call(lkl::RT_SIGACTION as c_long, [sig as usize, &dfl as *const _ as usize, 0, 8, 0, 0]);
+        lkl_call(l::__lkl__NR_rt_sigprocmask, [SIG_UNBLOCK, &set as *const u64 as usize, 0, 8, 0, 0]);
+        let pid = lkl_call(l::__lkl__NR_getpid, [0; 6]);
+        lkl_call(l::__lkl__NR_kill, [pid as usize, sig as usize, 0, 0, 0, 0]);
+        finish(128 + sig)
+    }
     match sig {
         SIGSYS => {
             // SAFETY: the filter kills the process for it.
@@ -1250,7 +1295,10 @@ fn set_exe(path: &[u8]) {
 /// `readlink`/`readlinkat` of `/proc/self/exe` (or `/proc/1/exe`): the program's path.
 fn readlink_exe(path: usize, buf: usize, size: usize) -> Option<isize> {
     let p = user_cstr(path, 32).ok()?;
-    if (p != b"/proc/self/exe" && p != b"/proc/1/exe") || S.exe_len.get() == 0 {
+    // The path is this process's (fork mode: each process keeps its own, copied by the fork and
+    // replaced by its exec); /proc/1/exe is init's, so only init's own answers it.
+    let init = p == b"/proc/1/exe" && !par::forked();
+    if (p != b"/proc/self/exe" && !init) || S.exe_len.get() == 0 {
         return None;
     }
     // SAFETY: as set_exe.
@@ -1415,6 +1463,9 @@ fn serve(uc: &mut Ucontext, nr: usize, a: [usize; 6]) -> isize {
             r
         }
         Route::Lkl(n) => lkl_call(n as c_long, a),
+        // fork and vfork: clone(SIGCHLD). vfork is a fork: its child can't share the parent's
+        // memory, a host process of its own.
+        Route::Rewrite(Rewrite::Fork) if fork::enabled() => ret(fork::clone_process(uc, [fork::SIGCHLD, 0, 0, 0, 0, 0])),
         Route::Rewrite(rw) => rewrite(rw, a),
         Route::Emulate(e) => emulate(uc, e, nr, a),
         Route::Errno(e) => e.ret(),
@@ -1542,7 +1593,7 @@ fn rewrite(rw: Rewrite, a: [usize; 6]) -> isize {
             r
         }
         Rewrite::SigAction => sigaction(a),
-        // TODO(fork mode): fork and vfork are host forks; coroutine mode has no processes.
+        // Fork mode's are `serve`'s; the other modes have no processes.
         Rewrite::Fork => -(Errno::NOSYS.raw_os_error() as isize),
     }
 }
@@ -1737,7 +1788,8 @@ fn futex_call(a: [usize; 6]) -> isize {
         // can't reach it, so `SCHED.interrupt_waits` wakes it (Interrupted: EINTR here) to ask.
         SCHED.set_interruptible(true);
         // SAFETY: uaddr is program memory (checked).
-        let r = unsafe { futexes().futex(&SCHED, uaddr as *const u32, op, val, ts.as_ref(), val3) };
+        // Keyed by this process (fork mode: each process's memory is its own).
+        let r = unsafe { futexes().futex_in(&SCHED, par::proc_id(), uaddr as *const u32, op, val, ts.as_ref(), val3) };
         SCHED.set_interruptible(false);
         if r != Err(Errno::INTR) {
             return ret(r);

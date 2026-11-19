@@ -918,6 +918,22 @@ impl Sched {
         unreachable!("an exited coroutine was resumed")
     }
 
+    /// End the current coroutine with `value` without switching away: its joiner is woken, and
+    /// the caller never runs it again (threaded mode: a host thread that leaves the coroutine's
+    /// stack and ends; fork mode's child whose clone failed after the host fork). No TLS
+    /// destructors run.
+    pub fn retire_current(&self, value: usize) {
+        let i = self.current.get();
+        assert!(i != ROOT, "the root coroutine can't exit");
+        let s = &self.slots[i as usize];
+        s.exit.set(value);
+        s.state.set(State::Zombie);
+        let j = s.joiner.replace(NONE);
+        if j != NONE && self.slots[j as usize].state.get() == State::Blocked {
+            self.resume(j, Wake::Woken);
+        }
+    }
+
     /// Wait for `tid` to exit and reclaim it; its exit value.
     pub fn join(&self, tid: Tid) -> Result<usize, JoinError> {
         let i = self.lookup(tid).ok_or(JoinError::Invalid)?;

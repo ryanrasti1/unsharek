@@ -138,6 +138,15 @@ fn with_obj<T>(ptr: usize, f: impl FnOnce(&mut Obj) -> T) -> Option<T> {
 
 // ---- the host ops ----
 
+/// Fork mode, in a fork's child process: the hooks, the registry and the executor are init's
+/// process's (this one has a stale copy of them, and running it would touch the shared scheduler
+/// from the wrong process). Until a child's ops reach init's executor (`net_fork`), a child's
+/// non-loopback connect is ENETUNREACH, its listen beyond loopback the guest's own, its name
+/// lookups unanswered, and a passed fd's readiness only what it is at the poll.
+fn elsewhere() -> bool {
+    crate::par::forked()
+}
+
 fn addr_of(addr: *const l::lkl_sockaddr, len: c_int) -> Option<SocketAddrV4> {
     if addr.is_null() || len < 16 {
         return None;
@@ -172,7 +181,7 @@ fn done(sock: usize, err: c_int) -> *mut c_void {
 /// A host op: called by the kernel, with its pointers valid for the call.
 pub unsafe extern "C" fn net_connect(sock: *mut c_void, pid: c_int, addr: *const l::lkl_sockaddr, len: c_int) -> c_int {
     let Some(addr) = addr_of(addr, len) else { return neg(Errno::INVAL) };
-    if R.hooks.borrow().connect.is_none() {
+    if R.hooks.borrow().connect.is_none() || elsewhere() {
         return neg(Errno::NETUNREACH);
     }
     let sock = sock as usize;
@@ -244,7 +253,7 @@ fn closed(sock: usize, cx: &mut Context<'_>) -> bool {
 /// A host op: called by the kernel, with its pointers valid for the call.
 pub unsafe extern "C" fn net_listen(sock: *mut c_void, pid: c_int, addr: *const l::lkl_sockaddr, len: c_int) -> c_int {
     let Some(addr) = addr_of(addr, len) else { return neg(Errno::INVAL) };
-    if R.hooks.borrow().listen.is_none() {
+    if R.hooks.borrow().listen.is_none() || elsewhere() {
         return neg(Errno::OPNOTSUPP);
     }
     let sock = sock as usize;
@@ -306,7 +315,7 @@ pub unsafe extern "C" fn net_sendto(
     size: c_ulong,
 ) -> c_int {
     let Some(to) = addr_of(addr, len) else { return neg(Errno::INVAL) };
-    if to.port() != 53 || R.hooks.borrow().resolve.is_none() {
+    if to.port() != 53 || R.hooks.borrow().resolve.is_none() || elsewhere() {
         return neg(Errno::NETUNREACH);
     }
     // SAFETY: the kernel's copy of the datagram, size bytes.
@@ -349,6 +358,9 @@ async fn resolve_task(sock: usize, pid: i32, ns: SocketAddrV4, msg: Vec<u8>) {
 /// # Safety
 /// A host op: called by the kernel, with its pointers valid for the call.
 pub unsafe extern "C" fn net_ready(obj: *mut c_void) {
+    if elsewhere() {
+        return;
+    }
     let wake = with_obj(obj as usize, |o| {
         // For a lent sock this is the program's close (`closed` is only read for socks: an
         // end's state is what its calls return).
@@ -370,7 +382,7 @@ pub unsafe extern "C" fn net_ready(obj: *mut c_void) {
 pub unsafe extern "C" fn hostfd_poll(fd: c_int, events: c_uint) -> c_uint {
     let events = events as i16 & (executor::POLLIN | executor::POLLOUT);
     let ready = executor::fd_ready(fd, events);
-    if ready & events != events && executor::installed() {
+    if ready & events != events && executor::installed() && !elsewhere() {
         executor::watch_hostfd(fd, events & !ready);
     }
     ready as u16 as c_uint

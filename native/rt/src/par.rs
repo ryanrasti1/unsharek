@@ -37,6 +37,16 @@
 //!
 //! Memory is high-water (the filter refuses `madvise` here: concurrent `madvise` and page faults
 //! is the Dirty-COW race class).
+//!
+//! - **Fork mode** (`guest`'s `fork`): the same, across host processes. [`PAR`] (the token, every
+//!   process's slots) is in the shared section (`share`), the eventfds are inherited by every fork,
+//!   and slot ids are the sandbox's, not a process's (each slot records its process,
+//!   `HostSlot::proc`). The per-slot alternate and boot stacks are private memory, each process its
+//!   own copy at the same address. A fork's child starts on its slot's boot stack ([`host_fork`],
+//!   [`child_start`]); a forked process's thread waits for the token watching init's pidfd too
+//!   (`wait_token`). Threads and processes end on their boot stack ([`thread_exited`],
+//!   [`process_exited`]): the control stacks are shared, and another process may take the slot's
+//!   coroutines as soon as it is free.
 
 use core::cell::Cell;
 use core::mem::size_of;
@@ -104,6 +114,8 @@ pub struct HostSlot {
     clear_tid: Cell<usize>,
     /// Acquire-waiter queue link (under `SPIN`).
     wnext: Cell<u16>,
+    /// Fork mode: the process (`proc_id`) whose host thread this is; 0 is init's.
+    proc: AtomicU32,
 }
 
 impl HostSlot {
@@ -112,6 +124,7 @@ impl HostSlot {
             id,
             efd: EFD_BASE + id as u32,
             used: AtomicBool::new(false),
+            proc: AtomicU32::new(0),
             lazy: Cell::new(false),
             tid_word: AtomicU32::new(0),
             bound: Cell::new(0),
@@ -151,12 +164,19 @@ pub struct Threaded {
     next: AtomicU32,
     /// The slots' stack region ([`SLOT_STACKS`] each: alternate, then boot), for [`me`].
     region: AtomicUsize,
+    /// Fork mode: processes alive (init's included), the bound on them (0: none), and the last
+    /// process number given out.
+    live_procs: AtomicU32,
+    max_procs: AtomicU32,
+    next_proc: AtomicU32,
 }
 
 // SAFETY: the scheduler fields are touched only by the token holder (one at a time). The atomics
 // and the spinlock-guarded waiter queue are the cross-thread state.
 unsafe impl Sync for Threaded {}
 
+/// Shared between fork mode's processes (`share`): the token, the slots of every process.
+#[unsafe(link_section = "exobox_shared")]
 pub static PAR: Threaded = Threaded {
     sched: Cell::new(None),
     slots: {
@@ -176,10 +196,50 @@ pub static PAR: Threaded = Threaded {
     k_ready: AtomicBool::new(false),
     next: AtomicU32::new(1),
     region: AtomicUsize::new(0),
+    live_procs: AtomicU32::new(1),
+    max_procs: AtomicU32::new(0),
+    next_proc: AtomicU32::new(0),
 };
 
 fn sched() -> &'static Sched {
     PAR.sched.get().expect("par not enabled")
+}
+
+/// Fork mode: this host process's own (private: not in the shared section, copied by a fork and
+/// then set by the child).
+struct Local {
+    /// The process's number in the sandbox (0: init's; a fork's child gets the next).
+    id: AtomicU32,
+    /// A fork's child (not init's process).
+    forked: AtomicBool,
+    /// Init's process's pidfd (made before lockdown, inherited): readable once it is gone. -1:
+    /// not fork mode.
+    init_pidfd: core::sync::atomic::AtomicI32,
+}
+
+static LOCAL: Local =
+    Local { id: AtomicU32::new(0), forked: AtomicBool::new(false), init_pidfd: core::sync::atomic::AtomicI32::new(-1) };
+
+/// This host process's number in the sandbox (fork mode; 0: init's, and in the other modes).
+pub fn proc_id() -> u32 {
+    LOCAL.id.load(Ordering::Relaxed)
+}
+
+/// Whether this is a fork's child process (not init's).
+pub fn forked() -> bool {
+    LOCAL.forked.load(Ordering::Relaxed)
+}
+
+/// Fork mode, before lockdown: init's pidfd, which every forked process watches while it waits
+/// for the token (`wait_token`), so that it ends with init's process however that ends.
+pub fn set_init_pidfd(fd: i32) {
+    LOCAL.init_pidfd.store(fd, Ordering::Relaxed);
+}
+
+/// A fork's child process, at its start: its number.
+pub fn become_child(id: u32) {
+    LOCAL.id.store(id, Ordering::Relaxed);
+    LOCAL.forked.store(true, Ordering::Relaxed);
 }
 
 /// The calling host thread's record, found from the stack pointer: no register of the thread's is
@@ -233,8 +293,24 @@ fn poke(id: u16) {
 }
 
 /// Block until this host thread holds the token (its eventfd read returns on each hand-off).
+///
+/// In a forked process, the wait also watches init's pidfd: when init's process is gone (its end
+/// is the sandbox's, or it crashed on the host), nothing would hand this thread the token again,
+/// and the process ends here instead of waiting for good (holding the sandbox's stdout open).
 fn wait_token(id: u16) {
     while PAR.owner.load(Ordering::Acquire) != id as u32 {
+        if forked() {
+            let mut fds = [
+                PollFd { fd: slot(id).efd as i32, events: POLLIN, revents: 0 },
+                PollFd { fd: LOCAL.init_pidfd.load(Ordering::Relaxed), events: POLLIN, revents: 0 },
+            ];
+            if trap::ppoll_fds(&mut fds, None).is_ok() && fds[1].revents != 0 {
+                trap::exit_group(0);
+            }
+            if fds[0].revents == 0 {
+                continue;
+            }
+        }
         let _ = trap::eventfd_read(slot(id).efd);
     }
 }
@@ -517,16 +593,10 @@ pub fn target_ctl() -> (usize, usize) {
 
 // ---- lazy program threads ----
 
-/// Make a host thread for a new program thread (a trapped `clone`): a free slot, a bound coroutine
-/// resuming the program at `regs`, and a host thread through the gate that starts it in user mode.
-/// Returns the guest tid the caller reports, or an errno. Called with the token held.
-pub fn spawn_thread(
-    regs: &context::Registers,
-    fs: usize,
-    guest_tid: i32,
-    clear_tid: usize,
-    tmpl: &trap::Ucontext,
-) -> Result<(), rustix::io::Errno> {
+/// A free program slot for a new host thread of process `proc`, with its bound coroutine (a
+/// control stack for its traps) and its scheduler coroutine; marked taken (`tid_word` nonzero,
+/// cleared again when the thread is off its stacks). Called with the token held.
+fn take_slot(proc: u32) -> Result<(u16, Tid), rustix::io::Errno> {
     let s = sched();
     // Find a free slot (its old host thread, if any, has cleared its tid word).
     let start = PAR.next.load(Ordering::Relaxed) as usize;
@@ -558,8 +628,8 @@ pub fn spawn_thread(
     // queue) and its context is filled when it first blocks.
     let bound = s.adopt_root(id).map_err(|_| rustix::io::Errno::AGAIN)?;
     h.bound.set(bound.raw());
-    h.attach.set(guest_tid);
-    h.clear_tid.set(clear_tid);
+    h.attach.set(0);
+    h.clear_tid.set(0);
     h.ctl.set(s.stack_of(bound));
     // Its scheduler coroutine.
     let sc = s.spawn_sched_loop(sched_loop, id as usize, id, context::read_fs()).map_err(|_| {
@@ -567,9 +637,182 @@ pub fn spawn_thread(
         rustix::io::Errno::AGAIN
     })?;
     h.sched_co.set(sc.raw());
-    h.lazy.set(true);
+    h.lazy.set(false);
     h.running.set(0);
+    h.proc.store(proc, Ordering::Relaxed);
     h.tid_word.store(u32::MAX, Ordering::Release);
+    Ok((id, bound))
+}
+
+// ---- fork mode: a process's first host thread ----
+
+/// Fork mode: a slot for a fork's child process `proc`, whose first host thread is the host
+/// fork's child itself ([`host_fork`]). Returns the slot and its bound coroutine, the child's
+/// thread (what `thread_self` says on it). Called with the token held. Undone by [`drop_slot`].
+pub fn fork_slot(proc: u32) -> Result<(u16, Tid), rustix::io::Errno> {
+    take_slot(proc)
+}
+
+/// A slot from [`fork_slot`] whose fork failed.
+pub fn drop_slot(id: u16) {
+    drop_coroutines(id);
+    slot(id).tid_word.store(0, Ordering::Release);
+}
+
+/// The top of slot `id`'s boot region (private memory of each process: a fork's child starts
+/// there, and a thread's end runs there, off the shared stacks).
+pub fn boot_top(id: u16) -> usize {
+    slot(id).boot.get()
+}
+
+/// Slot `id`'s alternate signal stack, `(base, len)`.
+pub fn alt_stack(id: u16) -> (usize, usize) {
+    (slot(id).alt.get(), trap::ALTSTACK_SIZE)
+}
+
+/// The host fork (`clone(flags)` through the gate, no new stack: what the filter allows), made on
+/// `stack_top` (in slot `id`'s boot region, private memory: the calling thread runs on a shared
+/// control stack, which the child must not write). Returns the child's host pid in the parent,
+/// or `-errno`. In the child the call doesn't return: it makes `rt_sigreturn` (through the gate)
+/// on `frame`, an `rt_sigframe` (its return address, then the ucontext) the caller left in that
+/// region, which installs the child's own alternate signal stack and enters the child's code.
+///
+/// # Safety
+/// `stack_top` is 16-aligned private memory below `frame`, free; `frame` is a valid frame whose
+/// registers start the child.
+pub unsafe fn host_fork(stack_top: usize, flags: u64, frame: usize) -> isize {
+    // SAFETY: the caller's.
+    unsafe { fork_trampoline(stack_top, flags, frame) }
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn fork_trampoline(stack_top: usize, flags: u64, frame: usize) -> isize {
+    core::arch::naked_asm!(
+        "push rbp",
+        "mov rbp, rsp",
+        "mov rsp, rdi",
+        // The frame's address, for the child (its copy of this stack has it too).
+        "push rdx",
+        // gate(NR_CLONE, flags, 0, 0, 0, 0, 0): the seventh argument (a5) on the stack.
+        "push 0",
+        "mov rdi, {nr}",
+        "xor edx, edx",
+        "xor ecx, ecx",
+        "xor r8d, r8d",
+        "xor r9d, r9d",
+        "call {gate}",
+        "test rax, rax",
+        "jz 2f",
+        "mov rsp, rbp",
+        "pop rbp",
+        "ret",
+        // The child: rt_sigreturn reads the frame's ucontext at rsp (just past its return address).
+        "2:",
+        "mov rsp, [rsp + 8]",
+        "add rsp, 8",
+        "mov eax, 15",
+        "jmp exobox_rt_gate_syscall",
+        nr = const crate::filter::NR_CLONE,
+        gate = sym trap::gate,
+    )
+}
+
+/// Run `f(arg)` on stack `top` (16-aligned), never coming back: a thread's or a process's end,
+/// moved off the shared control stack it ran on before its slot is given up.
+///
+/// # Safety
+/// `top` is free private memory, this thread's.
+pub unsafe fn on_stack(top: usize, f: extern "C" fn(usize) -> !, arg: usize) -> ! {
+    // SAFETY: the caller's.
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, {top}",
+            "call {f}",
+            "ud2",
+            top = in(reg) top & !15,
+            f = in(reg) f,
+            in("rdi") arg,
+            options(noreturn),
+        )
+    }
+}
+
+/// Call `f(arg)` on stack `top` (16-aligned) and come back to this one: a fork's child runs the
+/// kernel's bootstrap on its control stack (shared memory), from its boot stack.
+///
+/// # Safety
+/// `top` is the top of free memory only this thread uses meanwhile.
+#[unsafe(naked)]
+pub unsafe extern "C" fn call_on_stack(top: usize, f: extern "C" fn(usize), arg: usize) {
+    core::arch::naked_asm!(
+        "push rbp",
+        "mov rbp, rsp",
+        "and rdi, -16",
+        "mov rsp, rdi",
+        "mov rdi, rdx",
+        "call rsi",
+        "mov rsp, rbp",
+        "pop rbp",
+        "ret",
+    )
+}
+
+/// Make the calling (fork's child) host thread slot `id`'s, and take the token for it: the
+/// child's first steps, on its boot stack. Its bound coroutine is then the current one.
+pub fn child_start(id: u16) {
+    let h = slot(id);
+    // SAFETY: once, on this thread, which `rt_sigreturn` gave its alternate stack.
+    unsafe { setup_host(id, true) };
+    h.lazy.set(false);
+    h.used.store(true, Ordering::Release);
+    let bound = Tid::from_raw(h.bound.get());
+    h.set_running(bound);
+    acquire(id);
+    sched().par_set_current(bound);
+}
+
+/// The calling thread's slot's bound coroutine's control stack top (where the child's
+/// bootstrap runs: shared memory, as every kernel stack must be).
+pub fn ctl_top() -> usize {
+    me().ctl.get().1
+}
+
+/// The bound coroutine of the calling thread's slot.
+pub fn bound() -> Tid {
+    Tid::from_raw(me().bound.get())
+}
+
+/// The calling thread's slot no longer owns its bound coroutine (someone joins it, and frees it).
+pub fn disown_bound() {
+    me().bound.set(0);
+}
+
+/// Fork mode, init's process: its main thread's traps run on a coroutine stack too (shared
+/// memory), not the host thread's own stack: kernel code keeps objects on its stack that other
+/// processes reach (a wait queue entry while a `wait4` blocks). Called once, after [`enable`].
+pub fn root_on_shared_stack() -> Result<(), rustix::io::Errno> {
+    let s = sched();
+    let holder = s.adopt_root(0).map_err(|_| rustix::io::Errno::NOMEM)?;
+    PAR.slots[0].ctl.set(s.stack_of(holder));
+    Ok(())
+}
+
+/// Make a host thread for a new program thread (a trapped `clone`): a free slot, a bound coroutine
+/// resuming the program at `regs`, and a host thread through the gate that starts it in user mode.
+/// Returns the guest tid the caller reports, or an errno. Called with the token held.
+pub fn spawn_thread(
+    regs: &context::Registers,
+    fs: usize,
+    guest_tid: i32,
+    clear_tid: usize,
+    tmpl: &trap::Ucontext,
+) -> Result<(), rustix::io::Errno> {
+    let s = sched();
+    let (id, bound) = take_slot(proc_id())?;
+    let h = slot(id);
+    h.attach.set(guest_tid);
+    h.clear_tid.set(clear_tid);
+    h.lazy.set(true);
     let child = ChildStart { regs: *regs, fs };
     // The child's start state at the top of its boot region; the rt_sigreturn frame is built below
     // it (thread_start reads it before using that stack for anything else).
@@ -636,18 +879,113 @@ extern "C" fn thread_start(arg: usize) -> ! {
 /// the host thread. Called with the token held, on the thread's own host. The slot's Sched
 /// coroutines are freed when the slot is reused (nothing runs on their stacks after `exit(0)`); the
 /// host kernel clears the tid word once this thread is off its stacks, marking the slot free.
+///
+/// The end runs on the slot's boot stack (private), not the control stack it was called on: in
+/// fork mode that is shared, and a fork's first thread (made by the host fork, with no tid word
+/// the kernel clears) frees its slot itself, after which another process may reuse the stack.
 pub fn thread_exited(id: u16) -> ! {
-    let h = slot(id);
-    h.used.store(false, Ordering::Release);
     // A coroutine bound to no host may be runnable (a timer this thread's last calls armed is woken
     // to re-read its deadline, which is on no heap until it runs): this host can't run it any
     // more, so the kernel thread takes the token rather than leaving it free with that coroutine
     // stranded (a thread's end while main slept on that timer hung the process). The return to
     // user mode (`leave`) doesn't look: it would hand the token off at nearly every call.
-    give(id, !sched().par_unbound_ready());
+    let allow_none = !sched().par_unbound_ready();
+    // SAFETY: the boot region is this thread's, unused while it runs the program.
+    unsafe { on_stack(boot_top(id), thread_end, id as usize | (allow_none as usize) << 16) }
+}
+
+/// Free slot `id`'s coroutines, now that its thread is off their stacks (on its boot stack), with
+/// the token held: a slot reused only much later (they're taken in turn) mustn't keep two
+/// coroutines and their stacks meanwhile (fork mode's processes ran out of them).
+fn drop_coroutines(id: u16) {
+    let h = slot(id);
+    let s = sched();
+    for t in [h.bound.replace(0), h.sched_co.replace(0)] {
+        if t != 0 {
+            s.drop_adopted(Tid::from_raw(t));
+        }
+    }
+}
+
+extern "C" fn thread_end(arg: usize) -> ! {
+    let (id, allow_none) = (arg as u16, arg >> 16 != 0);
+    let h = slot(id);
+    drop_coroutines(id);
+    h.used.store(false, Ordering::Release);
+    give(id, allow_none);
+    if !h.lazy.get() && forked() {
+        // A fork's first thread: no CLONE_CHILD_CLEARTID word. Off the shared stacks already.
+        h.tid_word.store(0, Ordering::Release);
+    }
     // SAFETY: nothing else needs this thread's stack; the kernel clears the tid word (reuse frees
     // the Sched coroutines).
     unsafe { trap::exit_thread() }
+}
+
+/// Fork mode: a forked process's last task ended (`task_exit` with its pid): the host process
+/// ends. Called with the token held, on the thread's own host. Its slots come free: its other
+/// threads have ended (each gave the token up before this one could take it); their host threads
+/// are waited for (briefly) to be off their stacks, then any slot of the process still marked
+/// taken (a thread that never attached) is freed with the token held, and the process exits.
+pub fn process_exited(id: u16) -> ! {
+    PAR.live_procs.fetch_sub(1, Ordering::AcqRel);
+    let allow_none = !sched().par_unbound_ready();
+    // SAFETY: as thread_exited.
+    unsafe { on_stack(boot_top(id), process_end, id as usize | (allow_none as usize) << 16) }
+}
+
+extern "C" fn process_end(arg: usize) -> ! {
+    let (id, allow_none) = (arg as u16, arg >> 16 != 0);
+    let me_proc = proc_id();
+    let h = slot(id);
+    drop_coroutines(id);
+    h.used.store(false, Ordering::Release);
+    give(id, allow_none);
+    let others = |j: usize| {
+        let o = &PAR.slots[j];
+        j != id as usize && o.proc.load(Ordering::Relaxed) == me_proc && o.tid_word.load(Ordering::Acquire) != 0
+    };
+    // Up to 100 ms: the other threads already made their `exit`.
+    let ms = Timespec { tv_sec: 0, tv_nsec: 1_000_000 };
+    for _ in 0..100 {
+        if !(1..PROG_SLOTS).any(others) {
+            break;
+        }
+        let _ = trap::ppoll(None, Some(&ms));
+    }
+    if (1..PROG_SLOTS).any(others) {
+        acquire(id);
+        for j in (1..PROG_SLOTS).filter(|&j| others(j)) {
+            PAR.slots[j].used.store(false, Ordering::Release);
+            PAR.slots[j].tid_word.store(0, Ordering::Release);
+        }
+        give(id, true);
+    }
+    h.tid_word.store(0, Ordering::Release);
+    trap::exit_group(0)
+}
+
+/// Fork mode: the most processes alive at once, init's included (`--max-procs`; 0: no bound but
+/// the slots).
+pub fn set_max_procs(n: u32) {
+    PAR.max_procs.store(n, Ordering::Relaxed);
+    PAR.live_procs.store(1, Ordering::Relaxed);
+}
+
+/// Fork mode: a new process's number, if the bound allows one more (`None`: the fork fails with
+/// EAGAIN). Called with the token held. [`process_exited`] (or [`drop_proc`]) gives it back.
+pub fn take_proc() -> Option<u32> {
+    let max = PAR.max_procs.load(Ordering::Relaxed);
+    if max != 0 && PAR.live_procs.load(Ordering::Acquire) >= max {
+        return None;
+    }
+    PAR.live_procs.fetch_add(1, Ordering::AcqRel);
+    Some(PAR.next_proc.fetch_add(1, Ordering::Relaxed) + 1)
+}
+
+/// A process number from [`take_proc`] whose fork failed.
+pub fn drop_proc() {
+    PAR.live_procs.fetch_sub(1, Ordering::AcqRel);
 }
 
 /// True in threaded mode after [`enable`] has run (the driver is installed).

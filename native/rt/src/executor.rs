@@ -85,6 +85,10 @@ struct Exec {
     /// Of those, the ones found ready: the kernel is told by the executor's coroutine.
     hostfds_ready: RefCell<Vec<i32>>,
     last_busy_poll: Cell<u64>,
+    /// The host-thread slot the executor's coroutine is bound to (`u16::MAX`: none, it runs
+    /// wherever the CPU is). Fork mode: init's kernel thread, since the executor's state is init's
+    /// process's own memory.
+    home: Cell<u16>,
 }
 
 /// A cell behind a spin lock: the ready queue, pushed to by wakers from wherever they run.
@@ -125,7 +129,14 @@ static E: Exec = Exec {
     hostfds: RefCell::new(Vec::new()),
     hostfds_ready: RefCell::new(Vec::new()),
     last_busy_poll: Cell::new(0),
+    home: Cell::new(u16::MAX),
 };
+
+/// Bind the executor's coroutine to host-thread slot `home` (fork mode: init's kernel thread).
+/// Before it starts.
+pub fn set_home(home: u16) {
+    E.home.set(home);
+}
 
 /// Run the executor on `sched` (the guest's, at boot). Its coroutine starts with the first task.
 pub fn install(sched: &'static Sched) {
@@ -177,6 +188,9 @@ fn start() {
         None => {
             let t = s.spawn(run, 0).expect("no coroutine for the hooks' executor");
             let _ = s.detach(t);
+            if E.home.get() != u16::MAX {
+                s.bind(t, E.home.get());
+            }
             E.tid.set(Some(t));
         }
     }

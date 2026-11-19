@@ -459,6 +459,26 @@ pub unsafe fn install(dispatch: Dispatch, target: Target) -> Result<(), Errno> {
     Ok(())
 }
 
+/// A host signal handler of the runtime's for `sig` (fork mode's SIGCHLD): `handler(sig, info,
+/// uc)` on the thread's alternate stack, returning through the runtime's restorer (the gate's
+/// `rt_sigreturn`), with `SA_RESTART` (an interrupted blocking read goes on) and `flags` more.
+/// Before lockdown.
+///
+/// # Safety
+/// `handler` is safe to run on any host thread at any point: it makes only gate calls and touches
+/// no TLS.
+pub unsafe fn install_handler(sig: usize, handler: unsafe extern "C" fn(i32, *mut Siginfo, *mut Ucontext), flags: u64) -> Result<(), Errno> {
+    const SA_RESTART: u64 = 0x1000_0000;
+    let act = X86Sigaction {
+        handler: handler as *const () as usize,
+        flags: SA_SIGINFO | SA_ONSTACK | SA_RESTORER | SA_RESTART | flags,
+        restorer: restorer as *const () as usize,
+        mask: 0,
+    };
+    // SAFETY: the kernel reads `act` during the call.
+    check(unsafe { gate(NR_RT_SIGACTION, sig, &act as *const _ as usize, 0, 8, 0, 0) }).map(|_| ())
+}
+
 /// Make `base..base + len` the calling host thread's alternate signal stack (`sigaltstack`), where
 /// SIGSYS is delivered. Once per host thread, before lockdown (or before the thread's first trap,
 /// while `sigaltstack` is still allowed). [`ALTSTACK_SIZE`] is the size to use.

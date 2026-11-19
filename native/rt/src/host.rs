@@ -131,10 +131,14 @@ impl<T, const N: usize> Pool<T, N> {
 // SAFETY: one host thread runs the scheduler and the kernel's host ops (see `Sched`'s impl).
 unsafe impl<T, const N: usize> Sync for Pool<T, N> {}
 
+// The pools and the kernel's heap are the kernel's: shared between fork mode's processes (`share`).
+#[unsafe(link_section = "exobox_shared")]
 static SEMS: Pool<Semaphore, SEMAPHORES> =
     Pool { slots: [const { Slot::new(Semaphore::new(0)) }; SEMAPHORES], next: Cell::new(0) };
+#[unsafe(link_section = "exobox_shared")]
 static MUTEX_POOL: Pool<Mutex, MUTEXES> =
     Pool { slots: [const { Slot::new(Mutex::new(false)) }; MUTEXES], next: Cell::new(0) };
+#[unsafe(link_section = "exobox_shared")]
 static TIMER_POOL: Pool<TimerSlot, TIMERS> =
     Pool { slots: [const { Slot::new(TimerSlot::new()) }; TIMERS], next: Cell::new(0) };
 
@@ -222,6 +226,7 @@ struct Global {
 // SAFETY: as the pools'.
 unsafe impl Sync for Global {}
 
+#[unsafe(link_section = "exobox_shared")]
 static G: Global = Global { sched: Cell::new(None), heap: Heap::new() };
 
 fn sched() -> &'static Sched {
@@ -434,6 +439,8 @@ unsafe extern "C" fn thread_detach() {
 }
 
 unsafe extern "C" fn thread_exit() {
+    // Fork mode: a fork's child thread whose clone failed (its process ends there).
+    crate::guest::fork_thread_exit();
     sched().exit(0)
 }
 
@@ -625,6 +632,7 @@ unsafe extern "C" fn memmove(d: *mut c_void, s: *const c_void, n: c_ulong) -> *m
 
 /// The one host fd a coroutine waits on, polled by the idle wait (the filter allows `ppoll` on one
 /// fd): (fd, events, the waiter).
+#[unsafe(link_section = "exobox_shared")]
 static FD_WAIT: FdWait = FdWait(Cell::new(None));
 struct FdWait(Cell<Option<(i32, i16, Tid)>>);
 // SAFETY: as the pools'.

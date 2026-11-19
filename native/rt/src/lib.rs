@@ -31,6 +31,7 @@ pub mod host;
 pub mod memblk;
 pub mod par;
 pub mod sched;
+pub mod share;
 pub mod sync;
 pub mod sysmap;
 pub mod trap;

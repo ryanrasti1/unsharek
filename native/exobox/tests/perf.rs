@@ -395,9 +395,12 @@ fn make() -> Result<(), Failed> {
         c
     }, Duration::from_secs(30))?;
     let extra = [&bash, &make, &gcc, &coreutils].iter().map(|p| store_path(p)).chain([src.clone()]).collect::<Vec<_>>();
+    // exobox itself needs the host's PATH (nix-store, for the closures); the program sees it after
+    // its own, where nothing is mounted.
+    let host_path = env::var("PATH").unwrap_or_default();
     let sb = best_of(2, || {
         let mut c = sandboxed(Mode::Fork, &bash, &extra);
-        c.env("PATH", &path).arg("-c").arg(script(Path::new("/tmp/build")));
+        c.env("PATH", format!("{path}:{host_path}")).arg("-c").arg(script(Path::new("/tmp/build")));
         c
     }, Duration::from_secs(60))?;
     ratio_check("make -j4, 16 files", sb, native, BUILD_RATIO)

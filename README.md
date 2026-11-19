@@ -131,6 +131,22 @@ that mounts `/dev/exobox/<name>` with `mount(2)` and execs the next one).
   datagram to port 53 is a resolver query, answered from `on_resolve`. The runtime's executor waits
   on the hooks' host fds in the scheduler's idle wait (one `ppoll` over up to eight fds); passed
   fds (`pass_fd`) poll as their host fd does, the same way.
+- **Fork mode: a guest fork is a host fork.** The kernel's clone calls a host op inside it, and
+  the runtime forks its process; the processes run one kernel. Shared between them, mapped shared
+  before lockdown: the kernel's memory (its data, its pool, every coroutine stack: kernel code
+  keeps objects on its stack that other processes reach, so every trap, init's main thread's too,
+  is served on one) and the runtime state that runs it (the scheduler, the CPU token and every
+  process's host-thread slots, the host ops' pools, the futex table, keyed by process). Private,
+  copied by the fork: the program's memory and the runtime's per-process state. Each process's
+  threads take turns on threaded mode's CPU token, a hand-off to a thread of another process being
+  a write to its eventfd. A process's `exit_group` and fatal signals are the kernel's, its parent
+  waits for the status, and its last task's end ends the host process; init's end is the
+  sandbox's (the others see its pidfd and exit), and a process that dies on the host (a crash, the
+  filter's kill) ends the sandbox too, seen by init's SIGCHLD (every process is init's host child).
+  `--max-procs` bounds the processes alive at once (a fork past it is EAGAIN). exec is the guest's,
+  in the process's own arena (high-water: an exec reuses the old image's pages). Not yet: a forked
+  process's network beyond loopback (the hooks run in init's process), and `MAP_SHARED` memory
+  shared across a fork.
 - **The kernel.** Stock LKL plus a short series (`lkl/README.md`): idle that waits instead of
   spinning, the program as PID 1, threads that join their process, a block device over host memory,
   and the rest of what a cooperative in-process host needs.
@@ -145,11 +161,14 @@ that mounts `/dev/exobox/<name>` with `mount(2)` and execs the next one).
    device, the memory size, signals, fork, exec's kernel half.
 3. Threaded mode: a host thread per program thread, made through the gate; the CPU passed between
    them through eventfds.
-4. Fork mode: a guest fork is a host fork, sharing one guest kernel.
+4. Fork mode: a guest fork is a host fork, sharing one guest kernel (done: "How it works"; the
+   suite's fork cases, bash, a gcc build under make -j4 within its budget).
 5. Templates: a booted kernel forked per sandbox (`Template::start`, `spawn`), the kernel's pages
    shared copy-on-write.
 6. Within the performance budgets (`./test --perf`): startup, memory per sandbox, parallel builds.
-7. Code mapped in place from the store images (done, in release-mode arenas: coroutine and fork),
+7. Code mapped in place from the store images (done: release-mode arenas, coroutine mode, map a
+   range in place again once it is given back; high-water ones, threaded and fork mode, while it
+   was never written),
    and a streaming image builder for stores that write images as paths arrive.
 8. For capnix (`~/src/capnix-proper`, "What exobox needs to provide"): a host fd passed to the guest
    at a given fd (its Cap'n Web channel at 1000), with the filter widened to exactly that fd; the
@@ -170,8 +189,10 @@ that mounts `/dev/exobox/<name>` with `mount(2)` and execs the next one).
    reserved before). capnix plugs in its Cap'n Web session this way. The idle `ppoll` takes up to
    eight fds; passed fds (`pass_fd`) poll as their host fd. Since the program shares the address
    space, the provider's connection must carry no more authority than the program's own. Left:
-   threaded mode (the CPU token around the executor's kernel calls, a lock on its queues) and fork
-   mode (the hooks run in init's process; a child's host ops forward to it).
+   threaded mode (the CPU token around the executor's kernel calls, a lock on its queues, the hooks'
+   fds in the token holder's idle wait) and fork mode (the hooks run in init's process, the
+   executor's coroutine bound to init's kernel thread; a child's host ops must forward to it: they
+   are refused for now, ENETUNREACH, rather than run on its stale copy of init's state).
 10. Custom kernels, at build time: the kernel as its own Nix build (`lib.exoboxKernel { src, config }`:
    a source and a config fragment over `lkl/defconfig`, for more drivers or filesystems; LKL has
    no loadable modules), and `lib.mkExobox { kernel }` for an exobox built with it. In development,
@@ -237,12 +258,12 @@ the unit tests of exobox and exobox-erofs.
 |---|---|---|---|
 | `coroutine` (default) | the program's and the kernel's, as coroutines on one host thread | one | `write` (fds 1, 2), `read` (fd 0), `ppoll` (up to eight fds, no signal mask), `madvise` (inside the arena, one chunk, `MADV_DONTNEED`), `exit_group`; `read` and `write` on each held and passed fd (`hold_fd`, `pass_fd`) |
 | `threaded` | a host thread per program thread, made lazily; one guest CPU passed between them | one | coroutine's, without `madvise`, plus `read`/`write` on the CPU-token eventfds, `clone` with exactly the thread flag set, `exit(0)` |
-| `fork` | as threaded | a guest fork is a host fork; the processes share one guest kernel | threaded's, plus `clone(SIGCHLD)` with no stack |
+| `fork` | as threaded | a guest fork is a host fork; the processes share one guest kernel | threaded's, plus `clone(SIGCHLD)` (from init's process) or `clone(CLONE_PARENT \| SIGCHLD)` (from the others), with no stack |
 
-`rt_sigreturn` from the gate (the SIGSYS handler's return) is allowed in every mode, and in
-coroutine and threaded mode `kill` of the sandbox's own pid (a guest process that dies of a signal
-makes the sandbox die of the same); the program's own `rt_sigreturn` traps, as it returns from a
-handler the runtime ran. `--deny=kill` (the default)
+`rt_sigreturn` from the gate (the SIGSYS handler's return) is allowed in every mode, and `kill` of
+the sandbox's own pid (fork mode: init's process's; a guest init that dies of a signal makes the
+sandbox die of the same, and in fork mode so does a process that dies on the host); the program's
+own `rt_sigreturn` traps, as it returns from a handler the runtime ran. `--deny=kill` (the default)
 kills the sandbox on anything else from the gate; `--deny=errno` returns `EPERM`, for probing.
 `--allow RULE` adds one syscall, with conditions on its arguments.
 

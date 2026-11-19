@@ -92,6 +92,9 @@ struct Case {
     sandbox: Expect,
     flags: Vec<&'static str>,
     env: Vec<(&'static str, &'static str)>,
+    /// Programs from nixpkgs the case runs besides its own (devshell variables naming them): their
+    /// store paths are allowed (`--allow-path`), closures and all.
+    uses: Vec<&'static str>,
     stdin: Option<&'static str>,
     /// Stdin a pipe held open and silent for the whole run (a reader blocks on it).
     hold_stdin: bool,
@@ -111,6 +114,7 @@ fn case(name: &'static str, prog: Prog, modes: &'static [Mode], sandbox: Expect)
         sandbox,
         flags: vec![],
         env: vec![],
+        uses: vec![],
         stdin: None,
         hold_stdin: false,
         timeout: Duration::from_secs(5),
@@ -140,6 +144,10 @@ impl Case {
     }
     fn env(mut self, env: &[(&'static str, &'static str)]) -> Self {
         self.env = env.to_vec();
+        self
+    }
+    fn uses(mut self, vars: &[&'static str]) -> Self {
+        self.uses = vars.to_vec();
         self
     }
     fn renamed(mut self, name: &'static str) -> Self {
@@ -239,6 +247,17 @@ fn cases() -> Vec<Case> {
             .native(Some(ok("DENIED_LOADED"))),
         // Fork mode.
         fixture("fork", FORK),
+        // Init's end is the sandbox's: a child waiting in pause() doesn't outlive it on the host.
+        fixture("fork_ends", FORK).args(vec![Arg::Lit("init_exit")]).native(None),
+        // A child's death on the host (the filter's kill) is the sandbox's, by the same signal.
+        case(
+            "fork_ends_child_killed",
+            Prog::Fixture("fork_ends"),
+            FORK,
+            Expect { not_stdout: vec!["FORK_ENDS_SURVIVED"], ..status(Status::Signal(SIGSYS)) },
+        )
+        .args(vec![Arg::Lit("child_killed")])
+        .native(None),
 
         fixture("forkthreads", FORK),
         // Exec's kernel half: close-on-exec fds, handlers reset, the other threads ended.
@@ -268,7 +287,21 @@ fn cases() -> Vec<Case> {
         .args(vec![
             Arg::Lit("-c"),
             Arg::Lit("for i in 1 2 3 4 5; do v=$($EXOBOX_TEST_PATCHELF --version | $EXOBOX_TEST_COREUTILS/bin/cat) || exit 1; [ -n \"$v\" ] || exit 1; $EXOBOX_TEST_COREUTILS/bin/true | $EXOBOX_TEST_PATCHELF --version >/dev/null || exit 1; done; echo PIPELINE_OK"),
-        ]),
+        ])
+        .uses(&["EXOBOX_TEST_PATCHELF", "EXOBOX_TEST_COREUTILS"]),
+        // A compile and link: gcc's driver, collect2 and the ld wrapper (posix_spawn, a bash
+        // script) in processes made one from another. The link failed in ld.so ("Inconsistency
+        // detected ... elf_machine_rela_relative") when a library's data pages, written by an
+        // earlier program in the chain, were mapped in place again (arena: high-water's zone).
+        Case {
+            timeout: Duration::from_secs(15),
+            ..case("gcc", Prog::External("EXOBOX_TEST_BASH"), FORK, ok("GCC_OK"))
+                .args(vec![
+                    Arg::Lit("-c"),
+                    Arg::Lit("export PATH=$EXOBOX_TEST_COREUTILS/bin:$PATH; d=$(mktemp -d -p /tmp) && cd $d && printf 'int main(void) { return 7; }\\n' > m.c && $EXOBOX_TEST_GCC -o m m.c; ./m; [ $? = 7 ] && echo GCC_OK; rm -rf $d"),
+                ])
+                .uses(&["EXOBOX_TEST_GCC", "EXOBOX_TEST_COREUTILS"])
+        },
         fixture("forkbomb", FORK).flags(&["--max-procs=16"]).env(&[("EXOBOX_TEST_MAX_PROCS", "16")]).native(None),
         Case {
             timeout: Duration::from_secs(15),
@@ -325,9 +358,15 @@ fn sysaudit_check(out: &str) -> Result<(), String> {
     // futex_wait, futex_requeue, statmount, listmount, the lsm_* calls, mseal, the *xattrat calls,
     // open_tree_attr, file_getattr, file_setattr.
     const ENOSYS_NR: &[i64] = &[451, 453, 454, 455, 456, 457, 458, 459, 460, 461, 462, 463, 464, 465, 466, 467, 468, 469];
+    // Served, and with sysaudit's arguments Linux's own answer is an errno these classes name:
+    // a signal queued to another pid with si_code >= 0 is EPERM (do_rt_sigqueueinfo checks that
+    // first), and a futex op that doesn't exist (the buffer's address as the op) is ENOSYS.
+    const SERVED_AS: &[(&str, &str)] = &[("rt_sigqueueinfo", "EPERM"), ("rt_tgsigqueueinfo", "EPERM"), ("futex", "ENOSYS")];
     let class = |nr: i64| -> &'static str {
         let name = syscalls::Sysno::new(nr as usize).map(|s| s.name()).unwrap_or("");
-        if EPERM.contains(&name) {
+        if let Some((_, as_)) = SERVED_AS.iter().find(|(n, _)| *n == name) {
+            as_
+        } else if EPERM.contains(&name) {
             "EPERM"
         } else if ENOSYS.contains(&name) || ENOSYS_NR.contains(&nr) {
             "ENOSYS"
@@ -398,6 +437,13 @@ fn run(c: &Case, mode: Mode, secret: &PathBuf) -> Result<(), Failed> {
     } else {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_exobox"));
         cmd.args(["run", "--mode", mode.name(), "--allow-path"]).arg(fx::bin_dir());
+        for var in &c.uses {
+            let Some(p) = env::var_os(var) else { return Err(format!("{var} unset: run in the devshell (./test)").into()) };
+            let p = PathBuf::from(p);
+            // Its store path (`/nix/store/<hash>-<name>`), which brings its closure.
+            let store = p.ancestors().find(|a| a.parent() == Some(std::path::Path::new("/nix/store"))).unwrap_or(&p);
+            cmd.arg("--allow-path").arg(store);
+        }
         cmd.args(&c.flags).arg("--").arg(&prog);
         cmd
     };
