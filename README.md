@@ -156,14 +156,19 @@ against threaded mode (`threads`), and the host filter refusing a hostile progra
 5. Templates: a booted kernel forked per sandbox (`Template::start`, `spawn`), the kernel's pages
    shared copy-on-write.
 6. Within the performance budgets (`./test --perf`): startup, memory per sandbox, parallel builds.
-7. Code mapped in place from the store images (done, in release-mode arenas: coroutine and fork),
-   and a streaming image builder for stores that write images as paths arrive.
+7. Code mapped in place from the store images (done, in release-mode arenas: coroutine and fork).
+   Images from extents: a guest disk assembled from an ordered list of {metadata bytes | a range of
+   a host file, mapped before lockdown | zeros}, and `exobox_erofs::synthesize(paths)`, which lays
+   out an erofs image over a closure's files as they are in the host store (metadata made in
+   memory, every file mapped once: one copy of every byte, the page cache shared with the host).
+   `exobox::store` then needs no image copies; the per-path image cache stays for very large
+   closures (one host mapping per file costs every fork and exit).
 8. For capnix (`~/src/capnix-proper`, "What exobox needs to provide"): a host fd passed to the guest
    at a given fd (its Cap'n Web channel at 1000), with the filter widened to exactly that fd; the
    program run as a given uid (setup is the guest's init, as root, and can drop to it before exec);
    a read-write block device served over a channel (a new kernel driver: Nix's `/nix/var` on
-   ext4); FUSE in the store's kernel (a config fragment); the streaming image builder (item 7) to
-   the API in capnix's `spikes/storefs/README.md`.
+   ext4); FUSE in the store's kernel (a config fragment); a closure shown from the host's store
+   with no copy (item 7's extents and `synthesize`).
 9. Pluggable networking (done in coroutine mode): the guest's `connect`, `listen`/`accept` and name
    lookups go to the hooks the sandbox is given (`Hooks { on_connect, on_listen, on_resolve }`,
    each `async` with the guest pid; `NetError`s map to errnos and resolver codes). The kernel's
