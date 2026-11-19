@@ -364,6 +364,12 @@ fn cases() -> Vec<Case> {
         // coroutine mode (rustc sized its codegen from it).
         Case { check: Some(nproc_is_hosts), ..case("nproc", Prog::Fixture("nproc"), THREADED_FORK, ok("NPROC ")) },
         case("nproc_one", Prog::Fixture("nproc"), &[Mode::Coroutine], ok("NPROC 1")).native(None),
+        // A thread kept busy mustn't keep another's timer from being serviced (with one CPU passed
+        // between host threads, main's sleep never ended). Busy in user code: not coroutine mode
+        // (one host thread, and user code isn't preempted).
+        fixture("busy_sleep", THREADED_FORK).args(vec![Arg::Lit("user")]),
+        fixture("busy_sleep", ALL).renamed("busy_sleep_calls").args(vec![Arg::Lit("calls")]),
+        fixture("signal_futex_race", ALL),
         // cargo, rustup-less: Rust's std probes statx with NULLs (statx_probe), which crashed every
         // cargo at startup. Its build in fork mode: cargo, rustc and cc, each a process of its own.
         case("cargo_version", Prog::External("EXOBOX_TEST_CARGO"), ALL, ok("cargo ")).args(vec![Arg::Lit("--version")]),

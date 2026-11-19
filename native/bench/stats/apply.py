@@ -21,7 +21,7 @@ edit('native/rt/src/par.rs', [
     ("fn poke(id: u16) {\n    let _ = trap::eventfd_write",
      "fn poke(id: u16) {\n    crate::stats::count(crate::stats::K::Poke, 0);\n    let _ = trap::eventfd_write"),
     ("fn wait_token(id: u16) {\n",
-     "fn wait_token(id: u16) {\n    if PAR.owner.load(Ordering::Acquire) == id as u32 {\n        return;\n    }\n    let t = crate::stats::tsc();\n    wait_token_inner(id);\n    crate::stats::count(crate::stats::K::WaitToken, crate::stats::tsc() - t);\n    crate::stats::handed();\n}\n\nfn wait_token_inner(id: u16) {\n"),
+     "fn wait_token(id: u16) {\n    if PAR.owner.load(Ordering::Acquire) == id as u32 {\n        return;\n    }\n    let t = crate::stats::tsc();\n    wait_token_counted(id);\n    crate::stats::count(crate::stats::K::WaitToken, crate::stats::tsc() - t);\n    crate::stats::handed();\n}\n\nfn wait_token_counted(id: u16) {\n"),
 ])
 p = T + '/native/rt/src/par.rs'
 s = open(p).read()
@@ -49,7 +49,7 @@ edit('native/rt/src/guest.rs', [
     ("    let mut p = a.map(|v| v as c_long);\n    // SAFETY: the kernel runs; the arguments are the program's (LKL reads its pointers) or ours.\n    unsafe { l::lkl_syscall(nr, p.as_mut_ptr()) as isize }",
      "    let mut p = a.map(|v| v as c_long);\n    let t = crate::stats::tsc();\n    // SAFETY: the kernel runs; the arguments are the program's (LKL reads its pointers) or ours.\n    let r = unsafe { l::lkl_syscall(nr, p.as_mut_ptr()) as isize };\n    crate::stats::count(crate::stats::K::Lkl, crate::stats::tsc() - t);\n    r"),
     ("fn finish(code: i32) -> ! {\n",
-     "fn finish(code: i32) -> ! {\n    if crate::stats::ENABLED {\n        if S.phase.get() == Phase::Program {\n            let st = with_arena(|ar, _| ar.stats());\n            crate::stats::bytes(crate::stats::K::Release, st.released);\n            let hw = alloc::format!(\"EXOBOX_STATS arena high_water={} mapped={} extents={}\\n\", st.high_water, st.mapped, st.extents);\n            let _ = trap::write(2, hw.as_bytes());\n        }\n        crate::stats::report(SCHED.now(), &|b| {\n            let _ = trap::write(2, b);\n        });\n    }\n"),
+     "fn finish(code: i32) -> ! {\n    if crate::stats::ENABLED {\n        if S.phase.get() == Phase::Program {\n            let st = with_arena(|ar, _| ar.stats());\n            let hw = alloc::format!(\"EXOBOX_STATS arena high_water={} mapped={} extents={}\\n\", st.high_water, st.mapped, st.extents);\n            let _ = trap::write(2, hw.as_bytes());\n        }\n        crate::stats::report(SCHED.now(), &|b| {\n            let _ = trap::write(2, b);\n        });\n    }\n"),
 ])
 # exec
 p = T + '/native/rt/src/guest.rs'
