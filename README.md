@@ -208,7 +208,7 @@ against threaded mode (`threads`), and the host filter refusing a hostile progra
 Works, in every mode unless noted: the escape and hostile-loader probes, exec inside the guest,
 the store mounted from images, signals, ttys, pipes and host fds, threads, fork mode's processes,
 templates (coroutine and threaded), the network hooks (coroutine and threaded; fork mode in
-init's process), custom kernels. `./test` runs about 400 cases in a few seconds.
+init's process), custom kernels. `./test` runs about 590 cases in a few seconds.
 
 Not yet, or known limits:
 
