@@ -401,8 +401,9 @@ pub fn fork_parent(token: Option<u16>) {
 
 /// A host fork's child takes the guest over: the guest's pid is this process's (the filter's
 /// `kill` and [`die`]), and in threaded mode the host-thread state the fork didn't copy is made
-/// again (`par::after_fork`: the CPU-token eventfds, which a fork shares with the parent, and
-/// the kernel idler thread, which it doesn't copy; `spawn_idler` starts it). Then
+/// again (`par::after_fork`; the CPU-token eventfds, which a fork shares with the parent, the
+/// caller has made again first; the kernel idler thread, which the fork doesn't copy,
+/// `spawn_idler` starts). Then
 /// `token`, if [`fork_prepare`] took it, is given back. The guest's RNG is the caller's to reseed
 /// (its state is the parent's copy).
 pub fn fork_child(token: Option<u16>, spawn_idler: impl FnOnce()) -> Result<(), Error> {
@@ -417,11 +418,12 @@ pub fn fork_child(token: Option<u16>, spawn_idler: impl FnOnce()) -> Result<(), 
     Ok(())
 }
 
-/// Switch the runtime to threaded mode (a host thread per program thread): bind the main thread,
-/// make the CPU-token eventfds (before lockdown), and install the scheduler driver. Returns the token eventfds' inclusive fd range,
-/// for the mode filter. Call once, after [`boot`] and before [`route`], on the main thread. The
-/// caller must also start the kernel idler host thread on [`threaded_kernel_main`].
-pub fn enable_threaded() -> Result<(u32, u32), Error> {
+/// Switch the runtime to threaded mode (a host thread per program thread): bind the main thread
+/// and install the scheduler driver. The CPU-token eventfds are the caller's to make first, at
+/// `par::EFD_BASE + slot` for each of `par::N_SLOTS` slots. Call once, after [`boot`] and before
+/// [`route`], on the main thread. The caller must also start the kernel idler host thread on
+/// [`threaded_kernel_main`].
+pub fn enable_threaded() -> Result<(), Error> {
     // SAFETY: once, on the main (boot) thread, before lockdown.
     unsafe { par::enable(&SCHED, SCHED.current()) }.map_err(err("enabling threaded mode"))
 }
@@ -522,6 +524,25 @@ pub fn exec(path: &[u8], argv: &[&[u8]], envp: &[&[u8]], aux: Aux) -> Errno {
         Err(e) => e,
     }
 }
+
+/// Run `f` as the program, on this (the root) coroutine, as init: from now on its syscalls are
+/// served as an exec'd program's are (the program phase: memory from the arena, signals, the
+/// guest's files), and its return value is the program's exit status, by its `exit_group`, a
+/// trapped call as any program's. After lockdown, from the setup phase (after [`route`]), on the
+/// root. The root's trap frames go below the trapping stack pointer (the program runs on the host
+/// thread's own stack here, not on one in the arena: `target`'s root case).
+pub fn run_fn(f: impl FnOnce() -> i32) -> ! {
+    S.phase.set(Phase::Program);
+    let code = f();
+    // exit_group, not from the gate: trapped, and served as the program's.
+    // SAFETY: ends the process; nothing after it runs.
+    unsafe {
+        core::arch::asm!("syscall", in("rax") NR_EXIT_GROUP, in("rdi") code as isize as usize, options(noreturn, nostack));
+    }
+}
+
+/// `exit_group(2)`.
+const NR_EXIT_GROUP: usize = 231;
 
 /// Open, check and map a program, and build its stack. With `replace`, the old image (the whole
 /// arena) is dropped first, once nothing can fail any more short of memory: the guest's execve.

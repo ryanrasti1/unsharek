@@ -38,7 +38,7 @@ mod tcb;
 pub use net::{Cx, GuestSocket, HeldFd, NetError, OnConnect, OnListen, OnResolve};
 
 /// One classic-BPF instruction (`struct sock_filter`), for [`Builder::restrict`].
-pub use tcb::filter::old::SockFilter;
+pub use tcb::filter::SockFilter;
 /// The auxiliary-vector tag under which a sandboxed program finds the gate's address (what the
 /// escape tests call, as a compromised program that found the gate would).
 pub use exobox_rt::exec::AT_EXOBOX_GATE;
@@ -47,13 +47,13 @@ use std::convert::Infallible;
 use std::ffi::{CString, OsString};
 use std::fs::File;
 use std::marker::PhantomData;
-use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use exobox_rt::{guest, sched};
-use tcb::filter::old as filter;
+use tcb::inventory::{Fd, Inventory, MapKind};
 
 /// How the sandbox runs the program's threads and processes. Each mode's host allowlist is a
 /// superset of the one before.
@@ -100,8 +100,6 @@ pub enum Error {
     Guest(guest::Error),
     #[error("{}: {errno}", .path.display())]
     Exec { path: PathBuf, errno: std::io::Error },
-    #[error("{0} host threads at lockdown, {1} expected: the mode's filter would leave the others unfiltered or misrouted")]
-    Threads(usize, usize),
     #[error("not implemented yet: {0}")]
     NotImplemented(&'static str),
 }
@@ -151,6 +149,8 @@ impl Default for GuestConfig {
 /// on success. `!Send`: the thread that booted it is the one that uses it.
 #[derive(Debug)]
 pub struct Guest {
+    /// Every host resource the sandbox keeps past lockdown (`tcb::inventory`).
+    inv: Inventory,
     aux: guest::Aux,
     /// The image zone's unused part, `[next, end)`.
     zone: (usize, usize),
@@ -224,26 +224,6 @@ const COROUTINE_STACK: usize = 128 << 10;
 /// put them at 0x400000).
 const ARENA_AT: usize = 0x20_0000;
 
-fn reserve(at: usize, len: usize, prot: i32) -> Result<*mut u8, Error> {
-    reserve_as(at, len, prot, libc::MAP_PRIVATE)
-}
-
-/// `reserve`, `MAP_SHARED` or `MAP_PRIVATE`: fork mode's kernel memory is shared by the
-/// processes' host forks (`exobox_rt::share`).
-fn reserve_as(at: usize, len: usize, prot: i32, share: i32) -> Result<*mut u8, Error> {
-    let flags = share | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
-    let fixed = if at != 0 { libc::MAP_FIXED_NOREPLACE } else { 0 };
-    // SAFETY: a fresh anonymous mapping; FIXED_NOREPLACE never replaces one.
-    let p = unsafe { libc::mmap(at as *mut _, len, prot, flags | fixed, -1, 0) };
-    if p == libc::MAP_FAILED {
-        if at != 0 {
-            return reserve_as(0, len, prot, share);
-        }
-        return Err(Error::Io { what: format!("reserving {len} bytes"), source: std::io::Error::last_os_error() });
-    }
-    Ok(p as *mut u8)
-}
-
 static BOOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 64 bytes of the host's entropy.
@@ -292,27 +272,23 @@ impl Guest {
         let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
         // SAFETY: sets a limit of this process.
         unsafe { libc::setrlimit(libc::RLIMIT_CORE, &none) };
+        let mut inv = Inventory::new();
         let memory = config.memory.next_multiple_of(PAGE);
         let rwx = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
         let rw = libc::PROT_READ | libc::PROT_WRITE;
         let zone = config.image_space.next_multiple_of(PAGE);
-        let arena = reserve(ARENA_AT, memory + zone, rwx)?;
+        let reserving = |len| Error::io(format!("reserving {len} bytes"));
+        let arena = inv.reserve(ARENA_AT, memory + zone, rwx, false, MapKind::Arena).map_err(reserving(memory + zone))?;
         let mem_mb = config.kernel_memory.div_ceil(1 << 20).max(16);
         let heap_len = (mem_mb << 20) + PAGE;
-        let share = if shared {
+        if shared {
             // The kernel's and the runtime's statics, before anything of them is used.
-            // SAFETY: nothing else uses the runtime yet.
-            unsafe { exobox_rt::share::remap() }.map_err(|e| Error::Io {
-                what: "sharing the kernel's data (fork mode)".into(),
-                source: std::io::Error::from_raw_os_error(e.raw_os_error()),
-            })?;
-            libc::MAP_SHARED
-        } else {
-            libc::MAP_PRIVATE
-        };
-        let heap = reserve_as(0, heap_len, rw, share)?;
+            // SAFETY: nothing else uses the runtime yet; this is the only thread.
+            unsafe { inv.share_section() }.map_err(Error::io("sharing the kernel's data (fork mode)"))?;
+        }
+        let heap = inv.reserve(0, heap_len, rw, shared, MapKind::KernelHeap).map_err(reserving(heap_len))? as *mut u8;
         let stacks_len = COROUTINES * COROUTINE_STACK;
-        let stacks = reserve_as(0, stacks_len, rw, share)?;
+        let stacks = inv.reserve(0, stacks_len, rw, shared, MapKind::Stacks).map_err(reserving(stacks_len))? as *mut u8;
         let loglevel = std::env::var("EXOBOX_KERNEL_LOGLEVEL").unwrap_or_else(|_| "1".into());
         // program_mem: what sysinfo and /proc/meminfo report (the kernel series' item 13): the
         // program's memory is the arena, not the kernel's pool (V8 sizes its heap from it).
@@ -331,6 +307,7 @@ impl Guest {
         let aux = |t| unsafe { libc::getauxval(t) };
         setup::defaults(&host_entropy()?).map_err(Error::io("the guest's basics"))?;
         Ok(Guest {
+            inv,
             aux: guest::Aux {
                 hwcap: aux(libc::AT_HWCAP),
                 hwcap2: aux(libc::AT_HWCAP2),
@@ -351,6 +328,7 @@ impl Guest {
         if token.is_none() && !guest::forked() {
             return Ok(());
         }
+        self.inv.remake_tokens().map_err(Error::io("the CPU tokens' eventfds, after a fork"))?;
         guest::fork_child(token, || spawn_idler().expect("the kernel idler thread"))?;
         setup::reseed(&host_entropy()?).map_err(Error::io("reseeding the guest's RNG"))
     }
@@ -393,17 +371,7 @@ impl Guest {
         if len == 0 || !len.is_multiple_of(512) {
             return Err(Error::io(name)(std::io::Error::new(std::io::ErrorKind::InvalidData, "not an image of whole blocks")));
         }
-        let data: &'static [u8] = {
-            // SAFETY: a read-only private mapping of the whole file, never unmapped.
-            let p = unsafe {
-                libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, file.as_raw_fd(), 0)
-            };
-            if p == libc::MAP_FAILED {
-                return Err(Error::io(format!("mapping {name}"))(std::io::Error::last_os_error()));
-            }
-            // SAFETY: mapped above for the process's life.
-            unsafe { std::slice::from_raw_parts(p as *const u8, len) }
-        };
+        let data = self.inv.map_image(file.as_raw_fd(), len).map_err(Error::io(format!("mapping {name}")))?;
         let image = Image { name: Box::leak(name.into_boxed_str()), data };
         let in_zone = match layout.and_then(|l| std::fs::read(l).ok()) {
             Some(layout) => self.map_in_zone(&file, len, &layout)?,
@@ -432,16 +400,8 @@ impl Guest {
         if end - at < size {
             return Ok(None);
         }
-        let rx = libc::PROT_READ | libc::PROT_EXEC;
-        // SAFETY: over the arena's own reservation, in the zone's unused part: nothing is there.
-        let p = unsafe { libc::mmap(at as *mut _, len, rx, libc::MAP_PRIVATE | libc::MAP_FIXED, file.as_raw_fd(), 0) };
-        if p == libc::MAP_FAILED {
-            // A failed MAP_FIXED may have unmapped the range: the reservation's zeros back.
-            let rwx = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
-            let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | libc::MAP_FIXED;
-            // SAFETY: as above.
-            let back = unsafe { libc::mmap(at as *mut _, size, rwx, flags, -1, 0) };
-            assert_ne!(back, libc::MAP_FAILED, "the image zone lost a range");
+        // In the zone's unused part of the arena's reservation: nothing is there.
+        if self.inv.map_image_at(at, file.as_raw_fd(), len).is_err() {
             return Ok(None);
         }
         self.zone.0 = at + size;
@@ -477,13 +437,13 @@ impl Guest {
     /// nonblocking and kept open for the sandbox's life. Under a [`Sandbox`] the filter allows
     /// `read` and `write` on exactly it ([`Sandbox::hold_fd`]).
     pub fn hold_fd(&mut self, fd: OwnedFd) -> Result<HeldFd, Error> {
-        let fd = fd.into_raw_fd();
-        // SAFETY: fcntl on our own fd.
-        let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        // SAFETY: fcntl on the caller's fd, owned.
+        let fl = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
         // SAFETY: as above.
-        if fl < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) } < 0 {
+        if fl < 0 || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK) } < 0 {
             return Err(Error::io("holding an fd")(std::io::Error::last_os_error()));
         }
+        let fd = self.inv.keep(fd, Fd::Held).map_err(Error::io("holding an fd"))?;
         Ok(HeldFd { fd })
     }
 
@@ -533,7 +493,8 @@ impl Guest {
     /// [`Sandbox`] adds it). Never returns on success; on failure the error is the caller's to
     /// report (its syscalls are the guest's by then, and printing and exiting work through it).
     pub fn run(self, argv: &[OsString], env: &[OsString]) -> Result<Infallible, Error> {
-        self.launch(net::Hooks::default(), argv, env, || {
+        let path = argv.first().ok_or(Error::NoProgram)?.clone();
+        self.launch(net::Hooks::default(), Start::Exec(&path, argv, env), |_| {
             alloc::lockdown();
             Ok(())
         })
@@ -548,14 +509,10 @@ impl Guest {
     fn launch(
         mut self,
         hooks: net::Hooks,
-        argv: &[OsString],
-        env: &[OsString],
-        lockdown: impl FnOnce() -> Result<(), Error>,
+        start: Start,
+        lockdown: impl FnOnce(&Inventory) -> Result<(), Error>,
     ) -> Result<Infallible, Error> {
-        let path = argv.first().ok_or(Error::NoProgram)?;
         self.own(None)?;
-        let args: Vec<&[u8]> = argv.iter().map(|a| a.as_bytes()).collect();
-        let envs: Vec<&[u8]> = env.iter().map(|a| a.as_bytes()).collect();
         let on_start = hooks.install();
         // Once the program runs, a panic is the runtime's: it ends the sandbox through the host
         // (`guest::runtime_panic`), not through the guest it was serving. Set now: setting a hook
@@ -569,13 +526,29 @@ impl Guest {
         }));
         guest::route()?;
         guest::intercept_begin()?;
-        lockdown()?;
+        lockdown(&self.inv)?;
+        // Locked down: from here on, everything is the sandbox's.
         if let Some(f) = on_start {
             exobox_rt::executor::spawn(f(Cx));
         }
-        let errno = guest::exec(path.as_bytes(), &args, &envs, self.aux);
-        Err(Error::Exec { path: PathBuf::from(path), errno: std::io::Error::from_raw_os_error(errno.raw_os_error()) })
+        match start {
+            Start::Exec(path, argv, env) => {
+                let args: Vec<&[u8]> = argv.iter().map(|a| a.as_bytes()).collect();
+                let envs: Vec<&[u8]> = env.iter().map(|a| a.as_bytes()).collect();
+                let errno = guest::exec(path.as_bytes(), &args, &envs, self.aux);
+                Err(Error::Exec { path: PathBuf::from(path), errno: std::io::Error::from_raw_os_error(errno.raw_os_error()) })
+            }
+            Start::Fn(f) => guest::run_fn(f),
+        }
     }
+}
+
+/// What [`Guest::launch`] starts after lockdown.
+enum Start<'a> {
+    /// A program exec'd inside the guest: its path, argv and env.
+    Exec(&'a OsString, &'a [OsString], &'a [OsString]),
+    /// [`Sandbox::run_fn`]'s closure, run as the program.
+    Fn(Box<dyn FnOnce() -> i32 + 'a>),
 }
 
 /// While it lives, the calling thread's syscalls are the guest's ([`Guest::intercept`]); dropped,
@@ -704,32 +677,26 @@ impl Builder {
     /// guest's `/etc/resolv.conf` and `/etc/hosts` are written now, root's ([`setup::resolver`]):
     /// a guard may change them.
     pub fn build(self) -> Result<Sandbox, Error> {
-        let guest = Guest::boot_as(self.config, self.mode == Mode::Fork)?;
+        let mut guest = Guest::boot_as(self.config, self.mode == Mode::Fork)?;
         if self.hooks.resolves() {
             setup::resolver().map_err(Error::io("the guest's resolver"))?;
         }
-        let token_fds = if self.mode != Mode::Coroutine {
-            // Make the CPU-token eventfds and switch the runtime to threaded (before lockdown),
-            // then start the kernel idler host thread and wait for it to install its signal stack.
-            let range = guest::enable_threaded()?;
+        if self.mode != Mode::Coroutine {
+            // The CPU tokens' eventfds, where the runtime looks for them, then the runtime
+            // switched to threaded (before lockdown), then the kernel idler host thread started
+            // and waited for (it installs its signal stack).
+            let base = exobox_rt::par::EFD_BASE as RawFd;
+            guest.inv.token_eventfds(base, exobox_rt::par::N_SLOTS).map_err(Error::io("the CPU tokens' eventfds"))?;
+            guest::enable_threaded()?;
             spawn_idler().map_err(Error::io("the kernel idler thread"))?;
+            guest.inv.add_thread();
             guest::threaded_wait_ready();
             if self.mode == Mode::Fork {
-                guest::enable_fork(self.max_procs)?;
+                let pidfd = guest.inv.init_pidfd().map_err(Error::io("init's pidfd"))?;
+                guest::enable_fork(self.max_procs, pidfd)?;
             }
-            range
-        } else {
-            (0, 0)
-        };
-        Ok(Sandbox {
-            guest,
-            mode: self.mode,
-            deny: self.deny,
-            restrictions: self.restrictions,
-            hooks: self.hooks,
-            host_fds: vec![],
-            token_fds,
-        })
+        }
+        Ok(Sandbox { guest, mode: self.mode, deny: self.deny, restrictions: self.restrictions, hooks: self.hooks })
     }
 }
 
@@ -743,15 +710,15 @@ pub struct Sandbox {
     deny: Deny,
     restrictions: Vec<Vec<SockFilter>>,
     hooks: net::Hooks,
-    /// Host fds the filter allows `read` and `write` on (passed and held fds).
-    host_fds: Vec<RawFd>,
-    /// Threaded mode: the CPU-token eventfds' inclusive fd range (coroutine: `(0, 0)`).
-    token_fds: (u32, u32),
 }
 
 impl std::fmt::Debug for Sandbox {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Sandbox").field("mode", &self.mode).field("host_fds", &self.host_fds).finish_non_exhaustive()
+        f.debug_struct("Sandbox")
+            .field("mode", &self.mode)
+            .field("fds", &self.guest.inv.fds())
+            .field("maps", &self.guest.inv.maps())
+            .finish_non_exhaustive()
     }
 }
 
@@ -837,21 +804,13 @@ impl Sandbox {
     /// stays open for the sandbox's life. Host code (outside a guard); fails if `fd` isn't open.
     pub fn pass_fd(&mut self, fd: OwnedFd, guest: i32) -> Result<(), Error> {
         self.guest.own(None)?;
-        let host = fd.into_raw_fd();
-        // SAFETY: fcntl on the fd just taken.
-        if unsafe { libc::fcntl(host, libc::F_GETFD) } < 0 {
-            return Err(Error::io("passing an fd")(std::io::Error::last_os_error()));
-        }
-        setup::host_fd(host, guest).map_err(Error::io(format!("the guest's fd {guest}")))?;
-        self.host_fds.push(host);
-        Ok(())
+        let host = self.guest.inv.keep(fd, Fd::Passed).map_err(Error::io("passing an fd"))?;
+        setup::host_fd(host, guest).map_err(Error::io(format!("the guest's fd {guest}")))
     }
 
     /// [`Guest::hold_fd`], and the filter widened to `read` and `write` on exactly that fd.
     pub fn hold_fd(&mut self, fd: OwnedFd) -> Result<HeldFd, Error> {
-        let held = self.guest.hold_fd(fd)?;
-        self.host_fds.push(held.fd);
-        Ok(held)
+        self.guest.hold_fd(fd)
     }
 
     /// [`Sandbox::hold_fd`] under `name`, for the hooks to find with [`Cx::held`]: a template's
@@ -880,7 +839,9 @@ impl Sandbox {
     /// Fork mode: not yet (its processes share the guest kernel's memory, which each instance
     /// needs a copy of).
     pub fn fork(&mut self) -> Result<Fork, Error> {
-        if self.mode == Mode::Fork {
+        // The template isn't locked down: memory it shares with a child would be the child's to
+        // write (fork mode's shared kernel memory, the only shared mapping exobox makes).
+        if self.guest.inv.has_shared() {
             return Err(Error::NotImplemented("a fork-mode template: its kernel's shared memory needs a copy per child"));
         }
         self.guest.own(None)?;
@@ -930,102 +891,68 @@ impl Sandbox {
     ///
     /// The sandbox's process must have no host threads but the mode's own (the caller's would be
     /// left unfiltered, or routed into the guest): `Error::Threads`.
-    pub fn run(mut self, argv: &[OsString], env: &[OsString]) -> Result<Infallible, Error> {
+    pub fn run(self, argv: &[OsString], env: &[OsString]) -> Result<Infallible, Error> {
+        let path = argv.first().ok_or(Error::NoProgram)?.clone();
+        self.start(Start::Exec(&path, argv, env))
+    }
+
+    /// Lockdown, then `f` run as the program: on this thread, after both filters, its syscalls
+    /// trapped and served by the guest kernel as an exec'd program's are (as init, with the
+    /// credentials the guards left), and its return value the sandbox's exit status. Never
+    /// returns on success; fails as [`Sandbox::run`] does, before `f` runs.
+    ///
+    /// `f` is ordinary Rust in this process, so it is the sandbox's program: what it can reach on
+    /// the host is what the program's could (the security filter's list), and what it captures
+    /// it may use (it's moved in). Its limits: no threads (`std::thread` makes a guest thread
+    /// that knows nothing of Rust's TLS: don't); its allocations come from the region exobox
+    /// reserved at build (the global allocator after lockdown); a panic in it is the runtime's
+    /// (the sandbox dies of SIGABRT); its host fds are the inventory's (any other was closed
+    /// at lockdown: a `File` captured from before is a closed or a guest fd now).
+    pub fn run_fn(self, f: impl FnOnce() -> i32) -> Result<Infallible, Error> {
+        self.start(Start::Fn(Box::new(f)))
+    }
+
+    fn start(mut self, start: Start) -> Result<Infallible, Error> {
         self.guest.own(None)?;
-        let expected = if self.mode == Mode::Coroutine { 1 } else { 2 };
-        // A thread just joined (the image cache's builders: `std::thread::scope`) is still listed
-        // while it finishes exiting (a join returns when its tid word is cleared, before the
-        // kernel has reaped it): a few milliseconds' grace.
-        let mut threads = 0;
-        for _ in 0..100 {
-            threads = std::fs::read_dir("/proc/self/task").map_err(Error::io("/proc/self/task"))?.count();
-            if threads <= expected {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        if threads != expected {
-            return Err(Error::Threads(threads, expected));
-        }
+        let fds: Vec<RawFd> = self
+            .guest
+            .inv
+            .fds()
+            .iter()
+            .filter(|(_, k)| matches!(k, Fd::Stdio | Fd::Passed | Fd::Held))
+            .map(|&(fd, _)| fd)
+            .collect();
         // How the runtime writes the guest's host fds (a pipe's in pieces that can't block, a
         // regular file's whole): looked at now, as they are for this run (after lockdown nothing
         // may fstat them).
-        let stdio = [0, 1, 2];
-        exobox_rt::host::note_host_fds(&stdio.iter().chain(&self.host_fds).copied().collect::<Vec<_>>());
-        // Compiled now, on the host: lockdown must not allocate after the filter goes in.
-        let prog = Box::leak(Box::new(filter::Program::new()));
-        let conds: Vec<[filter::Cond; 1]> =
-            self.host_fds.iter().map(|&fd| [filter::Cond { arg: 0, lo: fd as u64, hi: fd as u64 }]).collect();
-        let extra: Vec<filter::Rule> = conds
-            .iter()
-            .flat_map(|c| [filter::Rule { nr: filter::NR_READ, conds: c }, filter::Rule { nr: filter::NR_WRITE, conds: c }])
-            .collect();
-        let params = filter::Params {
-            policy: filter::Policy::Mode(match self.mode {
-                Mode::Coroutine => filter::Mode::Coroutine,
-                Mode::Threaded => filter::Mode::Threaded,
-                Mode::Fork => filter::Mode::Fork,
-            }),
-            deny: match self.deny {
-                Deny::Kill => filter::Deny::Kill,
-                Deny::Errno => filter::Deny::Errno,
-            },
-            gate_ip: exobox_rt::trap::gate_ip(),
-            token_fds: self.token_fds,
-            pid: std::process::id(),
-            extra: &extra,
+        exobox_rt::host::note_host_fds(&fds);
+        // Compiled now, on the host: lockdown allocates nothing.
+        let mode = match self.mode {
+            Mode::Coroutine => tcb::filter::Mode::Coroutine,
+            Mode::Threaded => tcb::filter::Mode::Threaded,
+            Mode::Fork => tcb::filter::Mode::Fork,
         };
-        filter::compile(&params, prog).map_err(|e| Error::Io {
-            what: "the filter".into(),
+        let deny = match self.deny {
+            Deny::Kill => tcb::filter::Deny::Kill,
+            Deny::Errno => tcb::filter::Deny::Errno,
+        };
+        let gate_ip = exobox_rt::trap::gate_ip();
+        let security = tcb::filter::security(mode, deny, &self.guest.inv.pins(), gate_ip).map_err(|e| Error::Io {
+            what: "the security filter".into(),
             source: std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()),
         })?;
-        let prog: &'static filter::Program = prog;
         let restrictions: Vec<Vec<SockFilter>> =
-            std::mem::take(&mut self.restrictions).iter().map(|r| restriction(r, params.gate_ip)).collect();
-        // Threaded mode: sync the filters to every host thread (the kernel idler, and the
-        // program's threads made lazily inherit them). SECCOMP_FILTER_FLAG_TSYNC = 1.
-        let flags: u32 = if self.mode == Mode::Coroutine { 0 } else { 1 };
+            std::mem::take(&mut self.restrictions).iter().map(|r| tcb::filter::restriction(r, gate_ip)).collect();
         let hooks = std::mem::take(&mut self.hooks);
-        let install = |insns: &[SockFilter]| {
-            filter::install_insns(insns, flags)
-                .map_err(|e| Error::io("installing the filter")(std::io::Error::from_raw_os_error(e.raw_os_error())))
-        };
-        self.guest.launch(hooks, argv, env, move || {
-            // The mode's filter allows no host memory call: allocations are the region's.
+        self.guest.launch(hooks, start, move |inv| {
+            // The security filter allows no host memory call: allocations are the region's.
             alloc::lockdown();
             // Setup code that still makes one gets ENOMEM (mmap) or nothing done, not the
             // filter's verdict.
             guest::host_memory(false);
-            for r in &restrictions {
-                install(r)?;
-            }
-            install(prog.as_slice())
+            tcb::lockdown::lockdown(inv, &restrictions, &security).map_err(Error::io("lockdown"))
         })
     }
-}
-
-/// A restriction as installed: the caller's program after a prologue that lets exobox's own
-/// `prctl` and `seccomp` from the gate through (it installs the mode's filter after the
-/// restrictions; the mode's filter then refuses both). Classic BPF jumps are relative and
-/// forward, so the caller's program is unchanged after it.
-fn restriction(insns: &[SockFilter], gate_ip: u64) -> Vec<SockFilter> {
-    const LD: u16 = 0x20; // BPF_LD | BPF_W | BPF_ABS
-    const JEQ: u16 = 0x15; // BPF_JMP | BPF_JEQ | BPF_K
-    const RET: u16 = 0x06;
-    const ALLOW: u32 = filter::SECCOMP_RET_ALLOW;
-    let i = |code, jt, jf, k| SockFilter { code, jt, jf, k };
-    let mut p = vec![
-        i(LD, 0, 0, 0),                        // nr
-        i(JEQ, 1, 0, libc::SYS_prctl as u32),  // -> 3
-        i(JEQ, 0, 5, libc::SYS_seccomp as u32), // else -> 8
-        i(LD, 0, 0, 8),                        // instruction_pointer, low half
-        i(JEQ, 0, 3, gate_ip as u32),          // else -> 8
-        i(LD, 0, 0, 12),                       // high half
-        i(JEQ, 0, 1, (gate_ip >> 32) as u32),  // else -> 8
-        i(RET, 0, 0, ALLOW),
-    ];
-    p.extend_from_slice(insns);
-    p
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1127,18 +1054,6 @@ mod tests {
         for bad in ["a", "=p", "a=", "a/b=p", "a=p:"] {
             assert!(bad.parse::<ImageArg>().is_err(), "{bad} parsed");
         }
-    }
-
-    #[test]
-    fn restriction_prologue_jumps_to_the_program() {
-        let user = [SockFilter { code: 0x06, jt: 0, jf: 0, k: 0 }];
-        let p = restriction(&user, 0x1234_5678_9abc);
-        // Every not-taken branch of the prologue lands on the caller's first instruction.
-        let start = p.len() - 1;
-        assert_eq!(2 + 1 + p[2].jf as usize, start);
-        assert_eq!(4 + 1 + p[4].jf as usize, start);
-        assert_eq!(6 + 1 + p[6].jf as usize, start);
-        assert_eq!(1 + 1 + p[1].jt as usize, 3);
     }
 }
 

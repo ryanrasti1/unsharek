@@ -55,8 +55,6 @@ use core::cell::Cell;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use rustix::fd::AsRawFd;
-
 use crate::context;
 use crate::sched::{Sched, Tid};
 use crate::trap::{self, PollFd};
@@ -71,8 +69,9 @@ pub const N_SLOTS: usize = PROG_SLOTS + 1;
 /// No slot (the token is free): distinct from every real slot.
 pub const NONE_SLOT: u32 = u32::MAX;
 
-/// The eventfds' fixed fd range: slot `i` reads/writes `EFD_BASE + i`. The filter pins the token
-/// `read`/`write` to `[EFD_BASE, EFD_BASE + N_SLOTS)`.
+/// The eventfds' fixed fd range: slot `i` reads/writes `EFD_BASE + i`. The host (exobox's
+/// inventory) makes them there before [`enable`], and again in a fork's child before
+/// [`after_fork`]; its security filter pins the token `read`/`write` to the range it made.
 pub const EFD_BASE: u32 = 256;
 /// A lazy thread's first (boot) stack: `thread_start`'s frame and the `rt_sigreturn` frame, until
 /// it jumps to the program. Small; the program then runs on its own stack. Sized so a slot's
@@ -682,7 +681,7 @@ unsafe fn setup_host(id: u16, lazy: bool) {
 ///
 /// # Safety
 /// Called once, on the main thread, after boot and before `route`.
-pub unsafe fn enable(s: &'static Sched, root: Tid) -> Result<(u32, u32), rustix::io::Errno> {
+pub unsafe fn enable(s: &'static Sched, root: Tid) -> Result<(), rustix::io::Errno> {
     PAR.sched.set(Some(s));
     // Reserve alt + boot stacks for every slot in one NORESERVE region (only touched pages cost).
     let each = SLOT_STACKS;
@@ -701,15 +700,6 @@ pub unsafe fn enable(s: &'static Sched, root: Tid) -> Result<(u32, u32), rustix:
         let h = &PAR.slots[i];
         h.alt.set(base + i * each);
         h.boot.set(base + i * each + trap::ALTSTACK_SIZE + BOOT_STACK); // boot stack top
-        // An eventfd duped onto the fixed fd EFD_BASE + i.
-        let efd = rustix::event::eventfd(0, rustix::event::EventfdFlags::empty())?;
-        let want = (EFD_BASE + i as u32) as i32;
-        // SAFETY: dup2 to a chosen fd; the source is closed with `efd` after.
-        let r = unsafe { trap::gate(33, efd.as_raw_fd() as usize, want as usize, 0, 0, 0, 0) };
-        if r < 0 {
-            return Err(rustix::io::Errno::from_raw_os_error(-r as i32));
-        }
-        drop(efd);
     }
     // The main thread becomes slot 0, owning the token; its running coroutine (init) is bound here.
     let main = &PAR.slots[0];
@@ -724,7 +714,7 @@ pub unsafe fn enable(s: &'static Sched, root: Tid) -> Result<(u32, u32), rustix:
     s.install_par(&PAR);
     let main_sc = s.spawn_sched_loop(sched_loop, 0, 0, context::read_fs()).map_err(|_| rustix::io::Errno::NOMEM)?;
     main.sched_co.set(main_sc.raw());
-    Ok((EFD_BASE, EFD_BASE + N_SLOTS as u32 - 1))
+    Ok(())
 }
 
 // ---- the dispatcher's token, per trapped syscall ----
@@ -1176,7 +1166,8 @@ pub fn rearm_altstack() {
 /// (main) thread was copied, and it holds the CPU token (exobox's fork takes it first, so the
 /// kernel was copied at rest). What the fork didn't copy, or copied as shared:
 /// - the CPU-token eventfds: a fork shares their open files with the parent, so every hand-off
-///   here would wake the parent's threads (and theirs ours). Each is made again, at its fd.
+///   here would wake the parent's threads (and theirs ours). The host makes each again, at its
+///   fd, before this (exobox's inventory).
 /// - the kernel idler thread: gone. Its slot is cleared (its scheduler coroutine freed: nothing
 ///   runs on it), for a new one (`kernel_main` on a thread the caller spawns, then
 ///   [`wait_kernel_ready`]).
@@ -1192,20 +1183,6 @@ pub fn after_fork(s: &'static Sched) -> Result<(), rustix::io::Errno> {
         PAR.slots[i].wnext.set(u16::MAX);
         PAR.slots[i].invited.store(false, Ordering::Relaxed);
         PAR.slots[i].lost.set(false);
-        // eventfd2(0, 0) then dup2 onto the slot's fd, through the gate (the routing filter may
-        // be in: rustix's would trap).
-        // SAFETY: a new eventfd, moved to the fd the filter pins; the inherited one is closed.
-        let efd = unsafe { trap::gate(290, 0, 0, 0, 0, 0, 0) };
-        if efd < 0 {
-            return Err(rustix::io::Errno::from_raw_os_error(-efd as i32));
-        }
-        // SAFETY: as above.
-        let r = unsafe { trap::gate(33, efd as usize, (EFD_BASE + i as u32) as usize, 0, 0, 0, 0) };
-        // SAFETY: closes the temporary fd.
-        unsafe { trap::gate(3, efd as usize, 0, 0, 0, 0, 0) };
-        if r < 0 {
-            return Err(rustix::io::Errno::from_raw_os_error(-r as i32));
-        }
     }
     let k = slot(KERNEL);
     let old = k.sched_co.replace(0);

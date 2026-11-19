@@ -1,3 +1,7 @@
+//! The security filter as it was before seccompiler (exobox-rt's `filter.rs`, unchanged but for
+//! this line and the tests' module): kept as the oracle the new filter is checked against
+//! (`tests.rs`'s `same_as_the_old_filter`), test-only.
+//!
 //! The seccomp-BPF filter: compiled from plain parameters into a classic-BPF program, then
 //! installed.
 //!
@@ -516,6 +520,3 @@ pub fn install_insns(insns: &[SockFilter], flags: u32) -> Result<(), rustix::io:
     check(unsafe { exobox_rt::trap::gate(NR_SECCOMP, 1, flags as usize, &fprog as *const SockFprog as usize, 0, 0, 0) })
 }
 
-#[cfg(test)]
-#[path = "old_tests.rs"]
-mod tests;

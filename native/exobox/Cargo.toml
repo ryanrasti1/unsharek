@@ -23,6 +23,8 @@ libc.workspace = true
 # Errno, the runtime's error type, in the hooks' adapters
 rustix.workspace = true
 thiserror.workspace = true
+# The security filter's allowlist, compiled to classic BPF (src/tcb/filter.rs): Firecracker's
+seccompiler = "0.5"
 # The global allocator after lockdown (src/alloc.rs): the hooks' and the executor's allocations,
 # from a region reserved before it
 talc = { version = "5", default-features = false }

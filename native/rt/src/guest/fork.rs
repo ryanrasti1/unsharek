@@ -43,8 +43,6 @@ use super::*;
 pub(super) const SIGCHLD: usize = trap::SIGCHLD as usize;
 const CLONE_PARENT: u64 = trap::CLONE_PARENT;
 const SA_NOCLDWAIT: u64 = 2;
-const NR_PIDFD_OPEN: usize = 434;
-const NR_GETPID: usize = 39;
 
 /// Fork mode is on (this process's: set before lockdown, copied by every fork).
 static ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -54,16 +52,12 @@ pub(super) fn enabled() -> bool {
 }
 
 /// Fork mode, in init's process before lockdown, after [`enable_threaded`]: the `fork` host op,
-/// the bound on processes, init's pidfd for the others to watch, the SIGCHLD handler that sees a
-/// process die on the host, and init's main thread's traps on a shared stack.
-pub fn enable_fork(max_procs: u32) -> Result<(), Error> {
+/// the bound on processes, init's pidfd for the others to watch (`init_pidfd`, the host's: made
+/// by exobox's inventory), the SIGCHLD handler that sees a process die on the host, and init's
+/// main thread's traps on a shared stack.
+pub fn enable_fork(max_procs: u32, init_pidfd: i32) -> Result<(), Error> {
     par::set_max_procs(max_procs);
-    // SAFETY: getpid and pidfd_open, before lockdown.
-    let fd = unsafe { trap::gate(NR_PIDFD_OPEN, trap::gate(NR_GETPID, 0, 0, 0, 0, 0, 0) as usize, 0, 0, 0, 0, 0) };
-    if fd < 0 {
-        return Err(Error { what: "init's pidfd", errno: Errno::from_raw_os_error(-fd as i32) });
-    }
-    par::set_init_pidfd(fd as i32);
+    par::set_init_pidfd(init_pidfd);
     // SAFETY: the handler makes only gate calls; before lockdown.
     unsafe { trap::install_handler(17, on_sigchld, SA_NOCLDWAIT) }.map_err(err("the SIGCHLD handler"))?;
     par::root_on_shared_stack().map_err(err("init's kernel stack"))?;
