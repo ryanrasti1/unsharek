@@ -31,6 +31,10 @@
         exobox-erofs = default // { meta = default.meta // { mainProgram = "exobox-erofs"; }; };
       };
 
+      # The release step's check: the package's exobox runs hello, Python, bash, Go and busybox in
+      # all three modes inside Nix's build sandbox (nix/smoke.nix). `nix build .#checks.x86_64-linux.smoke`.
+      checks.${system}.smoke = import ./nix/smoke.nix { inherit pkgs tp; exobox = self.packages.${system}.default; };
+
       devShells.${system}.default = pkgs.mkShell {
         packages = with pkgs; [
           cargo
