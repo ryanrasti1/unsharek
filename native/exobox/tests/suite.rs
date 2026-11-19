@@ -14,7 +14,7 @@ use std::env;
 use exobox_fixtures as fx;
 
 mod common;
-use common::spawn_bounded;
+use common::spawn_bounded_with;
 use libtest_mimic::{Arguments, Failed, Trial};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -98,6 +98,8 @@ struct Case {
     stdin: Option<&'static str>,
     /// Stdin a pipe held open and silent for the whole run (a reader blocks on it).
     hold_stdin: bool,
+    /// How long the suite holds off reading the program's stdout (a slow reader: the pipe fills).
+    stdout_delay: Duration,
     timeout: Duration,
     cpu_budget: Option<Duration>,
     /// Checks stdout beyond `Expect` (sysaudit's table).
@@ -117,6 +119,7 @@ fn case(name: &'static str, prog: Prog, modes: &'static [Mode], sandbox: Expect)
         uses: vec![],
         stdin: None,
         hold_stdin: false,
+        stdout_delay: Duration::ZERO,
         timeout: Duration::from_secs(5),
         cpu_budget: None,
         check: None,
@@ -270,6 +273,41 @@ fn cases() -> Vec<Case> {
         Case { hold_stdin: true, ..fixture("hostfd_thread", ALL).args(vec![Arg::Lit("exit")]) },
         Case { hold_stdin: true, ..fixture("hostfd_thread", ALL).renamed("hostfd_thread_sleep").args(vec![Arg::Lit("sleep")]) },
         Case { hold_stdin: true, ..fixture("hostfd_thread", ALL).renamed("hostfd_thread_write").args(vec![Arg::Lit("write")]) },
+        // Threads writing to a full stdout pipe (the suite reads it only after 300 ms): a
+        // nonblocking write's EAGAIN and poll, and a blocking write that waits without the CPU;
+        // in fork mode in a forked process too (init's process watches its fds).
+        Case { stdout_delay: Duration::from_millis(300), ..fixture("stdout_full", ALL).args(vec![Arg::Lit("nonblock")]) },
+        Case {
+            stdout_delay: Duration::from_millis(300),
+            ..fixture("stdout_full", ALL).renamed("stdout_full_block").args(vec![Arg::Lit("block")])
+        },
+        // ... which a signal cuts short, and the process's exit ends (in 0.7 s, the reader not yet
+        // reading: the exit doesn't wait for it).
+        Case {
+            stdout_delay: Duration::from_millis(300),
+            ..fixture("stdout_full", ALL).renamed("stdout_full_signal").args(vec![Arg::Lit("signal")])
+        },
+        Case {
+            stdout_delay: Duration::from_millis(1000),
+            timeout: Duration::from_millis(700),
+            ..case(
+                "stdout_full_exit",
+                Prog::Fixture("stdout_full"),
+                ALL,
+                Expect { stderr: vec!["STDOUT_FULL_EXIT"], ..status(Status::Code(0)) },
+            )
+            .args(vec![Arg::Lit("exit")])
+        },
+        Case {
+            stdout_delay: Duration::from_millis(300),
+            ..fixture("stdout_full", FORK).renamed("stdout_full_child").args(vec![Arg::Lit("child"), Arg::Lit("nonblock")])
+        },
+        Case {
+            stdout_delay: Duration::from_millis(300),
+            ..fixture("stdout_full", FORK)
+                .renamed("stdout_full_child_block")
+                .args(vec![Arg::Lit("child"), Arg::Lit("block")])
+        },
         fixture("fork_rng", FORK),
         fixture("settid", FORK),
         // The pipeline that found settid's bug: a C++ program on a pipeline's left side, in a
@@ -456,7 +494,7 @@ fn run(c: &Case, mode: Mode, secret: &PathBuf) -> Result<(), Failed> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let (status, cpu, stdout, stderr) = spawn_bounded(cmd, c.stdin, c.timeout)?;
+    let (status, cpu, stdout, stderr) = spawn_bounded_with(cmd, c.stdin, c.stdout_delay, c.timeout)?;
     let expect = if mode == Mode::Native { c.native.as_ref().unwrap() } else { &c.sandbox };
     let fail = |why: String| -> Result<(), Failed> {
         Err(format!("{why}\n--- status: {status:?}, cpu {cpu:?}\n--- stdout:\n{stdout}\n--- stderr:\n{stderr}").into())

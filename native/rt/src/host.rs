@@ -49,6 +49,7 @@
 use core::cell::{Cell, UnsafeCell};
 use core::ffi::{c_char, c_int, c_uint, c_ulong, c_ulonglong, c_void};
 use core::ptr;
+use core::sync::atomic::{AtomicI32, Ordering};
 
 use lkl_sys::{lkl_host_operations, lkl_jmp_buf, lkl_mutex, lkl_sem, lkl_thread_t, lkl_tls_key};
 
@@ -630,19 +631,104 @@ unsafe extern "C" fn memmove(d: *mut c_void, s: *const c_void, n: c_ulong) -> *m
 
 // ---- host fds as guest files (the kernel series' item 11) ----
 
-/// The one host fd a coroutine waits on, polled by the idle wait (the filter allows `ppoll` on one
-/// fd): (fd, events, the waiter).
+/// The host fds coroutines wait on (a blocking read or write in [`hostfd_rw`]): (fd, events, the
+/// waiter's `Tid::raw`; 0: a free entry). Polled by the idle wait, coroutine mode's
+/// ([`SysHost::idle`]) and threaded mode's (`par`'s idler, on the kernel thread: in fork mode
+/// init's process, whose host fds 0-2 and passed fds are the same files as every process's),
+/// which wakes the waiter. In the shared section: a forked process's threads wait here too.
+/// Touched only with the CPU token held (coroutine mode: always).
 #[unsafe(link_section = "exobox_shared")]
-static FD_WAIT: FdWait = FdWait(Cell::new(None));
-struct FdWait(Cell<Option<(i32, i16, Tid)>>);
+static FD_WAITS: FdWaits = FdWaits([const { Cell::new((0, 0, 0)) }; FD_WAITERS]);
+struct FdWaits([Cell<(i32, i16, u64)>; FD_WAITERS]);
 // SAFETY: as the pools'.
-unsafe impl Sync for FdWait {}
+unsafe impl Sync for FdWaits {}
+/// Waiters the idle wait watches at once (of its `PPOLL_FDS`: the others are the hooks' fds and
+/// the threaded idler's eventfd). One past them is woken by its deadline alone.
+const FD_WAITERS: usize = 4;
 
 const POLLIN: i16 = 1;
 const POLLOUT: i16 = 4;
-/// How long a waiting coroutine sleeps between polls when the idle wait isn't watching its fd (it
-/// watches one; or the program keeps the CPU busy, and idle never runs).
+/// How long a waiting coroutine waits before looking again itself, the fd ready or not (the idle
+/// wait may not be watching it: the program keeps the CPU busy and idle doesn't run, or there are
+/// more waiters than [`FD_WAITERS`]). With nothing done yet the call is then restarted.
 const FD_REPOLL_NS: u64 = 5_000_000;
+
+/// The most of a write to a host fd that may block given to one write(2): a pipe that polls
+/// writable has a free buffer, a page, which takes this much without waiting (`pipe_write`); a
+/// stream socket polls writable with more room than this.
+const PIPE_BUF: usize = 4096;
+
+/// Host fds whose writes never block (regular files, block devices, character devices other than
+/// terminals, such as `/dev/null`), found before lockdown by [`note_host_fds`]: written whole.
+/// Any other (a pipe, a socket, a terminal, or one not looked at) is written [`PIPE_BUF`] at a
+/// time, each piece after a poll says it is writable: the host's write(2) never waits. Set before
+/// the first fork, then only read (each process has its copy).
+static WHOLE: [AtomicI32; 16] = [const { AtomicI32::new(-1) }; 16];
+
+/// Before lockdown: look at the host fds the guest's files are made of (fds 0-2, passed fds), for
+/// how [`hostfd_rw`] writes them (`fstat`: after lockdown the filter allows none).
+pub fn note_host_fds(fds: &[i32]) {
+    use rustix::fs::FileType;
+    let mut n = 0;
+    for &fd in fds {
+        // SAFETY: the fd is only looked at, for the call (a closed one fails the fstat).
+        let bfd = unsafe { rustix::fd::BorrowedFd::borrow_raw(fd) };
+        let Ok(st) = rustix::fs::fstat(bfd) else { continue };
+        let whole = match FileType::from_raw_mode(st.st_mode) {
+            FileType::RegularFile | FileType::BlockDevice => true,
+            FileType::CharacterDevice => !rustix::termios::isatty(bfd),
+            _ => false,
+        };
+        if whole && n < WHOLE.len() {
+            WHOLE[n].store(fd, Ordering::Relaxed);
+            n += 1;
+        }
+    }
+    for w in &WHOLE[n..] {
+        w.store(-1, Ordering::Relaxed);
+    }
+}
+
+fn written_whole(fd: i32) -> bool {
+    WHOLE.iter().any(|w| w.load(Ordering::Relaxed) == fd)
+}
+
+/// Whether a coroutine waits on a host fd: threaded mode's idler is then handed the CPU token to
+/// watch it (`par`'s `give`), as for a timer.
+pub fn fd_waiting() -> bool {
+    FD_WAITS.0.iter().any(|w| w.get().2 != 0)
+}
+
+/// The fds the idle wait watches, into `out` (as many as fit): the host fds coroutines wait on,
+/// then the hooks' executor's (`executor::idle_fds`). Returns how many.
+pub fn idle_fds(out: &mut [crate::trap::PollFd]) -> usize {
+    let mut n = 0;
+    for w in &FD_WAITS.0 {
+        let (fd, events, tid) = w.get();
+        if tid == 0 {
+            continue;
+        }
+        if let Some(p) = out[..n].iter_mut().find(|p| p.fd == fd) {
+            p.events |= events;
+        } else if n < out.len() {
+            out[n] = crate::trap::PollFd { fd, events, revents: 0 };
+            n += 1;
+        }
+    }
+    n + crate::executor::idle_fds(&mut out[n..])
+}
+
+/// The idle wait's results for the fds [`idle_fds`] gave: whoever waits on a ready one is woken
+/// (a host fd's waiter, to look again; the executor's tasks and passed fds, its own way).
+pub fn idle_ready(fds: &[crate::trap::PollFd]) {
+    for w in &FD_WAITS.0 {
+        let (fd, _, tid) = w.get();
+        if tid != 0 && fds.iter().any(|p| p.fd == fd && p.revents != 0) {
+            sched().wake(Tid::from_raw(tid));
+        }
+    }
+    crate::executor::idle_ready(fds);
+}
 
 /// The kernel's "restart this call if no handler says otherwise" (include/linux/errno.h).
 const ERESTARTSYS: core::ffi::c_long = 512;
@@ -652,77 +738,113 @@ const ERESTARTSYS: core::ffi::c_long = 512;
 const HOSTFD_WRITE: c_int = 1;
 const HOSTFD_NONBLOCK: c_int = 2;
 
+/// Block the current coroutine until host fd `fd` may have `events` (the idle wait watching it),
+/// one poll interval passes, or [`Sched::interrupt_waits`].
+fn wait_fd(fd: i32, events: i16) {
+    let s = sched();
+    let deadline = s.now().saturating_add(FD_REPOLL_NS);
+    s.set_interruptible(true);
+    let entry = FD_WAITS.0.iter().find(|w| w.get().2 == 0);
+    if let Some(w) = entry {
+        w.set((fd, events, s.current().raw()));
+    }
+    s.block(Some(deadline));
+    if let Some(w) = entry {
+        w.set((0, 0, 0));
+    }
+    s.set_interruptible(false);
+}
+
 /// `hostfd_rw`: a read or write on the host's fd for a guest file made by `host_fd`, called with
-/// the CPU free and the task asleep. The host thread is every coroutine's, so it must not block in
-/// the host: poll the fd (through the gate), and until it is ready block the coroutine, the idle
-/// wait watching the fd; then the one read or write, which won't block. Through the gate, so the
-/// filter decides: reads of 0 and writes of 1 and 2 (the program's stdio) and nothing else.
+/// the kernel's CPU free and the task asleep. Its host thread runs every coroutine (coroutine
+/// mode) or holds the CPU token every thread waits for (threaded and fork mode), so it must never
+/// block in the host: the fd is polled (through the gate), and until it is ready the coroutine
+/// blocks, the idle wait watching the fd; then one read, or what of the write the fd takes without
+/// waiting (to a pipe or a socket [`PIPE_BUF`] at a time, each piece after a poll; to a regular
+/// file all of it: see [`note_host_fds`]). The kernel asks again for the rest of a blocking write,
+/// until it is whole or a signal comes (hostfd.c, as a pipe's write). Through the gate, so the
+/// filter decides: reads of 0 and writes of 1 and 2 (the program's stdio), the passed fds, and
+/// nothing else.
+///
+/// A write the pipe couldn't take whole blocked in the host's write(2) here, and with it every
+/// other thread (all of them waited for the CPU token), until the reader had taken it all
+/// (`stdout_full_block`).
 ///
 /// **Nonblocking files** (`HOSTFD_NONBLOCK`: the guest file is O_NONBLOCK) never wait: the poll
-/// says not ready, and the call is EAGAIN, as a pipe's, the fd watched. tokio drives a passed fd (capnix's channel
-/// at 1000) edge-triggered, reading to EAGAIN after each edge; before this flag that read waited
-/// here, and its runtime stalled (`passfd_epoll_et`).
+/// says not ready, and the call is EAGAIN, as a pipe's, the fd watched. tokio drives a passed fd
+/// (capnix's channel at 1000) edge-triggered, reading to EAGAIN after each edge; before this flag
+/// that read waited here, and its runtime stalled (`passfd_epoll_et`). xz makes its stdout
+/// nonblocking and polls it at each EAGAIN: in threaded and fork mode the idle wait watched no
+/// fd, nothing saw the pipe drain, and xz into a full pipe hung (`stdout_full`).
 ///
 /// **Ends and signals.** The kernel's wait for this is uninterruptible (hostfd.c: the task asleep
 /// outside the CPU, as in a disk read), so neither a group exit nor a signal reaches a thread
 /// blocked here: its process never ended while a reader waited on a silent stdin (capnix's
 /// channel at fd 1000). So the wait is short: one poll interval (or less: it is marked
 /// interruptible, `Sched::interrupt_waits`, which a group exit, an exec, a `kill` or a timer
-/// wakes), and then, if the fd still isn't ready, `-ERESTARTSYS` with nothing done. The call's
-/// return to the program (`syscall_return`, the kernel series' item 8) then sees what is pending:
-/// a fatal signal ends the task, a caught one runs its handler and the call restarts under
-/// `SA_RESTART` or is `EINTR`, as a pipe's read; with nothing pending the kernel runs the call
-/// again, back here. (The kernel-side fix would be hostfd.c waiting interruptibly and the host
-/// op being told to give up: see the item-8 notes in `guest`.)
+/// wakes), and then, if the fd still isn't ready, `-ERESTARTSYS` with nothing done. The kernel
+/// then sees what is pending: mid-write, a signal ends the write at what was written, else it asks
+/// for the rest; otherwise at the call's return to the program (`syscall_return`, the kernel
+/// series' item 8) a fatal signal ends the task, a caught one runs its handler and the call
+/// restarts under `SA_RESTART` or is `EINTR`, as a pipe's read; with nothing pending the kernel
+/// runs the call again, back here. (The kernel-side fix would be hostfd.c waiting interruptibly
+/// and the host op being told to give up: see the item-8 notes in `guest`.)
 unsafe extern "C" fn hostfd_rw(fd: c_int, buf: *mut c_void, len: c_ulong, flags: c_int) -> core::ffi::c_long {
     let write = flags & HOSTFD_WRITE != 0;
+    let nonblock = flags & HOSTFD_NONBLOCK != 0;
     let events = if write { POLLOUT } else { POLLIN };
+    let len = len as usize;
+    let piece = if write && !written_whole(fd) { PIPE_BUF } else { len };
     let zero = crate::xabi::Timespec { tv_sec: 0, tv_nsec: 0 };
     let ready = || {
         let mut p = crate::trap::PollFd { fd, events, revents: 0 };
         crate::trap::ppoll(Some(&mut p), Some(&zero)).map(|n| n > 0)
     };
-    match ready() {
-        Ok(true) => {}
-        Ok(false) if flags & HOSTFD_NONBLOCK != 0 => {
-            // Watched until it is ready, as `hostfd_poll` watches what isn't: then the kernel
-            // wakes the file's pollers, the edge an edge-triggered epoll waits for after reading
-            // to EAGAIN (nothing else would tell it).
-            if crate::executor::installed() {
-                crate::executor::watch_hostfd(fd, events);
-            }
-            return -(rustix::io::Errno::AGAIN.raw_os_error() as core::ffi::c_long);
-        }
-        Ok(false) => {
-            let s = sched();
-            let deadline = s.now().saturating_add(FD_REPOLL_NS);
-            s.set_interruptible(true);
-            if FD_WAIT.0.get().is_none() {
-                FD_WAIT.0.set(Some((fd, events, s.current())));
-                s.block(Some(deadline));
-                FD_WAIT.0.set(None);
-            } else {
-                s.sleep_until(deadline);
-            }
-            s.set_interruptible(false);
-            match ready() {
-                Ok(true) => {}
-                Ok(false) => return -ERESTARTSYS,
-                Err(e) => return -(e.raw_os_error() as core::ffi::c_long),
-            }
-        }
-        Err(e) => return -(e.raw_os_error() as core::ffi::c_long),
-    }
-    let r = if write {
-        // SAFETY: the kernel's buffer of len bytes.
-        crate::trap::write(fd as u32, unsafe { core::slice::from_raw_parts(buf as *const u8, len as usize) })
-    } else {
-        // SAFETY: as above, writable.
-        crate::trap::read(fd as u32, unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len as usize) })
+    // What was written so far, else the error.
+    let mut done = 0usize;
+    let or_done = |done: usize, e: rustix::io::Errno| -> core::ffi::c_long {
+        if done > 0 { done as core::ffi::c_long } else { -(e.raw_os_error() as core::ffi::c_long) }
     };
-    match r {
-        Ok(n) => n as core::ffi::c_long,
-        Err(e) => -(e.raw_os_error() as core::ffi::c_long),
+    loop {
+        match ready() {
+            Ok(true) => {}
+            // What the fd took without waiting; the kernel asks for the rest, if it wants it.
+            Ok(false) if done > 0 => return done as core::ffi::c_long,
+            Ok(false) if nonblock => {
+                // Watched until it is ready, as `hostfd_poll` watches what isn't: then the kernel
+                // wakes the file's pollers, the edge an edge-triggered epoll waits for after
+                // reading to EAGAIN (nothing else would tell it).
+                if crate::executor::installed() {
+                    crate::executor::watch_hostfd(fd, events);
+                }
+                return or_done(0, rustix::io::Errno::AGAIN);
+            }
+            Ok(false) => {
+                wait_fd(fd, events);
+                match ready() {
+                    Ok(true) => {}
+                    Ok(false) => return -ERESTARTSYS,
+                    Err(e) => return or_done(0, e),
+                }
+            }
+            Err(e) => return or_done(done, e),
+        }
+        let n = (len - done).min(piece);
+        // SAFETY: the kernel's buffer of len bytes (writable, for a read); done < len.
+        let p = unsafe { (buf as *mut u8).add(done) };
+        let r = if write {
+            // SAFETY: as above.
+            crate::trap::write(fd as u32, unsafe { core::slice::from_raw_parts(p, n) })
+        } else {
+            // SAFETY: as above.
+            crate::trap::read(fd as u32, unsafe { core::slice::from_raw_parts_mut(p, n) })
+        };
+        match r {
+            // A read is one read, as a pipe's; a write goes on until it is whole.
+            Ok(k) if write && k > 0 && done + k < len => done += k,
+            Ok(k) => return (done + k) as core::ffi::c_long,
+            Err(e) => return or_done(done, e),
+        }
     }
 }
 
@@ -769,25 +891,14 @@ impl Host for SysHost {
         };
         let ts = timeout.map(|t| crate::xabi::Timespec { tv_sec: t.tv_sec, tv_nsec: t.tv_nsec });
         // Through the gate (the filter's one wait; rustix's poll would trap once the routing
-        // filter is in), watching the host fd a coroutine waits for, if any, and the fds the
-        // hooks' executor waits on (`executor::idle_fds`). EINTR (a signal) is a wake-up like any
-        // other.
+        // filter is in), watching the host fds coroutines wait for and the fds the hooks'
+        // executor waits on ([`idle_fds`]). EINTR (a signal) is a wake-up like any other.
         let mut fds = [crate::trap::PollFd::default(); crate::filter::PPOLL_FDS as usize];
-        let own = FD_WAIT.0.get();
-        let first = usize::from(own.is_some());
-        if let Some((fd, events, _)) = own {
-            fds[0] = crate::trap::PollFd { fd, events, revents: 0 };
-        }
-        let n = first + crate::executor::idle_fds(&mut fds[first..]);
+        let n = idle_fds(&mut fds);
         if let Ok(ready) = crate::trap::ppoll_fds(&mut fds[..n], ts.as_ref())
             && ready > 0
         {
-            if let Some((_, _, tid)) = own
-                && fds[0].revents != 0
-            {
-                sched().wake(tid);
-            }
-            crate::executor::idle_ready(&fds[first..n]);
+            idle_ready(&fds[..n]);
         }
     }
 }

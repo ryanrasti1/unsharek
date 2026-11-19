@@ -10,9 +10,21 @@ use libtest_mimic::Failed;
 
 /// Runs `cmd` to its end or `timeout` (then kills it), returning its status, the CPU time it and
 /// its reaped descendants used (the host's accounting, from wait4), and its output.
+#[allow(dead_code)] // (a test binary may use only `spawn_bounded_with`)
 pub fn spawn_bounded(
+    cmd: Command,
+    stdin: Option<&'static str>,
+    timeout: Duration,
+) -> Result<(ExitStatus, Duration, String, String), Failed> {
+    spawn_bounded_with(cmd, stdin, Duration::ZERO, timeout)
+}
+
+/// [`spawn_bounded`], reading the child's stdout only after `stdout_delay` (a slow reader: a
+/// pipe the child fills).
+pub fn spawn_bounded_with(
     mut cmd: Command,
     stdin: Option<&'static str>,
+    stdout_delay: Duration,
     timeout: Duration,
 ) -> Result<(ExitStatus, Duration, String, String), Failed> {
     let mut child = cmd.spawn().map_err(|e| format!("spawn {cmd:?}: {e}"))?;
@@ -29,8 +41,9 @@ pub fn spawn_bounded(
         }
         None => child.stdin.take(),
     };
-    let drain = |r: Option<Box<dyn Read + Send>>| {
+    let drain = |r: Option<Box<dyn Read + Send>>, delay: Duration| {
         thread::spawn(move || {
+            thread::sleep(delay);
             let mut s = String::new();
             if let Some(mut r) = r {
                 let mut b = vec![];
@@ -40,8 +53,8 @@ pub fn spawn_bounded(
             s
         })
     };
-    let out = drain(child.stdout.take().map(|r| Box::new(r) as _));
-    let err = drain(child.stderr.take().map(|r| Box::new(r) as _));
+    let out = drain(child.stdout.take().map(|r| Box::new(r) as _), stdout_delay);
+    let err = drain(child.stderr.take().map(|r| Box::new(r) as _), Duration::ZERO);
 
     let start = Instant::now();
     let mut timed_out = false;
