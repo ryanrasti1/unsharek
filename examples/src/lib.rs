@@ -12,7 +12,7 @@ pub mod mux;
 use std::ffi::OsString;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 
@@ -53,11 +53,6 @@ pub fn nix_program(var: &str) -> PathBuf {
             std::process::exit(0)
         }
     }
-}
-
-/// The examples' own C programs (`c/`, built by build.rs).
-pub fn c_program(name: &str) -> PathBuf {
-    Path::new(env!("EXOBOX_EXAMPLES_C")).join(name)
 }
 
 /// Small workloads, for the smoke tests (`tests/smoke.rs` sets it).

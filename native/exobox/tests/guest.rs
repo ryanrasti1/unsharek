@@ -39,7 +39,12 @@ const CHILD_ARGS: &str = "EXOBOX_GUEST_TEST_ARGS";
 
 fn mode() -> (Mode, String) {
     let m = std::env::var(CHILD_MODE).unwrap_or_else(|_| "coroutine".into());
-    (if m == "threaded" { Mode::Threaded } else { Mode::Coroutine }, m)
+    let mode = match m.as_str() {
+        "threaded" => Mode::Threaded,
+        "fork" => Mode::Fork,
+        _ => Mode::Coroutine,
+    };
+    (mode, m)
 }
 
 fn argv(name: &str) -> Vec<OsString> {
@@ -89,6 +94,7 @@ fn child(layer: &str, name: &str) -> ! {
         "intercept" => intercept(m, name),
         "entries" => entries(m),
         "template" => template(m),
+        "run_fn" => run_fn(m, name),
         _ => {
             let mut b = Sandbox::builder().mode(m).deny(Deny::Errno);
             match layer {
@@ -237,6 +243,79 @@ fn entries(m: Mode) -> exobox::Error {
 
 /// A template: one setup, then four children in turn, each with setup of its own and its own
 /// fixture. Prints each one's status; their output is theirs (stdout, in turn).
+/// `Sandbox::run_fn`: a closure run as the program, after lockdown. `ok`: its calls are the
+/// guest's (init's pid, the guest's files, no host path), a host fd from before lockdown is
+/// closed, and its return value is the status (42). `gate`: a host call from the gate is the
+/// security filter's (EPERM with deny=errno, which `ok` doesn't set: the kill is checked by
+/// `run_fn_gate_kills`).
+fn run_fn(m: Mode, what: &str) -> exobox::Error {
+    let deny = if what == "errno" { Deny::Errno } else { Deny::Kill };
+    let sb = Sandbox::builder().mode(m).deny(deny).build().unwrap();
+    // A host fd opened now, before lockdown: the closure finds it closed.
+    let before = std::fs::File::open(env!("CARGO_MANIFEST_DIR")).unwrap();
+    let before_fd = before.as_raw_fd();
+    std::mem::forget(before);
+    let host_path = env!("CARGO_MANIFEST_DIR");
+    let what = what.to_owned();
+    let Err(e) = sb.run_fn(move || {
+        // SAFETY: getpid; fcntl on a number.
+        check("run_fn: getpid is init's", unsafe { libc::getpid() } == 1);
+        check("run_fn: the guest's files", std::fs::write("/tmp/run_fn", "x").is_ok() && std::fs::read("/tmp/run_fn").is_ok_and(|b| b == b"x"));
+        check("run_fn: no host path", !std::path::Path::new(host_path).exists());
+        check("run_fn: memory", vec![7u8; 1 << 20].iter().map(|&b| b as usize).sum::<usize>() == 7 << 20);
+        let gate = find_gate();
+        // The host fd from before: closed at lockdown. ppoll is on the list (any fd: it moves no
+        // data), and says POLLNVAL for an fd that isn't open; stdin, which is, isn't.
+        let poll = |fd: i32| {
+            let mut p = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+            let ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            let r = gate_call4(gate, libc::SYS_ppoll, [&mut p as *mut _ as usize, 1, &ts as *const _ as usize, 0]);
+            (r, p.revents)
+        };
+        check("run_fn: a host fd from before lockdown is closed", poll(before_fd) == (1, libc::POLLNVAL));
+        check("run_fn: stdin is open", poll(0).1 & libc::POLLNVAL == 0);
+        if what == "errno" {
+            // Not on the list: EPERM.
+            check("run_fn: the gate's getppid is refused", gate_call(gate, libc::SYS_getppid, 0, 0) == -(libc::EPERM as isize));
+            return 42;
+        }
+        if what == "kill" {
+            gate_call(gate, libc::SYS_getppid, 0, 0);
+            println!("run_fn: survived the gate");
+        }
+        42
+    });
+    e
+}
+
+/// The gate's `syscall` instruction, found in the binary's code: `mov r9, [rsp + 8]; syscall;
+/// ret` (exobox-rt's `trap::gate`), as a compromised program would find it.
+fn find_gate() -> usize {
+    unsafe extern "C" {
+        static __executable_start: u8;
+        static etext: u8;
+    }
+    const TAIL: [u8; 8] = [0x4c, 0x8b, 0x4c, 0x24, 0x08, 0x0f, 0x05, 0xc3];
+    let (lo, hi) = (&raw const __executable_start as usize, &raw const etext as usize);
+    // SAFETY: the binary's own code, readable.
+    let text = unsafe { std::slice::from_raw_parts(lo as *const u8, hi - lo) };
+    lo + text.windows(8).position(|w| w == TAIL).expect("the gate") + 5
+}
+
+fn gate_call(gate: usize, nr: i64, a0: usize, a1: usize) -> isize {
+    gate_call4(gate, nr, [a0, a1, 0, 0])
+}
+
+fn gate_call4(gate: usize, nr: i64, a: [usize; 4]) -> isize {
+    let r: isize;
+    // SAFETY: the gate's `syscall; ret`: whatever it does is the filter's to allow.
+    unsafe {
+        std::arch::asm!("call {g}", g = in(reg) gate, inlateout("rax") nr as isize => r, in("rdi") a[0], in("rsi") a[1],
+            in("rdx") a[2], in("r10") a[3], in("r8") 0, in("r9") 0, lateout("rcx") _, lateout("r11") _);
+    }
+    r
+}
+
 fn template(m: Mode) -> exobox::Error {
     let mut sb = Sandbox::builder().mode(m).build().unwrap();
     let mounts = sb.map_closure(&fx::bin("hello"), &[fx::bin_dir()]).unwrap();
@@ -365,6 +444,30 @@ fn main() {
             Ok(())
         }),
     ];
+    for mode in ["coroutine", "threaded", "fork"] {
+        trials.push(Trial::test(format!("run_fn::{mode}"), move || {
+            let (st, out, err) = run("run_fn", "ok", mode, &[])?;
+            if st.code() != Some(42) || out.contains("FAIL") || out.matches(": ok").count() != 6 {
+                return fail(st, &out, &err, "wanted the closure's checks and status 42");
+            }
+            Ok(())
+        }));
+        trials.push(Trial::test(format!("run_fn_gate_errno::{mode}"), move || {
+            let (st, out, err) = run("run_fn", "errno", mode, &[])?;
+            if st.code() != Some(42) || out.contains("FAIL") || out.matches(": ok").count() != 7 {
+                return fail(st, &out, &err, "wanted the gate's calls refused (EPERM)");
+            }
+            Ok(())
+        }));
+        trials.push(Trial::test(format!("run_fn_gate_kills::{mode}"), move || {
+            use std::os::unix::process::ExitStatusExt;
+            let (st, out, err) = run("run_fn", "kill", mode, &[])?;
+            if st.signal() != Some(libc::SIGSYS) || out.contains("survived") {
+                return fail(st, &out, &err, "wanted the sandbox killed by SIGSYS at the gate's getppid");
+            }
+            Ok(())
+        }));
+    }
     for mode in ["coroutine", "threaded"] {
         // A thread blocked reading the passed fd (open, silent) while main exits with 3, or dies
         // of SIGTERM: the process ends so, within the timeout (capnix's app hung on its fd 1000).
