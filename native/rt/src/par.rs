@@ -531,7 +531,7 @@ fn sched_loop(arg: usize) -> usize {
         // executor's ([`host::idle_fds`]); a program busy enough that it never idles has them
         // looked at between hand-offs, at most once a millisecond (as coroutine mode's
         // `executor::busy_poll`).
-        let mut fds = [PollFd::default(); crate::filter::PPOLL_FDS as usize];
+        let mut fds = [PollFd::default(); crate::trap::PPOLL_FDS as usize];
         if idle_watching() && s.now().saturating_sub(LAST_LOOK.0.get()) >= BUSY_LOOK_NS {
             // (a wake makes a coroutine runnable: the hand-off below runs it)
             LAST_LOOK.0.set(s.now());
@@ -889,7 +889,7 @@ unsafe extern "C" fn fork_trampoline(stack_top: usize, flags: u64, frame: usize)
         "add rsp, 8",
         "mov eax, 15",
         "jmp exobox_rt_gate_syscall",
-        nr = const crate::filter::NR_CLONE,
+        nr = const crate::trap::NR_CLONE,
         gate = sym trap::gate,
     )
 }

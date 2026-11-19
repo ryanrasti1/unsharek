@@ -534,7 +534,7 @@ fn fd_fired(fd: i32, revents: i16) {
 
 /// Every watched fd, polled without waiting (the executor's turn, and [`busy_poll`]).
 fn poll_watches() {
-    let mut fds = [PollFd::default(); crate::filter::PPOLL_FDS as usize];
+    let mut fds = [PollFd::default(); crate::trap::PPOLL_FDS as usize];
     loop {
         // In batches: more fds than one ppoll takes are polled in several.
         let all: Vec<(i32, i16)> = {

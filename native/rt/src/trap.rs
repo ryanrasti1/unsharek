@@ -4,7 +4,7 @@
 //! **The gate.** After lockdown every syscall the program makes is trapped (`SECCOMP_RET_TRAP`
 //! → SIGSYS) and served in-process; the runtime's own host syscalls are allowed only from one
 //! instruction, the `syscall` in [`gate`], which the filter recognises by the address just past it
-//! ([`gate_ip`], for `filter::Params::gate_ip`). rustix's wrappers have `syscall` instructions of
+//! ([`gate_ip`]: `route`'s and the security filter's). rustix's wrappers have `syscall` instructions of
 //! their own, inlined wherever they are called: they are **not** the gate. Before lockdown they
 //! work like any syscall; after it each one traps, and the handler would serve it as if the
 //! program had made it. So the host calls made after lockdown go through [`gate`] directly, by
@@ -58,16 +58,41 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use rustix::io::Errno;
 
-use crate::filter::{CLONE_HOST_THREAD, NR_CLONE, NR_EXIT, NR_EXIT_GROUP};
-use crate::filter::{NR_PPOLL, NR_READ, NR_WRITE};
 use crate::xabi::{SA_RESTORER, Timespec, X86Sigaction};
+
+// ------------------------------------------------------------------------------------------------
+// The host calls the runtime makes from the gate after lockdown, and the shapes it makes them in.
+// These are the runtime's own: the security filter (exobox's TCB, `native/exobox/src/tcb`) pins
+// its own copy of each and is checked against these in its tests, so a change here that the
+// filter doesn't follow is a sandbox killed by it, never a wider filter.
+
+// Syscall numbers (arch/x86/entry/syscalls/syscall_64.tbl).
+pub const NR_READ: u32 = 0;
+pub const NR_WRITE: u32 = 1;
+pub const NR_RT_SIGRETURN: u32 = 15;
+pub const NR_CLONE: u32 = 56;
+pub const NR_EXIT: u32 = 60;
+pub const NR_KILL: u32 = 62;
+pub const NR_EXIT_GROUP: u32 = 231;
+pub const NR_PPOLL: u32 = 271;
+
+/// The one flag set a host thread is made with (include/uapi/linux/sched.h): `CLONE_VM |
+/// CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM | CLONE_CHILD_CLEARTID`.
+/// The child-cleared tid word is how the runtime learns a thread's slot is free.
+pub const CLONE_HOST_THREAD: u64 = 0x100 | 0x200 | 0x400 | 0x800 | 0x1_0000 | 0x4_0000 | 0x20_0000;
+/// The most pollfds one `ppoll` from the gate passes (the idle wait).
+pub const PPOLL_FDS: u64 = 8;
+/// `SIGCHLD` (arch/x86/include/uapi/asm/signal.h): clone's flags for a plain fork.
+pub const SIGCHLD: u64 = 17;
+/// `CLONE_PARENT`: the new process is a sibling of the caller's (a child of its parent).
+pub const CLONE_PARENT: u64 = 0x8000;
 
 // ------------------------------------------------------------------------------------------------
 // The gate.
 
 /// The one `syscall` instruction the filter lets reach the host: `nr(a0, …, a5)`, returning the
 /// raw result (`-errno` on failure). Before lockdown it is an ordinary syscall; after, the filter
-/// decides from the mode's list (`filter::HOST`), and anything else is denied.
+/// decides (the routing filter allows it; the security filter allows the mode's list).
 ///
 /// # Safety
 /// It is a raw syscall: whatever `nr` does with the arguments (memory they point to, the process).
@@ -109,7 +134,8 @@ unsafe extern "C" {
     static exobox_rt_gate_ret: u8;
 }
 
-/// The address just past the gate's `syscall`: `filter::Params::gate_ip`.
+/// The address just past the gate's `syscall`: what the kernel reports as a gate call's
+/// instruction pointer (the routing filter's test, `route`).
 pub fn gate_ip() -> u64 {
     &raw const exobox_rt_gate_ret as u64
 }
@@ -120,7 +146,7 @@ fn check(r: isize) -> Result<usize, Errno> {
 }
 
 // The typed wrappers: exactly the calls the filter allows from the gate, shaped so their
-// arguments satisfy its pinned conditions (`filter::HOST` says what each is for).
+// arguments satisfy its pinned conditions (exobox's `tcb::filter` says what each is for).
 
 /// `write(fd, buf)`: fd 1 or 2 (the program's stdout and stderr), or a CPU-token eventfd.
 pub fn write(fd: u32, buf: &[u8]) -> Result<usize, Errno> {
@@ -158,11 +184,11 @@ pub fn ppoll(fd: Option<&mut PollFd>, timeout: Option<&Timespec>) -> Result<usiz
     check(unsafe { gate(NR_PPOLL as usize, fds, n, ts, 0, 8, 0) })
 }
 
-/// `ppoll` on up to [`crate::filter::PPOLL_FDS`] fds at once, no signal mask (the filter pins
+/// `ppoll` on up to [`PPOLL_FDS`] fds at once, no signal mask (the filter pins
 /// both): the idle wait over the fds coroutines and the hooks' executor wait on. `timeout` `None`
 /// waits forever. Returns how many are ready, each one's `revents` set.
 pub fn ppoll_fds(fds: &mut [PollFd], timeout: Option<&Timespec>) -> Result<usize, Errno> {
-    let n = fds.len().min(crate::filter::PPOLL_FDS as usize);
+    let n = fds.len().min(PPOLL_FDS as usize);
     let p = if n == 0 { 0 } else { fds.as_mut_ptr() as usize };
     let ts = timeout.map_or(0, |t| t as *const Timespec as usize);
     // SAFETY: the kernel reads the timespec and reads/writes the n pollfds, all borrowed.

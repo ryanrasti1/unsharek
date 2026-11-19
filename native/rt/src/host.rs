@@ -912,7 +912,7 @@ impl Host for SysHost {
         // Through the gate (the filter's one wait; rustix's poll would trap once the routing
         // filter is in), watching the host fds coroutines wait for and the fds the hooks'
         // executor waits on ([`idle_fds`]). EINTR (a signal) is a wake-up like any other.
-        let mut fds = [crate::trap::PollFd::default(); crate::filter::PPOLL_FDS as usize];
+        let mut fds = [crate::trap::PollFd::default(); crate::trap::PPOLL_FDS as usize];
         let n = idle_fds(&mut fds);
         if let Ok(ready) = crate::trap::ppoll_fds(&mut fds[..n], ts.as_ref())
             && ready > 0

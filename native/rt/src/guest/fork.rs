@@ -40,8 +40,8 @@
 use super::*;
 
 /// clone's flags for a plain fork.
-pub(super) const SIGCHLD: usize = filter::SIGCHLD as usize;
-const CLONE_PARENT: u64 = filter::CLONE_PARENT;
+pub(super) const SIGCHLD: usize = trap::SIGCHLD as usize;
+const CLONE_PARENT: u64 = trap::CLONE_PARENT;
 const SA_NOCLDWAIT: u64 = 2;
 const NR_PIDFD_OPEN: usize = 434;
 const NR_GETPID: usize = 39;

@@ -6,7 +6,6 @@
 
 use super::*;
 use crate::context::{self, Context};
-use crate::filter::{self, Deny, Mode, Params, Policy, Program};
 use core::arch::asm;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64};
 use std::time::{Duration, Instant};
@@ -155,20 +154,17 @@ fn to_control(uc: &Ucontext) -> usize {
 /// The runtime's FS as `install` captured it (the child's, before lockdown).
 static RUNTIME: AtomicUsize = AtomicUsize::new(0);
 
-/// Install the handler on this (child) thread and lock down: `mode`'s filter with deny=errno.
-fn lockdown(dispatch: Dispatch, target: Target, mode: Mode, tokens: (u32, u32)) {
-    let mut prog = Box::new(Program::new());
-    let params = Params { policy: Policy::Mode(mode), deny: Deny::Errno, gate_ip: gate_ip(), token_fds: tokens, pid: std::process::id(), extra: &[] };
-    filter::compile(&params, &mut prog).unwrap();
+/// Install the handler on this (child) thread and the routing filter: every call not from the
+/// gate traps. (Which gate calls the host allows is the security filter's, exobox's TCB, tested
+/// there.)
+fn lockdown(dispatch: Dispatch, target: Target) {
     RUNTIME.store(context::read_fs(), Ordering::Relaxed);
     // SAFETY: the child's own alternate stack; the dispatchers keep to the contract.
     unsafe {
         set_altstack(&raw mut ALT as *mut u8, ALTSTACK_SIZE).unwrap();
         install(dispatch, target).unwrap();
     }
-    filter::install(&prog, 0).unwrap();
-    // The kernel has its own copy; ours is leaked, as freeing it now could make a host call.
-    Box::leak(prog);
+    crate::route::install().unwrap();
 }
 
 /// A syscall *not* from the gate: after lockdown it traps.
@@ -255,7 +251,7 @@ fn fake(uc: &mut Ucontext) {
 }
 
 fn coroutine_lockdown(dispatch: Dispatch) {
-    lockdown(dispatch, to_control, Mode::Coroutine, (0, 0));
+    lockdown(dispatch, to_control);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -287,17 +283,13 @@ fn traps_and_the_gate() {
         // A trap from inside the dispatcher: its frame lands below the outer one.
         check!(raw(NR_NESTED, args) == ((NR_NESTED - 1) * 1000 + 7 + 1) as isize, 7);
 
-        // Through the gate: allowed, denied (deny=errno).
+        // Through the gate: the host's (routing allows every gate call).
         // SAFETY: write of nothing; getppid.
         check!(unsafe { gate(1, 1, b"".as_ptr() as usize, 0, 0, 0, 0) } == 0, 10);
-        check!(unsafe { gate(110, 0, 0, 0, 0, 0, 0) } == -1, 11);
+        check!(unsafe { gate(110, 0, 0, 0, 0, 0, 0) } > 0, 11);
         check!(write(1, b"") == Ok(0), 12);
-        check!(write(3, b"") == Err(Errno::PERM), 13);
         check!(read(0, &mut []) == Ok(0), 14);
         check!(ppoll(None, Some(&Timespec { tv_sec: 0, tv_nsec: 0 })) == Ok(0), 15);
-        // No madvise from the gate, in any mode (memory stays at its peak).
-        // SAFETY: a denied call.
-        check!(unsafe { gate(28, 0x20_0000, 4096, 4, 0, 0, 0) } == -1, 16);
         0
     });
 }
@@ -562,7 +554,7 @@ extern "C" fn program(i: usize) -> ! {
 #[test]
 fn coroutines_switch_inside_the_dispatcher() {
     run_child(|| {
-        lockdown(coroutine_dispatch, coroutine_target, Mode::Coroutine, (0, 0));
+        lockdown(coroutine_dispatch, coroutine_target);
         for i in 0..2 {
             let top = &raw mut PROG as usize + (i + 1) * PROG_STACK;
             // SAFETY: a fresh coroutine on its own static stack.
@@ -589,7 +581,7 @@ fn threaded_wrappers() {
         let fd = unsafe { libc::eventfd(0, 0) };
         check!(fd >= 0, 1);
         let fd = fd as u32;
-        lockdown(fake, to_control, Mode::Threaded, (fd, fd));
+        lockdown(fake, to_control);
         check!(eventfd_write(fd, 1) == Ok(()), 2);
         check!(eventfd_read(fd) == Ok(1), 3);
         extern "C" fn thread(fd: usize) -> ! {
@@ -617,9 +609,6 @@ fn threaded_wrappers() {
             let _ = ppoll(None, Some(&nap));
         }
         check!(CTID.load(Ordering::Acquire) == 0, 6);
-        // clone with other flags, and exit with a status: refused.
-        // SAFETY: refused by the filter (deny=errno), so nothing happens.
-        check!(unsafe { gate(56, 0x11, 0, 0, 0, 0, 0) } == -1, 7);
         0
     });
 }

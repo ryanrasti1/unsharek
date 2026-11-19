@@ -46,7 +46,6 @@ use rustix::io::Errno;
 use crate::arena::{self, Arena, Backing, Extent, FileMap};
 use crate::context::{self, JmpBuf, ProgramCall, Registers};
 use crate::exec::{self, Files, Scratch, StackParams};
-use crate::filter::{self, Deny, Params, Policy, Program as Filter};
 use crate::futex::{self, Futexes};
 use crate::host::{self, SysHost};
 use crate::memblk;
@@ -103,7 +102,6 @@ static ZONE_RW: Local<[(usize, usize); ZONE_RW_CAP]> = Local::new([(0, 0); ZONE_
 const ZONE_RW_CAP: usize = 16 << 10;
 static ARENA: Local<Option<Arena<'static>>> = Local::new(None);
 static SCRATCH: Local<Scratch> = Local::new(Scratch::new());
-static FILTER: Local<Filter> = Local::new(Filter::new());
 /// The root's alternate signal stack, where SIGSYS lands before the entry moves the frame.
 static ALTSTACK: Local<[u8; trap::ALTSTACK_SIZE]> = Local::new([0; trap::ALTSTACK_SIZE]);
 
@@ -330,22 +328,18 @@ pub unsafe fn boot(b: Boot) -> Result<(), Error> {
     Ok(())
 }
 
-/// Install the routing-only filter (`filter::Policy::RouteOnly`) on the calling thread (and the
-/// threads it makes from now on): from now on every syscall of its not from the gate traps, and
-/// is served by the guest in the setup phase ([`intercept_begin`]) or re-issued on the host
-/// otherwise (`passthrough`). Once; the phase becomes [`Phase::Passthrough`].
+/// Install the routing filter (`route`) on the calling thread (and the threads it makes from now
+/// on): from now on every syscall of its not from the gate traps, and is served by the guest in
+/// the setup phase ([`intercept_begin`]) or re-issued on the host otherwise (`passthrough`). Once;
+/// the phase becomes [`Phase::Passthrough`].
 pub fn route() -> Result<(), Error> {
     if S.routed.get() {
         return Ok(());
     }
-    let p = Params { policy: Policy::RouteOnly, deny: Deny::Kill, gate_ip: trap::gate_ip(), token_fds: (0, 0), pid: 0, extra: &[] };
-    // SAFETY: the static program, used only here and in `lock`, one at a time.
-    let prog = unsafe { FILTER.get() };
-    filter::compile(&p, prog).map_err(|_| Error { what: "the routing filter", errno: Errno::INVAL })?;
     // The calling thread only, in every mode: other host threads of the process stay unrouted
-    // until the mode's filter is synced to them at lockdown (the kernel idler makes only gate
+    // until the security filter is synced to them at lockdown (the kernel idler makes only gate
     // calls). Routed with TSYNC, another thread's calls would have trapped during setup.
-    filter::install(prog, 0).map_err(err("installing the routing filter"))?;
+    crate::route::install().map_err(err("installing the routing filter"))?;
     S.routed.set(true);
     S.phase.set(Phase::Passthrough);
     Ok(())
@@ -1357,7 +1351,7 @@ fn die(sig: i32) -> ! {
             // SAFETY: a signal to this process, whose default action ends it: in coroutine mode at
             // this call's return; in threaded mode on the thread the kernel picks, which ends the
             // rest (the wait below, until then).
-            unsafe { trap::gate(filter::NR_KILL as usize, S.host_pid.get() as usize, sig as usize, 0, 0, 0, 0) };
+            unsafe { trap::gate(trap::NR_KILL as usize, S.host_pid.get() as usize, sig as usize, 0, 0, 0, 0) };
             let _ = trap::ppoll(None, Some(&xabi::Timespec { tv_sec: 1, tv_nsec: 0 }));
         }
     }
@@ -1398,7 +1392,7 @@ pub fn runtime_panic(info: &dyn core::fmt::Display) -> ! {
     // processes see its pidfd), with the default action (as `die`). Then the exit, if the signal
     // didn't end it (every thread blocking it, or the filter's `--deny=errno`).
     // SAFETY: a signal to the sandbox's process; nothing after it needs the runtime's state.
-    unsafe { trap::gate(filter::NR_KILL as usize, S.host_pid.get() as usize, SIGABRT as usize, 0, 0, 0, 0) };
+    unsafe { trap::gate(trap::NR_KILL as usize, S.host_pid.get() as usize, SIGABRT as usize, 0, 0, 0, 0) };
     if !par::forked() {
         let _ = trap::ppoll(None, Some(&xabi::Timespec { tv_sec: 1, tv_nsec: 0 }));
     }

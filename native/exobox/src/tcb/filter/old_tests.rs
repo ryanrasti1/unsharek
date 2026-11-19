@@ -550,12 +550,12 @@ fn installs_in_the_kernel() {
 /// Through `trap::gate`, which `install` itself uses, so the second install passes the first filter.
 #[test]
 fn stacked_filters_in_the_kernel() {
-    let gate_ip = crate::trap::gate_ip();
+    let gate_ip = exobox_rt::trap::gate_ip();
     let params = |policy| Params { policy, deny: Deny::Errno, gate_ip, token_fds: TOKENS, pid: PID, extra: &[] };
     let (mut route, mut mode) = (Program::new(), Program::new());
     compile(&params(Policy::RouteOnly), &mut route).unwrap();
     compile(&params(Policy::Mode(Mode::Coroutine)), &mut mode).unwrap();
-    let g = |nr: u32, a0: usize| unsafe { crate::trap::gate(nr as usize, a0, b"".as_ptr() as usize, 0, 0, 0, 0) };
+    let g = |nr: u32, a0: usize| unsafe { exobox_rt::trap::gate(nr as usize, a0, b"".as_ptr() as usize, 0, 0, 0, 0) };
     // SAFETY: the child only calls install and the gate, then exits through the gate.
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0);

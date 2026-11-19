@@ -509,12 +509,13 @@ pub fn install_insns(insns: &[SockFilter], flags: u32) -> Result<(), rustix::io:
     // Unprivileged seccomp requires no_new_privs (and it's right regardless: no setuid gains).
     // prctl(PR_SET_NO_NEW_PRIVS = 38, 1).
     // SAFETY: sets a flag of the process.
-    check(unsafe { crate::trap::gate(NR_PRCTL, 38, 1, 0, 0, 0, 0) })?;
+    check(unsafe { exobox_rt::trap::gate(NR_PRCTL, 38, 1, 0, 0, 0, 0) })?;
     let fprog = SockFprog { len: insns.len() as u16, filter: insns.as_ptr() };
     // SECCOMP_SET_MODE_FILTER = 1 (include/uapi/linux/seccomp.h).
     // SAFETY: seccomp reads `fprog` and the instructions it points to, both live for the call.
-    check(unsafe { crate::trap::gate(NR_SECCOMP, 1, flags as usize, &fprog as *const SockFprog as usize, 0, 0, 0) })
+    check(unsafe { exobox_rt::trap::gate(NR_SECCOMP, 1, flags as usize, &fprog as *const SockFprog as usize, 0, 0, 0) })
 }
 
 #[cfg(test)]
+#[path = "old_tests.rs"]
 mod tests;

@@ -12,7 +12,7 @@
 //! - **No unwinding.** The crate is built `panic=abort` into the binary; a panic is a bug that
 //!   ends the sandbox.
 //! - **Host syscalls through the gate after lockdown** (`trap::gate` and its typed wrappers), and
-//!   only those the filter (`filter`) allows from it. rustix's raw Linux backend (or the gate) is
+//!   only those the security filter allows from it (exobox's TCB: this crate knows nothing of it). rustix's raw Linux backend (or the gate) is
 //!   for setup before lockdown: rustix's own `syscall` instructions are not the gate, so after
 //!   lockdown they trap.
 #![cfg_attr(not(test), no_std)]
@@ -24,13 +24,13 @@ pub mod context;
 pub mod dns;
 pub mod exec;
 pub mod executor;
-pub mod filter;
 pub mod futex;
 pub mod guest;
 pub mod host;
 pub mod memblk;
 pub mod par;
 pub mod passthrough;
+pub mod route;
 pub mod sched;
 pub mod share;
 pub mod sync;

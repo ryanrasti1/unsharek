@@ -33,11 +33,12 @@ pub mod alloc;
 pub mod net;
 pub mod setup;
 pub mod store;
+mod tcb;
 
 pub use net::{Cx, GuestSocket, HeldFd, NetError, OnConnect, OnListen, OnResolve};
 
 /// One classic-BPF instruction (`struct sock_filter`), for [`Builder::restrict`].
-pub use exobox_rt::filter::SockFilter;
+pub use tcb::filter::old::SockFilter;
 /// The auxiliary-vector tag under which a sandboxed program finds the gate's address (what the
 /// escape tests call, as a compromised program that found the gate would).
 pub use exobox_rt::exec::AT_EXOBOX_GATE;
@@ -51,7 +52,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use exobox_rt::{filter, guest, sched};
+use exobox_rt::{guest, sched};
+use tcb::filter::old as filter;
 
 /// How the sandbox runs the program's threads and processes. Each mode's host allowlist is a
 /// superset of the one before.
