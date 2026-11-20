@@ -44,6 +44,8 @@ stats = ["unsharek-rt/stats"]
 # build.rs: the binary's fixed-address link (the C compiler's PIE start files)
 [build-dependencies]
 unsharek-build = { path = "../unsharek-build" }
+# src/pty_init.c, the guest's init on a terminal (src/pty.rs)
+cc.workspace = true
 
 [dev-dependencies]
 unsharek-fixtures = { path = "../unsharek-fixtures" }

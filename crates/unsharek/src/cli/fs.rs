@@ -26,14 +26,31 @@ pub const SYSTEM: &[&str] = &["/nix/store", "/run/current-system", "/etc", "/bin
 pub fn resolve(prog: &std::ffi::OsStr) -> std::io::Result<PathBuf> {
     let p = Path::new(prog);
     if p.components().count() > 1 || p.is_absolute() {
-        return std::fs::canonicalize(p);
+        return follow(p);
     }
     let path = std::env::var_os("PATH").unwrap_or_default();
     std::env::split_paths(&path)
         .map(|d| d.join(p))
         .find(|c| c.is_file())
-        .map(std::fs::canonicalize)
+        .map(|c| follow(&c))
         .unwrap_or_else(|| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "not found on PATH")))
+}
+
+/// `p`'s symlinks followed while each keeps its name: a profile's `bin/true` to the store's, but
+/// not on to `coreutils`, a multi-call program that tells what to be by the name it was run by.
+fn follow(p: &Path) -> std::io::Result<PathBuf> {
+    let mut p = std::path::absolute(p)?;
+    for _ in 0..40 {
+        let Ok(t) = std::fs::read_link(&p) else { break };
+        let next = p.parent().unwrap_or(Path::new("/")).join(t);
+        if next.file_name() != p.file_name() {
+            break;
+        }
+        p = next;
+    }
+    // The directories' symlinks too (`/run/current-system`), the name kept.
+    let dir = std::fs::canonicalize(p.parent().unwrap_or(Path::new("/")))?;
+    Ok(dir.join(p.file_name().unwrap_or_default()))
 }
 
 impl std::str::FromStr for Arg {

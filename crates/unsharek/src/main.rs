@@ -7,6 +7,8 @@ use clap::{Parser, ValueEnum};
 
 #[path = "cli/fs.rs"]
 mod fs;
+#[path = "cli/tty.rs"]
+mod tty;
 
 /// Run a program in a sandbox of its own kernel; exits with the program's status.
 #[derive(Parser)]
@@ -68,6 +70,9 @@ fn main() -> ExitCode {
             return ExitCode::from(127);
         }
     }
+    // An interactive terminal (cli/tty.rs): fork mode, stdin a terminal. This process becomes the
+    // terminal's supervisor, outside the sandbox; its child goes on.
+    let tty = if matches!(mode, Mode::Fork) && tty::is_tty() { Some(tty::supervise()) } else { None };
     // Plugin: host directories, live (cli/fs.rs).
     let (live, images_ro): (Vec<fs::Arg>, Vec<fs::Arg>) = ro.into_iter().partition(|a| a.live || fs::live(&a.host));
     let host_dirs = match fs::spawn(&live, &rw) {
@@ -100,6 +105,7 @@ fn main() -> ExitCode {
         env,
         image_cache: None,
         host_dirs,
+        tty,
     };
     let Err(e) = unsharek::run(config);
     eprintln!("unsharek: {e}");
