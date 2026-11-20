@@ -1,7 +1,7 @@
 //! Plugin (experimental): the network through a provider process ([`unsharek_net`]). Everything
 //! the plugin does on the sandbox's side is here, in one place: [`spawn`] forks the provider
 //! before the guest boots; [`install`] holds the control socket and sets the hooks, which call the
-//! provider over it; [`grant`] is lockdown's part (the control socket as `recv_fds`).
+//! provider over it. The CLI's cli/net.rs grants the control socket at lockdown (`recv_fds`).
 //!
 //! The hooks run on the sandbox's executor, as every hook does, and decide nothing: `connect` and
 //! `listen` ask the provider, whose policy holds, and the socket it passes in becomes the stream
@@ -105,12 +105,6 @@ pub fn install(g: &mut Guest, ctl: OwnedFd, dials: bool) -> Result<RawFd, Error>
         }
     }));
     Ok(fd)
-}
-
-/// Lockdown's part: the control socket, kept, the one fd `recvmsg` may read (unsharek-tcb's
-/// `Config::recv_fds`).
-pub fn grant(s: &mut unsharek_tcb::Config, ctl: RawFd) {
-    s.recv_fds = Some(ctl);
 }
 
 fn net_error(r: Rejection) -> NetError {

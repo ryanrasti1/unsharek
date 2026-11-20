@@ -859,7 +859,7 @@ pub struct Config {
 
 /// A host directory served to the guest by a server on the other end of `fd` (a unix stream:
 /// unsharek-fs's `wire`), mounted at `at`. The fd is the caller's, open until the program ends
-/// (granted at lockdown).
+/// (the caller grants it: [`run_with`]'s `grants`).
 #[derive(Clone, Debug)]
 pub struct HostDir {
     pub fd: RawFd,
@@ -891,6 +891,17 @@ pub fn stdio(s: &mut tcb::Config) -> tcb::Result<()> {
 /// granted (fds 0-2), [`Locked::exec`]. Returns only on failure before
 /// the program starts; the process ends with the program's status.
 pub fn run(config: Config) -> Result<Infallible, Error> {
+    run_with(config, |_| Ok(()), |_| {})
+}
+
+/// [`run`], with the caller's two additions: `prepare`, on the booted guest before setup (hooks,
+/// held fds: a plugin's), and `grants`, inside lockdown's, after stdio's (the fds `config`'s
+/// host directories use, a plugin's control socket). Nothing here knows a plugin.
+pub fn run_with(
+    config: Config,
+    prepare: impl FnOnce(&mut Guest) -> Result<(), Error>,
+    grants: impl FnOnce(&mut tcb::Config),
+) -> Result<Infallible, Error> {
     let store = store(&config)?;
     let mut g = Guest::boot(GuestConfig { mode: config.mode, max_procs: config.max_procs.unwrap_or(0), ..Default::default() })?;
     let mut mounts = g.map_store(&store)?;
@@ -906,6 +917,7 @@ pub fn run(config: Config) -> Result<Infallible, Error> {
     for (i, d) in config.host_dirs.iter().enumerate() {
         hostfs::add(&format!("host{i}"), d.fd).map_err(Error::io("a host directory's device"))?;
     }
+    prepare(&mut g)?;
     let dirs: Vec<PathBuf> = config.host_dirs.iter().map(|d| d.at.clone()).collect();
     g.run(|| -> std::io::Result<()> {
         setup::mount_closure(&mounts)?;
@@ -914,12 +926,9 @@ pub fn run(config: Config) -> Result<Infallible, Error> {
         }
         Ok(())
     })??;
-    let fds: Vec<RawFd> = config.host_dirs.iter().map(|d| d.fd).collect();
     let locked = g.lockdown(|s| {
         stdio(s)?;
-        for &fd in &fds {
-            s.grant(fd);
-        }
+        grants(s);
         Ok(())
     })?;
     locked.exec(&argv, &config.env)
