@@ -1,5 +1,5 @@
 //! The host-side regression suite: one table of cases (`cases()`), each a program run natively
-//! (which checks the test itself) and under `unsharek run` in every mode it names, and checked from
+//! (which checks the test itself) and under `unsharek` in every mode it names, and checked from
 //! the host: its exit status or signal, its stdio (input given, output read late), its CPU time,
 //! files on the host, the CLI's flags, programs from nixpkgs. A run is a trial named
 //! `<case>::<native|coroutine|threaded|fork>`, with a timeout and an optional CPU budget, so
@@ -99,7 +99,7 @@ struct Case {
     flags: Vec<&'static str>,
     env: Vec<(&'static str, &'static str)>,
     /// Programs from nixpkgs the case runs besides its own (devshell variables naming them): their
-    /// store paths are allowed (`--allow-path`), closures and all.
+    /// store paths are allowed (`--ro`), closures and all.
     uses: Vec<&'static str>,
     stdin: Option<&'static str>,
     /// Stdin a pipe held open and silent for the whole run (a reader blocks on it).
@@ -157,6 +157,12 @@ impl Case {
     }
     fn uses(mut self, vars: &[&'static str]) -> Self {
         self.uses = vars.to_vec();
+        self
+    }
+    /// More the sandbox's stdout must have, and must not.
+    fn expect_also(mut self, has: &[&'static str], hasnt: &[&'static str]) -> Self {
+        self.sandbox.stdout.extend(has);
+        self.sandbox.not_stdout.extend(hasnt);
         self
     }
     fn renamed(mut self, name: &'static str) -> Self {
@@ -380,6 +386,13 @@ fn cases() -> Vec<Case> {
                 ])
                 .uses(&["UNSHAREK_TEST_CARGO", "UNSHAREK_TEST_RUSTC", "UNSHAREK_TEST_GCC", "UNSHAREK_TEST_COREUTILS"])
         },
+        // The CLI's environment is empty by default: the run's own variables reach the program only
+        // when kept (the suite keeps its UNSHAREK_TEST_* ones), `--setenv`'s do, and one the host
+        // sets but nobody keeps doesn't. Before, the program got all of the host's.
+        fixture("env_dump", ALL)
+            .flags(&["--setenv", "SET_BY_FLAG=1"])
+            .native(None)
+            .expect_also(&["SET_BY_FLAG=1", "UNSHAREK_TEST_MODE="], &["UNSHAREK_TEST_HOST_ONLY"]),
         fixture("forkbomb", FORK).flags(&["--max-procs=16"]).env(&[("UNSHAREK_TEST_MAX_PROCS", "16")]).native(None),
         Case {
             timeout: Duration::from_secs(15),
@@ -625,13 +638,20 @@ fn run(c: &Case, mode: Mode, secret: &PathBuf) -> Result<(), Failed> {
         Command::new(&prog)
     } else {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_unsharek"));
-        cmd.args(["run", "--mode", mode.name(), "--allow-path"]).arg(fx::bin_dir());
+        cmd.args(["--mode", mode.name(), "--ro"]).arg(fx::bin_dir());
         for var in &c.uses {
             let Some(p) = env::var_os(var) else { return Err(format!("{var} unset: run in the devshell (./test)").into()) };
             let p = PathBuf::from(p);
             // Its store path (`/nix/store/<hash>-<name>`), which brings its closure.
             let store = p.ancestors().find(|a| a.parent() == Some(std::path::Path::new("/nix/store"))).unwrap_or(&p);
-            cmd.arg("--allow-path").arg(store);
+            cmd.arg("--ro").arg(store);
+        }
+        // The environment is empty but for what's kept: the variables this run sets below, the
+        // programs the case uses (its scripts name them: `$UNSHAREK_TEST_GCC`), and the
+        // devshell's PATH and HOME (programs that run others, like cargo and bash, need them).
+        let fixed = ["UNSHAREK_TEST_MODE", "UNSHAREK_TEST_SECRET", "UNSHAREK_TEST_TARGET", "PATH", "HOME"];
+        for k in fixed.into_iter().chain(c.env.iter().map(|e| e.0)).chain(c.uses.iter().copied()) {
+            cmd.arg("--keep-env").arg(k);
         }
         cmd.args(&c.flags).arg("--").arg(&prog);
         cmd
@@ -640,6 +660,8 @@ fn run(c: &Case, mode: Mode, secret: &PathBuf) -> Result<(), Failed> {
         .env("UNSHAREK_TEST_MODE", mode.name())
         .env("UNSHAREK_TEST_SECRET", secret)
         .env("UNSHAREK_TEST_TARGET", std::process::id().to_string())
+        // set for every run and kept for none: a sandboxed program never sees it (env_dump)
+        .env("UNSHAREK_TEST_HOST_ONLY", "1")
         .envs(c.env.iter().copied())
         .stdin(if c.stdin.is_some() || c.hold_stdin { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())

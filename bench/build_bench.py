@@ -91,9 +91,9 @@ def run(cmd, timeout, env=None, cwd=None, cpus=None, perf=None):
 
 
 def sandboxed(unsharek, mode, allow, argv, max_procs=None):
-    cmd = [unsharek, 'run', '--mode', mode]
+    cmd = [unsharek, '--mode', mode, '--keep-env', 'PATH', '--keep-env', 'HOME']
     for a in allow:
-        cmd += ['--allow-path', a]
+        cmd += ['--ro', a]
     if max_procs:
         cmd += ['--max-procs', str(max_procs)]
     return cmd + ['--'] + argv

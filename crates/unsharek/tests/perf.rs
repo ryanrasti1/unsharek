@@ -78,14 +78,15 @@ fn main() {
     libtest_mimic::run(&args, trials).exit();
 }
 
-/// `unsharek run` in `mode`, the fixtures and `extra` allowed (a store path brings its closure).
+/// `unsharek` in `mode`, the fixtures and `extra` allowed (a store path brings its closure).
 fn sandboxed(mode: Mode, prog: &Path, extra: &[PathBuf]) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_unsharek"));
-    cmd.args(["run", "--mode", mode.name(), "--allow-path"]).arg(fx::bin_dir());
+    cmd.args(["--mode", mode.name(), "--ro"]).arg(fx::bin_dir());
     for p in extra {
-        cmd.arg("--allow-path").arg(p);
+        cmd.arg("--ro").arg(p);
     }
-    cmd.arg("--").arg(prog);
+    // The environment is empty but for these: the workloads' PATH, as each caller sets it.
+    cmd.args(["--keep-env", "PATH", "--keep-env", "HOME", "--"]).arg(prog);
     cmd
 }
 

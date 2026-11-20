@@ -3,7 +3,7 @@
 //! cached on disk. Runs on the host before lockdown, so std is fine here.
 //!
 //! Two steps, separately usable:
-//! - [`closure`]: which store paths and host directories, from the program and `--allow-path`s.
+//! - [`closure`]: which store paths and host directories, from the program and `--ro`s.
 //!   Nix's own tooling (`nix-store --query --requisites`) computes store closures; for files
 //!   outside the store, references are found the way Nix finds them, by scanning bytes for store
 //!   paths. [`Cache::closure`] is the same with both cached: a store path's closure is immutable

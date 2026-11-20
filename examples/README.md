@@ -29,7 +29,7 @@ Two things hold in all of them:
 
 ## nix-program: a Nix program and its closure
 
-`unsharek run` spelled out with the library: the program's closure from the image cache
+`unsharek` spelled out with the library: the program's closure from the image cache
 (`store::Cache::open_default`, `store`), `Guest::boot`, each image mapped (`map_store`;
 `map_closure` is both steps), `setup::mount_closure` in a setup closure, then lockdown and exec. The parent
 measures the sandbox from outside. Arguments are the program to run (default:

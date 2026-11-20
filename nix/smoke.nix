@@ -43,7 +43,7 @@ pkgs.runCommand "unsharek-smoke"
     check() {
       local name=$1 mode=$2 want=$3; shift 4
       local t0=$EPOCHREALTIME out st=0
-      out=$(timeout 60 unsharek run --mode "$mode" --allow-path "$COREUTILS" --allow-path "''${HTTPBIN%/bin/*}" \
+      out=$(timeout 60 unsharek --mode "$mode" --ro "$COREUTILS" --ro "''${HTTPBIN%/bin/*}" --keep-env PATH --keep-env COREUTILS \
         -- "$@" 2>"$TMPDIR/err" <<<"''${IN:-}") || st=$?
       local ms=$(( (''${EPOCHREALTIME/./} - ''${t0/./}) / 1000 ))
       if [[ $st == 0 && $out == *"$want"* ]]; then

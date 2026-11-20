@@ -33,7 +33,7 @@
 - What the host sees of a run (its exit status or signal, its stdin and a slow reader of its
   stdout, its host CPU time, files on the host, the CLI's flags, programs from nixpkgs) is a case
   in `cases()` of `crates/unsharek/tests/suite.rs`: a program in `crates/unsharek-fixtures/c/` run by
-  `unsharek run`. The library's API (hooks, held and passed fds, setup closures, templates) is
+  `unsharek`. The library's API (hooks, held and passed fds, setup closures, templates) is
   `crates/unsharek/tests/{guest,net}.rs`'.
 - A bug found gets a regression test first, in whichever of these fits; its comment says what
   broke and where. A known bug's test that fails is `#[ignore = "<why>"]` in the modes it fails

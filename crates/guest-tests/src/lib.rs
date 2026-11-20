@@ -1,7 +1,7 @@
 //! The in-guest tests: what a program observes inside the sandbox. Each test is an ordinary
 //! function here; the test targets (tests/guest_*.rs) each expand [`all!`] into `#[test]`s calling
 //! them, and nextest runs each test as its own process: natively (guest_native, which checks the
-//! test itself: it must pass on Linux) or under `unsharek run --mode M` (crates/guest-tests/
+//! test itself: it must pass on Linux) or under `unsharek --mode M` (crates/guest-tests/
 //! run-in-guest, nextest's run-wrapper), so every test gets a sandbox of its own. What the host
 //! sees of a run (its exit status, its CPU time, its stdio, the host's files) is
 //! crates/unsharek/tests/suite.rs's.

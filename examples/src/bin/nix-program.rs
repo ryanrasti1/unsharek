@@ -1,5 +1,5 @@
 //! Run a nixpkgs program in a sandbox, with its Nix closure, from the library: the CLI's
-//! `unsharek run` spelled out. The parent measures the sandbox from outside: startup, wall time,
+//! `unsharek` spelled out. The parent measures the sandbox from outside: startup, wall time,
 //! memory.
 //!
 //!     cargo run -p unsharek-examples --bin nix-program                       # python -c 'print(6*7)'
