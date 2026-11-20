@@ -99,6 +99,7 @@ fn child(layer: &str, name: &str) -> ! {
         "setup" => setup_closures(m, name),
         "entries" => entries(m),
         "template" => template(m),
+        "hostdir_live" => hostdir_live(m),
         "run_fn" => run_fn(m, name),
         _ => {
             let mut g = boot(m);
@@ -118,6 +119,34 @@ fn child(layer: &str, name: &str) -> ! {
     };
     eprintln!("unsharek: {e}");
     std::process::exit(125)
+}
+
+/// A host directory served live (unsharek-fs-server, through `hostfs`): a change the host makes
+/// between two setup closures is what the guest reads in the second (the store's images are
+/// snapshots; this is the host's file, as of now).
+fn hostdir_live(m: Mode) -> unsharek::Error {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("f"), "before").unwrap();
+    let fd = unsharek_fs_server::spawn(&unsharek_fs_server::Dir { host: dir.path().into(), writable: false, ..Default::default() }).unwrap();
+    let mut g = boot(m);
+    unsharek::hostfs::add("live", std::os::fd::AsRawFd::as_raw_fd(&fd)).unwrap();
+    let at = dir.path().to_owned();
+    let read = |g: &mut Guest| g.run(|| std::fs::read_to_string(at.join("f")).unwrap()).unwrap();
+    let a = dir.path().to_owned();
+    g.run(|| unsharek::hostfs::mount("live", &a).unwrap()).unwrap();
+    check("the guest reads the host's file", read(&mut g) == "before");
+    std::fs::write(dir.path().join("f"), "after, longer").unwrap();
+    check("then the host's change", read(&mut g) == "after, longer");
+    // Names are cached for a second (the server's entry timeout), of the guest's time: the wait is
+    // the guest's (its clock runs while it does).
+    std::fs::remove_file(dir.path().join("f")).unwrap();
+    let gone = g.run(|| {
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        !at.join("f").exists()
+    });
+    check("and its removal, a second later", gone.unwrap());
+    println!("HOSTDIR_LIVE_OK");
+    std::process::exit(0)
 }
 
 /// Setup closures and the host code around them, then `name` (creds) run as uid 1000 on host
@@ -444,6 +473,13 @@ fn main() {
         }),
     ];
     for mode in ["coroutine", "threaded", "fork"] {
+        trials.push(Trial::test(format!("hostdir_live::{mode}"), move || {
+            let (st, out, err) = run("hostdir_live", "hello", mode, &[])?;
+            if st.code() != Some(0) || !out.contains("HOSTDIR_LIVE_OK") || out.contains("FAIL") {
+                return fail(st, &out, &err, "wanted the host's changes seen");
+            }
+            Ok(())
+        }));
         trials.push(Trial::test(format!("run_fn::{mode}"), move || {
             let (st, out, err) = run("run_fn", "ok", mode, &[])?;
             if st.code() != Some(42) || out.contains("FAIL") || out.matches(": ok").count() != 6 {

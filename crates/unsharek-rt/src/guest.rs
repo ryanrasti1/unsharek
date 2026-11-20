@@ -2116,12 +2116,3 @@ fn futex_call(a: [usize; 6]) -> isize {
         }
     }
 }
-
-/// Run `f` with the boot thread's own syscalls the host's, inside a setup too (the selector let
-/// go for the call): a host-backed device's backend (unsharek-fs) is host code called from the
-/// guest's kernel. Before lockdown only: after it the filter has the last word.
-pub fn host_calls(f: &mut dyn FnMut()) {
-    let prev = SELECTOR.swap(trap::SUD_ALLOW, core::sync::atomic::Ordering::SeqCst);
-    f();
-    SELECTOR.store(prev, core::sync::atomic::Ordering::SeqCst);
-}

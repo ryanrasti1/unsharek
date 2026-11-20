@@ -1248,6 +1248,12 @@ mod tests {
     }
 }
 
+/// The virtio-fs devices' state (unsharek-fs): fork mode's processes share it, so it is here, in
+/// the shared section with the runtime's other shared statics (which precede the kernel's in the
+/// link: the section starts and ends on a page).
+#[unsafe(link_section = "unsharek_shared")]
+pub static FS_DEVICES: unsharek_fs::Devices = unsharek_fs::Devices::new();
+
 /// A host-backed MMIO device's register accesses (LKL's `ioremap` and `iomem_access` host ops):
 /// set before the device is added (unsharek-fs's virtio-fs). LKL reads the table at each call.
 pub fn set_iomem(
@@ -1271,4 +1277,57 @@ pub fn free_irq() -> i32 {
 pub fn trigger_irq(irq: u32) {
     // SAFETY: a line from free_irq.
     unsafe { lkl_sys::lkl_trigger_irq(irq as c_int) };
+}
+
+/// A host-backed device's round trip with its server (unsharek-fs's virtio-fs: `wire`'s framing,
+/// a `u32` length then the bytes, each way): `request` written to `fd`, the reply read into
+/// `reply` (a larger reply is read, dropped, and EIO). Through the gate (read and write on a granted fd: the filter's rows), and blocking:
+/// the guest's CPU waits for the server, as for a disk with no queue. EINTR (a host signal, fork
+/// mode's SIGCHLD) is retried; the server's end (EOF) is EIO.
+pub fn device_rpc(fd: i32, request: &[u8], reply: &mut [u8]) -> Result<usize, i32> {
+    use rustix::io::Errno;
+    let eio = Errno::IO.raw_os_error();
+    let write_all = |mut b: &[u8]| -> Result<(), i32> {
+        while !b.is_empty() {
+            match crate::trap::write(fd as u32, b) {
+                Ok(0) => return Err(eio),
+                Ok(k) => b = &b[k..],
+                Err(Errno::INTR) => {}
+                Err(e) => return Err(e.raw_os_error()),
+            }
+        }
+        Ok(())
+    };
+    let read_exact = |b: &mut [u8]| -> Result<(), i32> {
+        let mut got = 0;
+        while got < b.len() {
+            match crate::trap::read(fd as u32, &mut b[got..]) {
+                Ok(0) => return Err(eio),
+                Ok(k) => got += k,
+                Err(Errno::INTR) => {}
+                Err(e) => return Err(e.raw_os_error()),
+            }
+        }
+        Ok(())
+    };
+    write_all(&(request.len() as u32).to_le_bytes())?;
+    write_all(request)?;
+    let mut h = [0u8; 4];
+    read_exact(&mut h)?;
+    let n = u32::from_le_bytes(h) as usize;
+    if n > reply.len() {
+        // Read and dropped, so the next round trip starts at a header.
+        let mut left = n;
+        while left > 0 {
+            let k = left.min(reply.len());
+            if k == 0 {
+                return Err(eio);
+            }
+            read_exact(&mut reply[..k])?;
+            left -= k;
+        }
+        return Err(eio);
+    }
+    read_exact(&mut reply[..n])?;
+    Ok(n)
 }

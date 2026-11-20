@@ -99,10 +99,10 @@ pub struct Closure {
 /// Paths that don't exist are errors, as is a store path that Nix doesn't know. Relative paths
 /// are from the current directory. Needs `nix-store` on `PATH` (one query for all roots).
 pub fn closure(program: &Path, allow_paths: &[PathBuf]) -> Result<Closure> {
-    closure_in(program, allow_paths, None)
+    closure_in(program, allow_paths, &[], None)
 }
 
-fn closure_in(program: &Path, allow_paths: &[PathBuf], cache: Option<&Cache>) -> Result<Closure> {
+fn closure_in(program: &Path, allow_paths: &[PathBuf], live: &[PathBuf], cache: Option<&Cache>) -> Result<Closure> {
     let mut roots = BTreeSet::new();
     let mut host = BTreeSet::new();
     for path in allow_paths {
@@ -121,18 +121,27 @@ fn closure_in(program: &Path, allow_paths: &[PathBuf], cache: Option<&Cache>) ->
     // An allowed directory inside another is already in the outer one's image.
     let outer: BTreeSet<PathBuf> =
         host.iter().filter(|d| !host.iter().any(|o| o != *d && d.starts_with(o))).cloned().collect();
+    // A directory served live (virtiofs: the CLI's `--ro DIR`, `--rw DIR`) isn't imaged; one the
+    // program is in is still scanned for its references, so its libraries are in the closure (a
+    // program built against the store). Others aren't: a big tree's walk at every run, for
+    // nothing the program needs.
+    let mut scan: Vec<PathBuf> = outer.iter().cloned().collect();
     match locate(program)? {
         Place::Store(p) => {
             roots.insert(p);
         }
         Place::Host(p) => {
             if !outer.iter().any(|d| p.starts_with(d)) {
-                return Err(Error::ProgramNotAllowed(p));
+                let canon: Vec<PathBuf> = live.iter().filter_map(|d| fs::canonicalize(d).ok()).collect();
+                match canon.into_iter().find(|d| p.starts_with(d)) {
+                    Some(d) => scan.push(d),
+                    None => return Err(Error::ProgramNotAllowed(p)),
+                }
             }
         }
     }
     let mut refs = BTreeMap::new();
-    for dir in &outer {
+    for dir in &scan {
         match cache {
             Some(c) => merge(&mut refs, c.host_refs(dir)?),
             None => scan_tree(dir, &mut refs)?,
@@ -382,7 +391,13 @@ impl Cache {
     /// `program`'s closure (plus `allow_paths`, each with its own) as images: [`Cache::closure`]
     /// then [`Cache::images`], each built where the cache lacks it.
     pub fn store(&self, program: &Path, allow_paths: &[PathBuf]) -> Result<Store> {
-        self.images(&self.closure(program, allow_paths)?)
+        self.store_live(program, allow_paths, &[])
+    }
+
+    /// [`Cache::store`], with host directories served live (`live`: not imaged) besides: the
+    /// program may be in one.
+    pub fn store_live(&self, program: &Path, allow_paths: &[PathBuf], live: &[PathBuf]) -> Result<Store> {
+        self.images(&closure_in(program, allow_paths, live, Some(self))?)
     }
 
     /// How many images this `Cache` has built (rather than found).
@@ -395,7 +410,7 @@ impl Cache {
     /// references (keyed by its tree, as its image; resolved again on every call, since a store
     /// path it mentions may have appeared since).
     pub fn closure(&self, program: &Path, allow_paths: &[PathBuf]) -> Result<Closure> {
-        closure_in(program, allow_paths, Some(self))
+        closure_in(program, allow_paths, &[], Some(self))
     }
 
     fn requisites(&self, roots: &BTreeSet<PathBuf>) -> Result<BTreeSet<PathBuf>> {

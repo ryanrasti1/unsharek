@@ -8,6 +8,8 @@ license.workspace = true
 publish = false
 
 [dependencies]
+# The virtio-fs device's state, a static of the shared section (host.rs's FS_DEVICES)
+unsharek-fs = { path = "../unsharek-fs" }
 # thread: prctl(PR_SET_NO_NEW_PRIVS) before installing the filter; mm: mprotect for the
 # coroutine stacks' guard pages (sched); time: the clocks (vDSO), event: ppoll as the idle wait
 # (host)

@@ -1,16 +1,7 @@
 [package]
 name = "unsharek-fs"
 version = "0.0.0"
-description = "Host directories for the guest: a virtio-fs device whose FUSE requests a pluggable backend answers"
+description = "Host directories for the guest: a virtio-fs device whose FUSE requests go to a server over a socket"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-
-[features]
-default = ["passthrough"]
-# The backend that serves a host directory: virtiofsd's passthrough file system (fuse-backend-rs)
-passthrough = ["dep:fuse-backend-rs", "dep:libc"]
-
-[dependencies]
-fuse-backend-rs = { version = "0.14", default-features = false, features = ["fusedev"], optional = true }
-libc = { version = "0.2", optional = true }

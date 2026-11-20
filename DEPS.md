@@ -287,3 +287,16 @@ prove, and to test; `install` lives in unsharek-tcb's lockdown.
 |---|---|---|---|
 | seccomp-fn (path): syn 3 (`full`), quote, proc-macro2 | `compile!` | build time only | as the macro crate before |
 | seccomp-fn-verify (path) | the proof and the sampled test | unsharek-tcb (`policy!` expands only under `cfg(kani)`; `check_sampled` in its tests) | none in the binary |
+
+## Host directories (2026-11-19): unsharek-fs, unsharek-fs-server (plugin)
+`--ro DIR` and `--rw DIR`: the guest's stock virtio-fs driver (kernel config only: VIRTIO_MMIO,
+FUSE_FS, VIRTIO_FS) on unsharek-fs's device, whose FUSE requests go over a socket to
+unsharek-fs-server's process. Sizes from the release binary (x86_64-unknown-linux-gnu, symbols by
+crate): stripped 9.30 MB.
+
+| Crate | For | Where | Cost noted |
+|---|---|---|---|
+| unsharek-fs (path) | the virtio-fs device | the runtime's host side (not trusted) | ~2 KB `.text`; 2 MB of `.bss` (its request and reply buffers) |
+| fuse-backend-rs 0.14 (`fusedev`): vmm-sys-util, caps, bitflags, log, nix | virtiofsd's passthrough file system, as a library over byte buffers | the server process (plugin) | ~165 KB, plus ~105 KB of its generic code in unsharek-fs-server; caps ~11 KB |
+| landlock 0.4: enumflags2, thiserror | the server's confinement to its directory | the server process (plugin) | ~10 KB |
+| kernel: VIRTIO_MMIO, FUSE_FS, VIRTIO_FS | the guest's driver | lkl-sys's defconfig | ~180 KB |

@@ -851,6 +851,18 @@ pub struct Config {
     pub env: Vec<OsString>,
     /// Where store images are cached; None: [`store::Cache::default_dir`].
     pub image_cache: Option<PathBuf>,
+    /// Host directories served live, through virtio-fs ([`hostfs`]): each a server's socket (the
+    /// CLI's `--ro` and `--rw`, `unsharek-fs-server`), mounted at its guest path.
+    pub host_dirs: Vec<HostDir>,
+}
+
+/// A host directory served to the guest by a server on the other end of `fd` (a unix stream:
+/// unsharek-fs's `wire`), mounted at `at`. The fd is the caller's, open until the program ends
+/// (granted at lockdown).
+#[derive(Clone, Debug)]
+pub struct HostDir {
+    pub fd: RawFd,
+    pub at: PathBuf,
 }
 
 /// The images the guest mounts for `config`'s program and allowed paths, built where the cache
@@ -862,7 +874,8 @@ pub fn store(config: &Config) -> Result<store::Store, Error> {
         Some(dir) => store::Cache::new(dir),
         None => store::Cache::open_default()?,
     };
-    Ok(cache.store(Path::new(program), &config.allow_paths)?)
+    let live: Vec<PathBuf> = config.host_dirs.iter().map(|d| d.at.clone()).collect();
+    Ok(cache.store_live(Path::new(program), &config.allow_paths, &live)?)
 }
 
 /// The program's stdio granted, as the CLI does ([`run`]): fds 0-2.
@@ -889,8 +902,25 @@ pub fn run(config: Config) -> Result<Infallible, Error> {
     // The program's path as the host resolves it: the guest's working directory is `/`.
     let mut argv = config.argv.clone();
     argv[0] = std::path::absolute(&argv[0]).map_err(Error::io("the program's path"))?.into_os_string();
-    g.run(|| setup::mount_closure(&mounts))??;
-    let locked = g.lockdown(stdio)?;
+    for (i, d) in config.host_dirs.iter().enumerate() {
+        hostfs::add(&format!("host{i}"), d.fd).map_err(Error::io("a host directory's device"))?;
+    }
+    let dirs: Vec<PathBuf> = config.host_dirs.iter().map(|d| d.at.clone()).collect();
+    g.run(|| -> std::io::Result<()> {
+        setup::mount_closure(&mounts)?;
+        for (i, at) in dirs.iter().enumerate() {
+            hostfs::mount(&format!("host{i}"), at)?;
+        }
+        Ok(())
+    })??;
+    let fds: Vec<RawFd> = config.host_dirs.iter().map(|d| d.fd).collect();
+    let locked = g.lockdown(|s| {
+        stdio(s)?;
+        for &fd in &fds {
+            s.grant(fd);
+        }
+        Ok(())
+    })?;
     locked.exec(&argv, &config.env)
 }
 

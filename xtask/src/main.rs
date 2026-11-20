@@ -7,7 +7,7 @@
 //!   the suite), `-E 'binary(guest_fork)'`, `-E 'test(/^escape/)'`, `--no-fail-fast`.
 //! - `perf [nextest args]`: the performance budgets (crates/unsharek/tests/perf.rs), release.
 //! - `prove [kani args]`: Kani's proofs, each `policy!` harness (seccomp-fn's examples,
-//!   unsharek-tcb's filter, a harness per mode); minutes.
+//!   unsharek-tcb's filter, a harness per mode; the fs plugin's server filter); minutes.
 //! - `vs-native [args]`: each mode against native on build workloads (bench/quick.py).
 //!
 //! Any step's failure is the task's: its exit status is nonzero.
@@ -34,6 +34,8 @@ fn main() -> ExitCode {
         "prove" => vec![
             cargo(&["kani", "--manifest-path", "seccomp-fn/Cargo.toml", "-p", "seccomp-fn", "--tests", "-j", "--output-format=terse"], &rest),
             cargo(&["kani", "-p", "unsharek-tcb", "-j", "--output-format=terse"], &rest),
+            // The fs plugin's server filter: its policy alone, not the server (fuse-backend-rs)
+            cargo(&["kani", "-p", "unsharek-fs-server", "--no-default-features", "-j", "--output-format=terse"], &rest),
         ],
         "vs-native" => {
             let mut c = Command::new(root().join("bench/quick"));

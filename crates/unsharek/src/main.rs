@@ -1,10 +1,12 @@
 //! The unsharek CLI: arguments to an [`unsharek::Config`], then [`unsharek::run`].
 
 use std::ffi::OsString;
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
+
+#[path = "cli/fs.rs"]
+mod fs;
 
 /// Run a program in a sandbox of its own kernel; exits with the program's status.
 #[derive(Parser)]
@@ -12,10 +14,14 @@ use clap::{Parser, ValueEnum};
 struct Cli {
     #[arg(long, value_enum, default_value_t = Mode::Coroutine)]
     mode: Mode,
-    /// More the program may see and map, read-only: a store path (with its closure) or a host
-    /// path. Repeatable.
-    #[arg(long = "ro", value_name = "PATH")]
-    ro: Vec<PathBuf>,
+    /// More the program may see, read-only: a store path (with its closure, as an image), a host
+    /// file, or a host directory, served live (at AT, default its own path). Repeatable.
+    #[arg(long = "ro", value_name = "PATH[:AT]")]
+    ro: Vec<fs::Arg>,
+    /// A host directory the program may read and write, served live (at AT, default its own
+    /// path). Repeatable.
+    #[arg(long = "rw", value_name = "DIR[:AT]")]
+    rw: Vec<fs::Arg>,
     /// Map an erofs image as /dev/unsharek/NAME, and mount it at MOUNTPOINT if given.
     /// Repeatable.
     #[arg(long = "image", value_name = "NAME=PATH[:MOUNTPOINT]")]
@@ -42,7 +48,16 @@ enum Mode {
 }
 
 fn main() -> ExitCode {
-    let Cli { mode, ro, images, max_procs, setenv, keep_env, argv } = Cli::parse();
+    let Cli { mode, ro, rw, images, max_procs, setenv, keep_env, argv } = Cli::parse();
+    // Plugin: host directories, live (cli/fs.rs).
+    let (live, images_ro): (Vec<fs::Arg>, Vec<fs::Arg>) = ro.into_iter().partition(|a| fs::live(&a.host));
+    let host_dirs = match fs::spawn(&live, &rw) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("unsharek: a host directory's server: {e}");
+            return ExitCode::from(125);
+        }
+    };
     // An empty environment, but what was asked for: the host's variables (tokens, keys) stay out
     // unless kept by name. `--setenv` first: getenv(3) takes a name's first entry.
     let mut env = setenv;
@@ -59,12 +74,13 @@ fn main() -> ExitCode {
             Mode::Threaded => unsharek::Mode::Threaded,
             Mode::Fork => unsharek::Mode::Fork,
         },
-        allow_paths: ro,
+        allow_paths: images_ro.into_iter().map(|a| a.host).collect(),
         images,
         max_procs,
         argv,
         env,
         image_cache: None,
+        host_dirs,
     };
     let Err(e) = unsharek::run(config);
     eprintln!("unsharek: {e}");
