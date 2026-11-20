@@ -77,6 +77,7 @@ pub const NR_EXIT: u32 = 60;
 pub const NR_KILL: u32 = 62;
 pub const NR_EXIT_GROUP: u32 = 231;
 pub const NR_PPOLL: u32 = 271;
+pub const NR_RECVMSG: u32 = 47;
 
 /// The one flag set a host thread is made with (include/uapi/linux/sched.h): `CLONE_VM |
 /// CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM | CLONE_CHILD_CLEARTID`.
@@ -162,6 +163,65 @@ pub fn read(fd: u32, buf: &mut [u8]) -> Result<usize, Errno> {
     check(unsafe {
         gate(NR_READ as usize, fd as usize, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0)
     })
+}
+
+/// The most fds one [`recv_fds`] takes from a message.
+pub const RECV_FDS_MAX: usize = 4;
+
+/// `recvmsg(fd, buf, MSG_CMSG_CLOEXEC)`: one packet from the control socket (unsharek-tcb's
+/// `Config::recv_fds`, the only fd the filter allows it on) and the fds sent with it, at most
+/// [`RECV_FDS_MAX`] (`n` of them in `fds`). Returns `(bytes, n)`; a packet or fd list the buffers
+/// cut short is EMSGSIZE (the fds that came are in `fds` all the same, never closed here).
+pub fn recv_fds(fd: u32, buf: &mut [u8], fds: &mut [i32; RECV_FDS_MAX]) -> Result<(usize, usize), Errno> {
+    #[repr(C)]
+    struct Iov {
+        base: usize,
+        len: usize,
+    }
+    #[repr(C)]
+    struct MsgHdr {
+        name: usize,
+        namelen: u32,
+        iov: *mut Iov,
+        iovlen: usize,
+        control: *mut u8,
+        controllen: usize,
+        flags: i32,
+    }
+    // cmsghdr (len: usize, level: i32, type: i32), then the fds; 8-aligned.
+    let mut control = [0u64; 2 + RECV_FDS_MAX / 2];
+    let mut iov = Iov { base: buf.as_mut_ptr() as usize, len: buf.len() };
+    let mut msg = MsgHdr {
+        name: 0,
+        namelen: 0,
+        iov: &mut iov,
+        iovlen: 1,
+        control: control.as_mut_ptr() as *mut u8,
+        controllen: core::mem::size_of_val(&control),
+        flags: 0,
+    };
+    const MSG_CMSG_CLOEXEC: usize = 0x4000_0000;
+    const MSG_TRUNC: i32 = 0x20;
+    const MSG_CTRUNC: i32 = 0x08;
+    const SOL_SOCKET: i32 = 1;
+    const SCM_RIGHTS: i32 = 1;
+    // SAFETY: the kernel writes at most `buf.len()` bytes into `buf` and `controllen` into
+    // `control`, all borrowed for the call; `msg` and `iov` are locals.
+    let n = check(unsafe { gate(NR_RECVMSG as usize, fd as usize, &mut msg as *mut MsgHdr as usize, MSG_CMSG_CLOEXEC, 0, 0, 0) })?;
+    let mut got = 0;
+    // One SCM_RIGHTS message at most (the sender's one cmsg): its fds after the 16-byte header.
+    let (len, level, kind) = (control[0] as usize, control[1] as u32 as i32, (control[1] >> 32) as i32);
+    if msg.controllen >= 16 && level == SOL_SOCKET && kind == SCM_RIGHTS && len >= 16 {
+        let words = &control[2..];
+        for (i, slot) in fds.iter_mut().enumerate().take(((len - 16) / 4).min(RECV_FDS_MAX)) {
+            *slot = (words[i / 2] >> (32 * (i % 2))) as u32 as i32;
+            got = i + 1;
+        }
+    }
+    if msg.flags & (MSG_TRUNC | MSG_CTRUNC) != 0 {
+        return Err(Errno::MSGSIZE);
+    }
+    Ok((n, got))
 }
 
 /// `struct pollfd`.
