@@ -51,44 +51,69 @@ pub fn compile(input: TokenStream) -> TokenStream {
     }
 }
 
-/// `name`'s `fn` in the module of `items` that holds line `line` (the call's): among `items`, or
-/// in the inline `mod` among them that holds the line, and so on in.
-fn find<'a>(items: &'a [syn::Item], name: &str, line: usize) -> Option<&'a ItemFn> {
+/// Every `fn name` in `items` and the inline `mod`s among them, at any depth.
+fn find_all<'a>(items: &'a [syn::Item], name: &Ident, out: &mut Vec<&'a ItemFn>) {
     for i in items {
-        if let syn::Item::Mod(m) = i
-            && let Some((brace, inner)) = &m.content
-            && (brace.span.open().start().line..=brace.span.close().start().line).contains(&line)
-        {
-            return find(inner, name, line);
+        match i {
+            syn::Item::Fn(f) if f.sig.ident == *name => out.push(f),
+            syn::Item::Mod(m) => {
+                if let Some((_, inner)) = &m.content {
+                    find_all(inner, name, out);
+                }
+            }
+            _ => {}
         }
     }
-    items.iter().find_map(|i| match i {
-        syn::Item::Fn(f) if f.sig.ident == name => Some(f),
-        _ => None,
-    })
+}
+
+/// The `fn` the call names in the file: by its path from the file's root through inline `mod`s
+/// (`compile!(table::policy(…))`: `mod table`'s `fn policy`), or, a bare name, the one `fn` of
+/// that name anywhere in the file (two are an error: the call must name its module). A proc
+/// macro can't see where it is called from, so the path, not the call's place, says.
+fn find<'a>(items: &'a [syn::Item], path: &syn::Path) -> R<&'a ItemFn> {
+    let segs: Vec<&Ident> = path.segments.iter().map(|s| &s.ident).filter(|i| *i != "self" && *i != "crate").collect();
+    let (name, mods) = segs.split_last().expect("a path has a name");
+    let mut items = items;
+    for m in mods {
+        items = items
+            .iter()
+            .find_map(|i| match i {
+                syn::Item::Mod(x) if x.ident == **m => x.content.as_ref().map(|(_, inner)| &inner[..]),
+                _ => None,
+            })
+            .ok_or_else(|| syn::Error::new(m.span(), format!("seccomp_fn::compile!: no inline `mod {m}` in the file on the call's path")))?;
+    }
+    if !mods.is_empty() {
+        return items
+            .iter()
+            .find_map(|i| match i {
+                syn::Item::Fn(f) if f.sig.ident == **name => Some(f),
+                _ => None,
+            })
+            .ok_or_else(|| syn::Error::new(name.span(), format!("seccomp_fn::compile!: no `fn {name}` at the call's path in the file")));
+    }
+    let mut all = vec![];
+    find_all(items, name, &mut all);
+    match all.as_slice() {
+        [f] => Ok(f),
+        [] => Err(syn::Error::new(name.span(), format!("seccomp_fn::compile!: no `fn {name}` in the call's file (a plain fn of that file)"))),
+        _ => Err(syn::Error::new(
+            name.span(),
+            format!("seccomp_fn::compile!: {} `fn {name}`s in the call's file: name its module from the file's root (`compile!(m::{name}(…))`)", all.len()),
+        )),
+    }
 }
 
 fn expand(call: &syn::ExprCall) -> R<Ts> {
     let Expr::Path(p) = &*call.func else { return err(&call.func, "a call of anything but a function by name") };
-    let Some(name) = p.path.segments.last().map(|s| s.ident.clone()) else { return err(p, "a path without a name") };
+    let name = p.path.segments.last().map(|s| s.ident.clone()).expect("a path has a name");
     let file = Span::call_site().unwrap().local_file().ok_or_else(|| {
         syn::Error::new(Span::call_site(), "seccomp_fn::compile!: the call's file isn't known (macro expanded from no file)")
     })?;
-    let line = Span::call_site().unwrap().line();
     let src = std::fs::read_to_string(&file)
         .map_err(|e| syn::Error::new(Span::call_site(), format!("seccomp_fn::compile!: reading {}: {e}", file.display())))?;
-    // parsed by proc-macro2's own parser, whose spans have lines (the compiler's, for a string,
-    // don't)
-    proc_macro2::fallback::force();
-    let found = syn::parse_file(&src).map(|ast| find(&ast.items, &name.to_string(), line).map(|f| quote!(#f).to_string()));
-    proc_macro2::fallback::unforce();
-    let found = found.map_err(|e| syn::Error::new(Span::call_site(), format!("seccomp_fn::compile!: parsing {}: {e}", file.display())))?;
-    let text = found.ok_or_else(|| {
-        syn::Error::new(name.span(), format!("seccomp_fn::compile!: no `fn {name}` in the call's module in {} (a plain fn of the call's own file)", file.display()))
-    })?;
-    // (parsed again, as the compiler's tokens: the fallback's can't be mixed with them)
-    let f: ItemFn = syn::parse_str(&text)?;
-    let f = &f;
+    let ast = syn::parse_file(&src).map_err(|e| syn::Error::new(Span::call_site(), format!("seccomp_fn::compile!: parsing {}: {e}", file.display())))?;
+    let f = find(&ast.items, &p.path)?;
     // the params, bound to the call's arguments
     let (mut binds, mut params) = (vec![], vec![]);
     if f.sig.inputs.len() != call.args.len() {
