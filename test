@@ -18,7 +18,7 @@ cd "$root"
 if [[ "${1:-}" == --prove ]]; then
   shift
   # -j: the harnesses in parallel (one per mode and shape; each a minute or two alone)
-  cargo kani --manifest-path seccomp-fn/Cargo.toml -p seccomp-fn -j --output-format=terse "$@"
+  cargo kani --manifest-path seccomp-fn/Cargo.toml -p seccomp-fn --tests -j --output-format=terse "$@"
   exec cargo kani -p exobox-tcb -j --output-format=terse "$@"
 fi
 if [[ "${1:-}" == --vs-native ]]; then

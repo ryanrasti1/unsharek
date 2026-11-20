@@ -297,6 +297,7 @@ version = "0.0.0"
 dependencies = [
  "libc",
  "seccomp-fn",
+ "seccomp-fn-validate",
 ]
 
 [[package]]
@@ -593,17 +594,16 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 name = "seccomp-fn"
 version = "0.0.0"
 dependencies = [
- "libc",
- "seccomp-fn-macros",
-]
-
-[[package]]
-name = "seccomp-fn-macros"
-version = "0.0.0"
-dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "seccomp-fn-validate"
+version = "0.0.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

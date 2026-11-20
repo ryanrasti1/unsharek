@@ -2,30 +2,8 @@
 //! (libc's), [`run_bpf`] and the checks the kernel makes before it takes a program. The proof
 //! trusts this file; `tests/kernel.rs` checks it against Linux.
 
-use crate::SockFilter;
-
-/// `struct seccomp_data` (include/uapi/linux/seccomp.h): what a filter sees of a syscall. libc's
-/// `seccomp_data`'s layout, checked below; not libc's type itself, because BPF reads `nr` as an
-/// unsigned word (libc's is `c_int`: a policy's `match d.nr` would compare signed), and Kani
-/// needs an `Arbitrary` for it.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[cfg_attr(kani, derive(kani::Arbitrary))]
-pub struct SeccompData {
-    pub nr: u32,
-    pub arch: u32,
-    pub instruction_pointer: u64,
-    pub args: [u64; 6],
-}
-
 use core::mem::{offset_of, size_of};
-const _: () = {
-    assert!(size_of::<SeccompData>() == size_of::<libc::seccomp_data>());
-    assert!(offset_of!(SeccompData, nr) == offset_of!(libc::seccomp_data, nr));
-    assert!(offset_of!(SeccompData, arch) == offset_of!(libc::seccomp_data, arch));
-    assert!(offset_of!(SeccompData, instruction_pointer) == offset_of!(libc::seccomp_data, instruction_pointer));
-    assert!(offset_of!(SeccompData, args) == offset_of!(libc::seccomp_data, args));
-};
+use libc::{seccomp_data as SeccompData, sock_filter as SockFilter};
 
 /// Offsets in `seccomp_data`, libc's: of a 64-bit field's low and high halves, as the target's
 /// byte order puts them.
@@ -33,89 +11,89 @@ const fn halves(off: usize) -> (u32, u32) {
     let (lo, hi) = if cfg!(target_endian = "little") { (off, off + 4) } else { (off + 4, off) };
     (lo as u32, hi as u32)
 }
-pub(crate) const OFF_NR: u32 = offset_of!(libc::seccomp_data, nr) as u32;
-pub(crate) const OFF_ARCH: u32 = offset_of!(libc::seccomp_data, arch) as u32;
-pub(crate) const OFF_IP: (u32, u32) = halves(offset_of!(libc::seccomp_data, instruction_pointer));
-pub(crate) const fn off_arg(i: usize) -> (u32, u32) {
+const OFF_NR: u32 = offset_of!(libc::seccomp_data, nr) as u32;
+const OFF_ARCH: u32 = offset_of!(libc::seccomp_data, arch) as u32;
+const OFF_IP: (u32, u32) = halves(offset_of!(libc::seccomp_data, instruction_pointer));
+const fn off_arg(i: usize) -> (u32, u32) {
     halves(offset_of!(libc::seccomp_data, args) + i * size_of::<u64>())
 }
-pub(crate) const DATA_LEN: u32 = size_of::<libc::seccomp_data>() as u32;
+const DATA_LEN: u32 = size_of::<libc::seccomp_data>() as u32;
 
 // Classic BPF's opcodes, libc's (include/uapi/linux/bpf_common.h, filter.h), combined as the
 // kernel's macros combine them. The masks are bpf_common.h's BPF_CLASS, BPF_MODE, BPF_OP,
 // BPF_SRC, BPF_RVAL and BPF_MISCOP, which libc doesn't have.
-pub(crate) const CLASS: u16 = 0x07;
-pub(crate) const MODE: u16 = 0xe0;
-pub(crate) const OP: u16 = 0xf0;
-pub(crate) const SRC: u16 = 0x08;
-pub(crate) const RVAL: u16 = 0x18;
-pub(crate) const MISCOP: u16 = 0xf8;
-pub(crate) use libc::{
+const CLASS: u16 = 0x07;
+const MODE: u16 = 0xe0;
+const OP: u16 = 0xf0;
+const SRC: u16 = 0x08;
+const RVAL: u16 = 0x18;
+const MISCOP: u16 = 0xf8;
+use libc::{
     BPF_A, BPF_ABS, BPF_ADD, BPF_ALU, BPF_AND, BPF_DIV, BPF_IMM, BPF_JA, BPF_JEQ, BPF_JGE, BPF_JGT, BPF_JMP, BPF_JSET,
     BPF_K, BPF_LD, BPF_LDX, BPF_LEN, BPF_LSH, BPF_MEM, BPF_MISC, BPF_MUL, BPF_NEG, BPF_OR, BPF_RET, BPF_RSH, BPF_ST,
     BPF_STX, BPF_SUB, BPF_TAX, BPF_TXA, BPF_W, BPF_X, BPF_XOR,
 };
-pub(crate) const fn op(c: u32) -> u16 {
+const fn op(c: u32) -> u16 {
     c as u16
 }
-pub(crate) const fn alu(o: u32, src: u32) -> u16 {
+const fn alu(o: u32, src: u32) -> u16 {
     op(BPF_ALU | o | src)
 }
-pub(crate) const fn jmp(o: u32, src: u32) -> u16 {
+const fn jmp(o: u32, src: u32) -> u16 {
     op(BPF_JMP | o | src)
 }
-pub(crate) const LD: u16 = op(BPF_LD);
-pub(crate) const LDX: u16 = op(BPF_LDX);
-pub(crate) const ST: u16 = op(BPF_ST);
-pub(crate) const STX: u16 = op(BPF_STX);
-pub(crate) const ALU: u16 = op(BPF_ALU);
-pub(crate) const JMP: u16 = op(BPF_JMP);
-pub(crate) const RET: u16 = op(BPF_RET);
-pub(crate) const X: u16 = op(BPF_X);
-pub(crate) const A: u16 = op(BPF_A);
-pub(crate) const LD_W_ABS: u16 = op(BPF_LD | BPF_W | BPF_ABS);
-pub(crate) const LD_W_IMM: u16 = op(BPF_LD | BPF_W | BPF_IMM);
-pub(crate) const LDX_W_IMM: u16 = op(BPF_LDX | BPF_W | BPF_IMM);
-pub(crate) const LD_W_LEN: u16 = op(BPF_LD | BPF_W | BPF_LEN);
-pub(crate) const LDX_W_LEN: u16 = op(BPF_LDX | BPF_W | BPF_LEN);
-pub(crate) const LD_MEM: u16 = op(BPF_LD | BPF_W | BPF_MEM);
-pub(crate) const LDX_MEM: u16 = op(BPF_LDX | BPF_W | BPF_MEM);
+const LD: u16 = op(BPF_LD);
+const LDX: u16 = op(BPF_LDX);
+const ST: u16 = op(BPF_ST);
+const STX: u16 = op(BPF_STX);
+const ALU: u16 = op(BPF_ALU);
+const JMP: u16 = op(BPF_JMP);
+const RET: u16 = op(BPF_RET);
+const X: u16 = op(BPF_X);
+const A: u16 = op(BPF_A);
+const LD_W_ABS: u16 = op(BPF_LD | BPF_W | BPF_ABS);
+const LD_W_IMM: u16 = op(BPF_LD | BPF_W | BPF_IMM);
+const LDX_W_IMM: u16 = op(BPF_LDX | BPF_W | BPF_IMM);
+const LD_W_LEN: u16 = op(BPF_LD | BPF_W | BPF_LEN);
+const LDX_W_LEN: u16 = op(BPF_LDX | BPF_W | BPF_LEN);
+const LD_MEM: u16 = op(BPF_LD | BPF_W | BPF_MEM);
+const LDX_MEM: u16 = op(BPF_LDX | BPF_W | BPF_MEM);
 // ALU by K or X; JEQ JGT JGE JSET by K or X. (Named one by one: `check` matches them without a
 // loop, which keeps Kani's model of it small.)
-pub(crate) const ADD_K: u16 = alu(BPF_ADD, BPF_K);
-pub(crate) const SUB_K: u16 = alu(BPF_SUB, BPF_K);
-pub(crate) const MUL_K: u16 = alu(BPF_MUL, BPF_K);
-pub(crate) const OR_K: u16 = alu(BPF_OR, BPF_K);
-pub(crate) const AND_K: u16 = alu(BPF_AND, BPF_K);
-pub(crate) const XOR_K: u16 = alu(BPF_XOR, BPF_K);
-pub(crate) const DIV_K: u16 = alu(BPF_DIV, BPF_K);
-pub(crate) const LSH_K: u16 = alu(BPF_LSH, BPF_K);
-pub(crate) const RSH_K: u16 = alu(BPF_RSH, BPF_K);
-pub(crate) const ADD_X: u16 = alu(BPF_ADD, BPF_X);
-pub(crate) const SUB_X: u16 = alu(BPF_SUB, BPF_X);
-pub(crate) const MUL_X: u16 = alu(BPF_MUL, BPF_X);
-pub(crate) const OR_X: u16 = alu(BPF_OR, BPF_X);
-pub(crate) const AND_X: u16 = alu(BPF_AND, BPF_X);
-pub(crate) const XOR_X: u16 = alu(BPF_XOR, BPF_X);
-pub(crate) const DIV_X: u16 = alu(BPF_DIV, BPF_X);
-pub(crate) const LSH_X: u16 = alu(BPF_LSH, BPF_X);
-pub(crate) const RSH_X: u16 = alu(BPF_RSH, BPF_X);
-pub(crate) const NEG: u16 = op(BPF_ALU | BPF_NEG);
-pub(crate) const JA: u16 = op(BPF_JMP | BPF_JA);
-pub(crate) const JEQ_K: u16 = jmp(BPF_JEQ, BPF_K);
-pub(crate) const JGT_K: u16 = jmp(BPF_JGT, BPF_K);
-pub(crate) const JGE_K: u16 = jmp(BPF_JGE, BPF_K);
-pub(crate) const JSET_K: u16 = jmp(BPF_JSET, BPF_K);
-pub(crate) const JEQ_X: u16 = jmp(BPF_JEQ, BPF_X);
-pub(crate) const JGT_X: u16 = jmp(BPF_JGT, BPF_X);
-pub(crate) const JGE_X: u16 = jmp(BPF_JGE, BPF_X);
-pub(crate) const JSET_X: u16 = jmp(BPF_JSET, BPF_X);
-pub(crate) const RET_K: u16 = op(BPF_RET | BPF_K);
-pub(crate) const RET_A: u16 = op(BPF_RET | BPF_A);
-pub(crate) const TAX: u16 = op(BPF_MISC | BPF_TAX);
-pub(crate) const TXA: u16 = op(BPF_MISC | BPF_TXA);
+const ADD_K: u16 = alu(BPF_ADD, BPF_K);
+const SUB_K: u16 = alu(BPF_SUB, BPF_K);
+const MUL_K: u16 = alu(BPF_MUL, BPF_K);
+const OR_K: u16 = alu(BPF_OR, BPF_K);
+const AND_K: u16 = alu(BPF_AND, BPF_K);
+const XOR_K: u16 = alu(BPF_XOR, BPF_K);
+const DIV_K: u16 = alu(BPF_DIV, BPF_K);
+const LSH_K: u16 = alu(BPF_LSH, BPF_K);
+const RSH_K: u16 = alu(BPF_RSH, BPF_K);
+const ADD_X: u16 = alu(BPF_ADD, BPF_X);
+const SUB_X: u16 = alu(BPF_SUB, BPF_X);
+const MUL_X: u16 = alu(BPF_MUL, BPF_X);
+const OR_X: u16 = alu(BPF_OR, BPF_X);
+const AND_X: u16 = alu(BPF_AND, BPF_X);
+const XOR_X: u16 = alu(BPF_XOR, BPF_X);
+const DIV_X: u16 = alu(BPF_DIV, BPF_X);
+const LSH_X: u16 = alu(BPF_LSH, BPF_X);
+const RSH_X: u16 = alu(BPF_RSH, BPF_X);
+const NEG: u16 = op(BPF_ALU | BPF_NEG);
+const JA: u16 = op(BPF_JMP | BPF_JA);
+const JEQ_K: u16 = jmp(BPF_JEQ, BPF_K);
+const JGT_K: u16 = jmp(BPF_JGT, BPF_K);
+const JGE_K: u16 = jmp(BPF_JGE, BPF_K);
+const JSET_K: u16 = jmp(BPF_JSET, BPF_K);
+const JEQ_X: u16 = jmp(BPF_JEQ, BPF_X);
+const JGT_X: u16 = jmp(BPF_JGT, BPF_X);
+const JGE_X: u16 = jmp(BPF_JGE, BPF_X);
+const JSET_X: u16 = jmp(BPF_JSET, BPF_X);
+const RET_K: u16 = op(BPF_RET | BPF_K);
+const RET_A: u16 = op(BPF_RET | BPF_A);
+const TAX: u16 = op(BPF_MISC | BPF_TAX);
+const TXA: u16 = op(BPF_MISC | BPF_TXA);
 /// Scratch memory's words (BPF_MEMWORDS).
-pub(crate) const MEMWORDS: usize = libc::BPF_MEMWORDS as usize;
+const MEMWORDS: usize = libc::BPF_MEMWORDS as usize;
 /// The kernel's limit on a program's length (BPF_MAXINSNS).
 pub const MAX_INSNS: usize = libc::BPF_MAXINSNS as usize;
 
@@ -137,7 +115,7 @@ pub fn run_bpf(prog: &[SockFilter], d: &SeccompData) -> u32 {
 /// the instructions, in order, runs it: an instruction runs if it is where control is (`pc`),
 /// and is passed over if a jump went past it. (A model checker then sees each instruction at a
 /// known index, and one machine state, which keeps the proof small.)
-pub(crate) fn run(prog: &[SockFilter], d: &SeccompData) -> u32 {
+fn run(prog: &[SockFilter], d: &SeccompData) -> u32 {
     let (mut pc, mut s) = (0, State { a: 0, x: 0, mem: [0; MEMWORDS] });
     for (i, &ins) in prog.iter().enumerate() {
         if pc != i {
@@ -171,7 +149,7 @@ fn step(s: &mut State, SockFilter { code, jt, jf, k }: SockFilter, d: &SeccompDa
     // each a field's or a half of one's)
     let word = |off: u32| -> u32 {
         let (v, (lo, _)) = match off {
-            OFF_NR => return d.nr,
+            OFF_NR => return d.nr as u32,
             OFF_ARCH => return d.arch,
             _ if off == OFF_IP.0 || off == OFF_IP.1 => (d.instruction_pointer, OFF_IP),
             _ => {
@@ -234,7 +212,7 @@ fn step(s: &mut State, SockFilter { code, jt, jf, k }: SockFilter, d: &SeccompDa
 
 /// The checks the kernel makes before it takes a program (`bpf_check_classic`,
 /// `seccomp_check_filter`'s list of opcodes): panics on the first it fails.
-pub(crate) fn check(prog: &[SockFilter]) {
+fn check(prog: &[SockFilter]) {
     assert!(!prog.is_empty() && prog.len() <= MAX_INSNS, "{} instructions", prog.len());
     for (pc, &SockFilter { code, jt, jf, k }) in prog.iter().enumerate() {
         let left = prog.len() - pc - 1;
