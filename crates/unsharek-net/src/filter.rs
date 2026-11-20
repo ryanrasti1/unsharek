@@ -3,12 +3,12 @@
 //! `connect`, `poll` and `getsockopt` for its end, `fcntl` for its flags; one lookup a UDP `socket`,
 //! `bind`, `connect`, `setsockopt` (a timeout), `sendto` and `recvfrom`; one reply a `write` or, with
 //! the socket in it, a `sendmsg` on the control socket only, then the socket's `close`. The rest is
-//! a single-threaded Rust process's: memory, futexes, signal returns, the exit. Proven equal to
+//! a single-threaded Rust process's (and a published port's `accept4`, its listener bound before): memory, futexes, signal returns, the exit. Proven equal to
 //! its program like the sandbox's (`policy!`).
 
 use libc::{seccomp_data, sock_filter};
 use libc::{
-    SYS_bind, SYS_brk, SYS_close, SYS_connect, SYS_exit, SYS_exit_group, SYS_fcntl, SYS_futex, SYS_getrandom,
+    SYS_accept4, SYS_bind, SYS_brk, SYS_close, SYS_connect, SYS_exit, SYS_exit_group, SYS_fcntl, SYS_futex, SYS_getrandom,
     SYS_getsockopt, SYS_ioctl, SYS_madvise, SYS_mmap, SYS_mprotect, SYS_mremap, SYS_munmap, SYS_poll, SYS_ppoll, SYS_read, SYS_recvfrom,
     SYS_rt_sigprocmask, SYS_rt_sigreturn, SYS_sendmsg, SYS_sendto, SYS_setsockopt, SYS_sigaltstack, SYS_socket,
     SYS_write,
@@ -38,6 +38,8 @@ pub fn policy(ctl: u64) -> impl Fn(&seccomp_data) -> u32 {
             }
             // A dialled socket made nonblocking (std's `FIONBIO`), nothing else of ioctl's.
             SYS_ioctl if d.args[1] == libc::FIONBIO => SECCOMP_RET_ALLOW,
+            // A published port's next connection (the listeners were bound before lockdown).
+            SYS_accept4 if d.args[3] == libc::SOCK_CLOEXEC as u64 => SECCOMP_RET_ALLOW,
             SYS_connect | SYS_bind | SYS_getsockopt | SYS_setsockopt | SYS_sendto | SYS_recvfrom => SECCOMP_RET_ALLOW,
             // A reply with a dialled socket in it: on the control socket only, no flags.
             SYS_sendmsg if d.args[0] == ctl && d.args[2] == 0 => SECCOMP_RET_ALLOW,

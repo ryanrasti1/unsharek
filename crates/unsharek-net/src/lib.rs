@@ -23,7 +23,7 @@ pub mod client;
 pub mod filter;
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
@@ -39,6 +39,10 @@ pub mod protocol {
     pub const CONNECT: &str = "connect";
     /// `resolve(name: string) -> string[]` (IPv4 addresses).
     pub const RESOLVE: &str = "resolve";
+    /// `listen(port: number) -> Listener`: the port published for the guest's `port`.
+    pub const LISTEN: &str = "listen";
+    /// `Listener.accept() -> [fd, peerIp: string, peerPort: number]`.
+    pub const ACCEPT: &str = "accept";
     /// The policy doesn't allow the address (EACCES).
     pub const DENIED: &str = "Denied";
     /// The destination refused (ECONNREFUSED).
@@ -114,10 +118,70 @@ fn rejection(name: &str, message: impl Into<String>) -> Error {
     Error::Serialized(CapnwebError::new(name, message))
 }
 
+/// A published port: connections to `host` on the host are the guest's listener's on `guest`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Publish {
+    pub host: SocketAddr,
+    pub guest: u16,
+}
+
+impl std::str::FromStr for Publish {
+    type Err = String;
+    /// `HOST_PORT:GUEST_PORT` (on 127.0.0.1) or `IP:HOST_PORT:GUEST_PORT`, as docker's `-p`.
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        let bad = || format!("{s:?}: expected [IP:]HOST_PORT:GUEST_PORT");
+        let (rest, guest) = s.rsplit_once(':').ok_or_else(bad)?;
+        let guest: u16 = guest.parse().map_err(|_| bad())?;
+        let host = match rest.rsplit_once(':') {
+            Some((ip, port)) => {
+                let ip: IpAddr = ip.trim_matches(|c| c == '[' || c == ']').parse().map_err(|_| bad())?;
+                SocketAddr::new(ip, port.parse().map_err(|_| bad())?)
+            }
+            None => SocketAddr::new(Ipv4Addr::LOCALHOST.into(), rest.parse().map_err(|_| bad())?),
+        };
+        Ok(Publish { host, guest })
+    }
+}
+
 /// The object the sandbox calls.
 pub struct Provider {
     policy: Policy,
     nameserver: Option<SocketAddr>,
+    /// The published ports' listeners, bound before lockdown: (guest port, listener).
+    listeners: Vec<(u16, Arc<TcpListener>)>,
+    reactor: Arc<Reactor>,
+}
+
+/// A published port's listener, for the guest's listen on its port: `accept()` waits for the
+/// next connection and answers with it, passed in, and its peer.
+pub struct Listener {
+    tcp: Arc<TcpListener>,
+    reactor: Arc<Reactor>,
+}
+
+#[rpc_target]
+impl Listener {
+    /// `accept() -> [fd, peerIp, peerPort]`.
+    async fn accept(&self) -> Result<Vec<CapnwebValue>> {
+        loop {
+            match self.tcp.accept() {
+                Ok((tcp, peer)) => {
+                    tcp.set_nonblocking(true).map_err(|e| rejection(protocol::UNREACHABLE, e.to_string()))?;
+                    return Ok(vec![
+                        CapnwebValue::custom(Fd(tcp.into_raw_fd())),
+                        CapnwebValue::String(peer.ip().to_string()),
+                        CapnwebValue::Number(f64::from(peer.port())),
+                    ]);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    let fd = self.tcp.as_raw_fd();
+                    std::future::poll_fn(|cx| self.reactor.poll(fd, libc::POLLIN, cx)).await;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(rejection(protocol::UNREACHABLE, e.to_string())),
+            }
+        }
+    }
 }
 
 #[rpc_target]
@@ -144,6 +208,17 @@ impl Provider {
         // Ours until sent; the transport closes nothing, so [`HostCtl::send_fds`] closes it once
         // the sandbox has its copy.
         Ok(CapnwebValue::custom(Fd(tcp.into_raw_fd())))
+    }
+
+    /// `listen(port)`: the listener of the port published for the guest's `port`; Denied if none
+    /// is (a guest listen beyond loopback reaches the host only through `--publish`).
+    async fn listen(&self, port: f64) -> Result<CapnwebValue> {
+        let found = self.listeners.iter().find(|(g, _)| f64::from(*g) == port);
+        let Some((_, tcp)) = found else {
+            return Err(rejection(protocol::DENIED, format!("port {port}: not published")));
+        };
+        let l = Listener { tcp: Arc::clone(tcp), reactor: Arc::clone(&self.reactor) };
+        Ok(CapnwebValue::Target(Arc::new(l)))
     }
 
     /// `resolve(name)`: the name's IPv4 addresses (A records) from the host's nameserver.
@@ -220,11 +295,49 @@ fn lookup(ns: SocketAddr, name: &str) -> io::Result<Vec<Ipv4Addr>> {
     Ok(out)
 }
 
+/// The provider's waits: each a task's waker on an fd, woken by [`serve`]'s idle `ppoll` over
+/// them all (the control socket's and the listeners').
+#[derive(Default)]
+pub struct Reactor {
+    waits: Mutex<Vec<(RawFd, i16, Waker)>>,
+}
+
+impl Reactor {
+    /// `fd` ready for `events` now, or the waker kept for the idle wait.
+    fn poll(&self, fd: RawFd, events: i16, cx: &mut Context<'_>) -> Poll<()> {
+        let mut p = libc::pollfd { fd, events, revents: 0 };
+        let now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: ppoll on one local pollfd, no wait, no mask.
+        if unsafe { libc::ppoll(&mut p, 1, &now, std::ptr::null()) } > 0 {
+            return Poll::Ready(());
+        }
+        self.waits.lock().expect("waits poisoned").push((fd, events, cx.waker().clone()));
+        Poll::Pending
+    }
+
+    /// Wait for any kept fd (and `ctl`, always, for its hangup) and wake the ready ones'
+    /// tasks. The control socket's hangup ends the provider.
+    fn wait(&self, ctl: RawFd) {
+        let mut waits = std::mem::take(&mut *self.waits.lock().expect("waits poisoned"));
+        let mut fds: Vec<libc::pollfd> = vec![libc::pollfd { fd: ctl, events: 0, revents: 0 }];
+        fds.extend(waits.iter().map(|&(fd, events, _)| libc::pollfd { fd, events, revents: 0 }));
+        // SAFETY: ppoll on a local array, no timeout, no mask.
+        let r = unsafe { libc::ppoll(fds.as_mut_ptr(), fds.len() as _, std::ptr::null(), std::ptr::null()) };
+        if r > 0 && fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            std::process::exit(0);
+        }
+        let mut keep = vec![];
+        for (w, p) in waits.drain(..).zip(&fds[1..]) {
+            if p.revents != 0 { w.2.wake() } else { keep.push(w) }
+        }
+        self.waits.lock().expect("waits poisoned").extend(keep);
+    }
+}
+
 /// The provider's end of the control socket, nonblocking.
 struct HostCtl {
     fd: RawFd,
-    /// The tasks waiting to read and to write.
-    waiters: Arc<Mutex<(Option<Waker>, Option<Waker>)>>,
+    reactor: Arc<Reactor>,
 }
 
 fn last<T>(r: isize, ok: T) -> io::Result<T> {
@@ -273,31 +386,22 @@ impl PacketSocket for HostCtl {
     }
 
     fn poll_ready(&self, cx: &mut Context<'_>, write: bool) -> Poll<()> {
-        // Ready now, or woken by [`serve`]'s idle wait, which polls the socket once nothing else
-        // can run.
-        let mut p = libc::pollfd { fd: self.fd, events: if write { libc::POLLOUT } else { libc::POLLIN }, revents: 0 };
-        let now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-        // SAFETY: ppoll on one local pollfd, no wait, no mask.
-        if unsafe { libc::ppoll(&mut p, 1, &now, std::ptr::null()) } > 0 {
-            return Poll::Ready(());
-        }
-        let mut w = self.waiters.lock().expect("waiters poisoned");
-        let slot = if write { &mut w.1 } else { &mut w.0 };
-        *slot = Some(cx.waker().clone());
-        Poll::Pending
+        self.reactor.poll(self.fd, if write { libc::POLLOUT } else { libc::POLLIN }, cx)
     }
 }
 
-/// Every fd but `ctl` and stderr closed, `no_new_privs`, the provider's filter installed: the
-/// provider's own lockdown, before it serves anything. An error ends the provider.
-pub fn lockdown(ctl: RawFd) -> io::Result<()> {
+/// Every fd but `ctl`, `keep` (the listeners) and stderr closed, no core dumps, `no_new_privs`,
+/// the provider's filter installed: the provider's own lockdown, before it serves anything. An
+/// error ends the provider.
+pub fn lockdown(ctl: RawFd, keep: &[RawFd]) -> io::Result<()> {
     let close = |lo: u32, hi: u32| -> io::Result<()> {
         // SAFETY: closes fds of this process; `ctl` and stderr are outside every range.
         let r = unsafe { libc::syscall(libc::SYS_close_range, lo, hi, 0) };
         last(r as isize, ())
     };
-    let mut keep = [2, ctl as u32];
+    let mut keep: Vec<u32> = [2, ctl as u32].into_iter().chain(keep.iter().map(|&f| f as u32)).collect();
     keep.sort_unstable();
+    keep.dedup();
     let mut next = 0u32;
     for fd in keep {
         if fd > next {
@@ -321,39 +425,42 @@ pub fn lockdown(ctl: RawFd) -> io::Result<()> {
     last(r as isize, ())
 }
 
-/// Serve the provider on `ctl` (the provider's end of the pair, nonblocking) with `policy` until
-/// the sandbox's end closes; then the process exits 0. Locks down first ([`lockdown`]).
-pub fn serve(ctl: RawFd, policy: Policy) -> ! {
+/// The published ports' listeners, bound and listening (nonblocking): before [`serve`]'s lockdown,
+/// which allows no `bind` of a TCP socket's or `listen`.
+pub fn bind_published(publish: &[Publish]) -> io::Result<Vec<(u16, TcpListener)>> {
+    publish
+        .iter()
+        .map(|p| {
+            let l = TcpListener::bind(p.host)?;
+            l.set_nonblocking(true)?;
+            Ok((p.guest, l))
+        })
+        .collect()
+}
+
+/// Serve the provider on `ctl` (the provider's end of the pair, nonblocking) with `policy` and the
+/// published ports' `listeners` ([`bind_published`]), until the sandbox's end closes; then the
+/// process exits 0. Locks down first ([`lockdown`]), keeping the listeners.
+pub fn serve(ctl: RawFd, policy: Policy, listeners: Vec<(u16, TcpListener)>) -> ! {
     let nameserver = host_nameserver();
-    // Warm what the session's first call would otherwise do under the filter (locale, allocator).
     let runtime = capnweb::local::LocalRuntime::new();
-    if let Err(e) = lockdown(ctl) {
+    let keep: Vec<RawFd> = listeners.iter().map(|(_, l)| l.as_raw_fd()).collect();
+    if let Err(e) = lockdown(ctl, &keep) {
         eprintln!("unsharek: the network provider's lockdown failed: {e}");
         std::process::exit(125);
     }
-    let waiters = Arc::new(Mutex::new((None, None)));
-    let transport = match PacketTransport::new(HostCtl { fd: ctl, waiters: Arc::clone(&waiters) }) {
+    let reactor = Arc::new(Reactor::default());
+    let transport = match PacketTransport::new(HostCtl { fd: ctl, reactor: Arc::clone(&reactor) }) {
         Ok(t) => t,
         Err(_) => std::process::exit(125),
     };
-    let main = CapnwebValue::Target(Arc::new(Provider { policy, nameserver }));
+    let listeners = listeners.into_iter().map(|(g, l)| (g, Arc::new(l))).collect();
+    let main = CapnwebValue::Target(Arc::new(Provider { policy, nameserver, listeners, reactor: Arc::clone(&reactor) }));
     let session = runtime.block_on(async { RpcSession::new(Arc::new(transport), Some(main), RpcSessionOptions::default()) }, || {});
     if session.is_err() {
         std::process::exit(125);
     }
-    // Nothing to run: wait for the socket, wake whoever waits on it. The sandbox's end gone: so
-    // is the provider.
-    runtime.block_on(std::future::pending::<()>(), || {
-        let want_write = waiters.lock().expect("waiters poisoned").1.is_some();
-        let mut p = libc::pollfd { fd: ctl, events: libc::POLLIN | if want_write { libc::POLLOUT } else { 0 }, revents: 0 };
-        // SAFETY: ppoll on one local pollfd, no timeout, no mask.
-        let r = unsafe { libc::ppoll(&mut p, 1, std::ptr::null(), std::ptr::null()) };
-        if r > 0 && p.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-            std::process::exit(0);
-        }
-        let (r, w) = std::mem::take(&mut *waiters.lock().expect("waiters poisoned"));
-        r.into_iter().chain(w).for_each(Waker::wake);
-    });
+    runtime.block_on(std::future::pending::<()>(), || reactor.wait(ctl));
     unreachable!("the provider serves until the sandbox's end closes")
 }
 

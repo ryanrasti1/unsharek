@@ -24,14 +24,19 @@ fn pair() -> [RawFd; 2] {
 
 /// The provider for `policy` on a fresh pair's one end, in a child; the other end.
 fn provider(policy: Policy) -> (RawFd, libc::pid_t) {
+    provider_publishing(policy, &[])
+}
+
+fn provider_publishing(policy: Policy, publish: &[unsharek_net::Publish]) -> (RawFd, libc::pid_t) {
     let [ours, theirs] = pair();
+    let listeners = unsharek_net::bind_published(publish).unwrap();
     // SAFETY: the child serves and exits; the parent goes on.
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0);
     if pid == 0 {
         // SAFETY: the child's copy of our end, not its to keep.
         unsafe { libc::close(ours) };
-        unsharek_net::serve(theirs, policy);
+        unsharek_net::serve(theirs, policy, listeners);
     }
     // SAFETY: the parent's copy of the provider's end.
     unsafe { libc::close(theirs) };
@@ -169,7 +174,7 @@ fn the_providers_filter_kills_an_unlisted_call() {
     // SAFETY: the child locks down and tries an open; the parent waits.
     let pid = unsafe { libc::fork() };
     if pid == 0 {
-        if unsharek_net::lockdown(a).is_err() {
+        if unsharek_net::lockdown(a, &[]).is_err() {
             // SAFETY: exit.
             unsafe { libc::_exit(1) };
         }
@@ -182,4 +187,51 @@ fn the_providers_filter_kills_an_unlisted_call() {
     // SAFETY: waitpid into a local.
     unsafe { libc::waitpid(pid, &mut status, 0) };
     assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS, "status {status:#x}");
+}
+
+/// A published port: the guest's listen on 80 gets the provider's listener; a host client's
+/// connection to the published port arrives as an fd, and bytes go both ways. An unpublished
+/// port is Denied.
+#[test]
+fn published_port_accepts() {
+    let free = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let publish: unsharek_net::Publish = format!("{free}:80").parse().unwrap();
+    let (ctl, pid) = provider_publishing(Policy::Public, &[publish]);
+    let client_thread = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", free)).unwrap();
+        c.write_all(b"hello").unwrap();
+        let mut got = [0u8; 3];
+        c.read_exact(&mut got).unwrap();
+        got
+    });
+    let (fd, denied) = with_client(ctl, |c| {
+        let c = Arc::clone(c);
+        Box::pin(async move {
+            let denied = c.listen(81).await.err();
+            let l = c.listen(80).await.expect("listen");
+            (c.accept(&l).await.expect("accept").0, denied)
+        })
+    });
+    assert_eq!(denied, Some(Some(protocol::DENIED)));
+    // SAFETY: the received socket, ours now.
+    let mut s = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+    s.set_nonblocking(false).unwrap();
+    let mut got = [0u8; 5];
+    s.read_exact(&mut got).unwrap();
+    assert_eq!(&got, b"hello");
+    s.write_all(b"bye").unwrap();
+    assert_eq!(&client_thread.join().unwrap(), b"bye");
+    end(ctl, pid);
+}
+
+#[test]
+fn publish_args() {
+    let p: unsharek_net::Publish = "8080:80".parse().unwrap();
+    assert_eq!((p.host, p.guest), ("127.0.0.1:8080".parse().unwrap(), 80));
+    let p: unsharek_net::Publish = "0.0.0.0:8080:80".parse().unwrap();
+    assert_eq!(p.host, "0.0.0.0:8080".parse().unwrap());
+    for bad in ["80", "a:80", "8080:b", "1.2.3:8080:80"] {
+        assert!(bad.parse::<unsharek_net::Publish>().is_err(), "{bad}");
+    }
 }

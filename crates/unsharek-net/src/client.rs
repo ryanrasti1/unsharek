@@ -73,6 +73,36 @@ impl<S: PacketSocket> Client<S> {
         })
     }
 
+    /// `listen(port)`: the published port's listener for the guest's `port`, then its connections,
+    /// one [`Client::accept`] each.
+    pub fn listen(self: &Arc<Self>, port: u16) -> impl Future<Output = Result<RpcStub, Rejection>> + Send + use<S> {
+        let this = Arc::clone(self);
+        capnweb::runtime::scope(Arc::clone(&self.runtime), async move {
+            let main = this.main()?;
+            let call = main.call(
+                vec![protocol::LISTEN.to_owned()],
+                RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::Number(f64::from(port))])),
+            );
+            match call.pull().await.map_err(|e| rejection(&e))? {
+                CapnwebValue::Stub(stub) => Ok(stub),
+                _ => Err(None),
+            }
+        })
+    }
+
+    /// The listener's next connection: its fd, received, and its peer.
+    pub fn accept(&self, listener: &RpcStub) -> impl Future<Output = Result<(RawFd, std::net::SocketAddr), Rejection>> + Send + use<S> {
+        let call = listener.call(vec![protocol::ACCEPT.to_owned()], RpcPayload::from_app_params(CapnwebValue::Array(vec![])));
+        capnweb::runtime::scope(Arc::clone(&self.runtime), async move {
+            let CapnwebValue::Array(v) = call.pull().await.map_err(|e| rejection(&e))? else { return Err(None) };
+            let [fd, ip, port] = &v[..] else { return Err(None) };
+            let fd = fd.downcast_custom::<Fd>().map_err(|_| None)?.0;
+            let (CapnwebValue::String(ip), CapnwebValue::Number(port)) = (ip, port) else { return Err(None) };
+            let ip: IpAddr = ip.parse().map_err(|_| None)?;
+            Ok((fd, std::net::SocketAddr::new(ip, *port as u16)))
+        })
+    }
+
     /// `resolve(name)`: its IPv4 addresses.
     pub fn resolve(self: &Arc<Self>, name: String) -> impl Future<Output = Result<Vec<Ipv4Addr>, Rejection>> + Send + use<S> {
         let this = Arc::clone(self);
