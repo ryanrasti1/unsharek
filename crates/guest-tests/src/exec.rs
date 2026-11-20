@@ -89,7 +89,7 @@ fn after(state: &str) {
 /// subtract with overflow" in `Context::new`, a stack top of 0), then hung: the exec ends the
 /// main thread, whose host slot's coroutines were freed, one of them the scheduler's root, which
 /// has no stack of its own (it ran on the host thread's); on the free list, the new thread's
-/// scheduler coroutine was made in it (crates/rt/src/sched.rs's `free_slot`). How the main thread
+/// scheduler coroutine was made in it (crates/unsharek-rt/src/sched.rs's `free_slot`). How the main thread
 /// waits doesn't matter (a timed futex, as libtest's, a plain one, pause, a join all did it); that
 /// the new image makes a thread does. exec_reset hit it only through libtest's thread.
 pub fn exec_then_threads() {

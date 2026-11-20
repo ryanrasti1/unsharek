@@ -221,15 +221,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f0d310082fd5de539d4f41601182241147498444a7695c520288a0cdbead6"
 
 [[package]]
-name = "exobox"
+name = "unsharek"
 version = "0.0.0"
 dependencies = [
  "clap",
- "exobox-build",
- "exobox-erofs",
- "exobox-fixtures",
- "exobox-rt",
- "exobox-tcb",
+ "unsharek-build",
+ "unsharek-erofs",
+ "unsharek-fixtures",
+ "unsharek-rt",
+ "unsharek-tcb",
  "futures-core",
  "futures-io",
  "libc",
@@ -243,14 +243,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "exobox-build"
+name = "unsharek-build"
 version = "0.0.0"
 dependencies = [
  "cc",
 ]
 
 [[package]]
-name = "exobox-erofs"
+name = "unsharek-erofs"
 version = "0.0.0"
 dependencies = [
  "clap",
@@ -260,30 +260,30 @@ dependencies = [
 ]
 
 [[package]]
-name = "exobox-examples"
+name = "unsharek-examples"
 version = "0.0.0"
 dependencies = [
- "exobox",
- "exobox-build",
- "exobox-erofs",
- "exobox-fixtures",
+ "unsharek",
+ "unsharek-build",
+ "unsharek-erofs",
+ "unsharek-fixtures",
  "futures-io",
  "libc",
  "tempfile",
 ]
 
 [[package]]
-name = "exobox-fixtures"
+name = "unsharek-fixtures"
 version = "0.0.0"
 dependencies = [
  "cc",
 ]
 
 [[package]]
-name = "exobox-rt"
+name = "unsharek-rt"
 version = "0.0.0"
 dependencies = [
- "exobox-fixtures",
+ "unsharek-fixtures",
  "libc",
  "lkl-sys",
  "object",
@@ -292,7 +292,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "exobox-tcb"
+name = "unsharek-tcb"
 version = "0.0.0"
 dependencies = [
  "libc",

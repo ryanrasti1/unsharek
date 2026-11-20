@@ -1,4 +1,4 @@
-//! Each example run once, small (`EXOBOX_EXAMPLE_QUICK`), under a timeout, its key output
+//! Each example run once, small (`UNSHAREK_EXAMPLE_QUICK`), under a timeout, its key output
 //! checked: so `./test` keeps them from rotting. An example whose nixpkgs program isn't in the
 //! environment says "skipped:", which passes.
 
@@ -13,8 +13,8 @@ fn run(bin: &str, args: &[&str]) -> (bool, String) {
     let exe = std::env::var_os(format!("CARGO_BIN_EXE_{bin}")).expect("cargo sets CARGO_BIN_EXE_<name>");
     let mut child = Command::new(exe)
         .args(args)
-        .env("EXOBOX_EXAMPLE_QUICK", "1")
-        .env("EXOBOX_IMAGE_CACHE", PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("image-cache"))
+        .env("UNSHAREK_EXAMPLE_QUICK", "1")
+        .env("UNSHAREK_IMAGE_CACHE", PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("image-cache"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

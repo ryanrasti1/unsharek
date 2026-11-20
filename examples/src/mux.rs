@@ -1,13 +1,13 @@
 //! A tiny multiplexing protocol for `net-policy`: every connect and lookup of a sandbox over ONE
 //! host fd (a socketpair end the sandbox holds as "net", `Guest::hold_fd_as`, which the hooks
 //! find with `cx.held`), to a proxy process at its other end. After
-//! `crates/exobox/tests/net.rs`'s test provider.
+//! `crates/unsharek/tests/net.rs`'s test provider.
 //!
 //! A frame is `id: u32 LE, op: u8, len: u32 LE, payload`. A connect or lookup is a request with a
 //! fresh id, answered by one reply; a connected stream's bytes and closes then go both ways under
 //! the request's id.
 //!
-//! Two halves: [`hooks`] runs inside the sandbox (exobox's async hooks, on its executor), and
+//! Two halves: [`hooks`] runs inside the sandbox (unsharek's async hooks, on its executor), and
 //! [`serve`] in the proxy (ordinary blocking Rust, a thread per connection), which asks a
 //! [`Policy`] about each request. The policy lives in the proxy, not in the hooks: see the
 //! authority rule in `net-policy.rs`.
@@ -23,7 +23,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
-use exobox::{Cx, HeldFd, NetError, OnConnect, OnResolve};
+use unsharek::{Cx, HeldFd, NetError, OnConnect, OnResolve};
 use futures_io::{AsyncRead, AsyncWrite};
 
 const CONNECT: u8 = 1; // pid: i32 LE, ip: 4 bytes, port: u16 BE, the name it was resolved from
@@ -170,7 +170,7 @@ async fn request(s: &Shared, op: u8, payload: &[u8]) -> (u32, u8, Vec<u8>) {
     (id, op, data)
 }
 
-/// A connection's stream over the session: what exobox copies the program's socket to and from.
+/// A connection's stream over the session: what unsharek copies the program's socket to and from.
 struct Proxied {
     id: u32,
     s: Shared,

@@ -155,7 +155,7 @@ paired ratios, not single numbers.
 bench/run --work rustc,xz --modes native,coroutine,threaded --reps 3
 bench/run --work make,rustmake --modes native,fork --reps 3 --perf $(command -v perf)
 bench/run --work rustc,make --modes native,fork,fork:stats --variant stats   # the counters
-bench/run --work rustc --modes native,fork,fork:a --variant a=/path/to/another/exobox
+bench/run --work rustc --modes native,fork,fork:a --variant a=/path/to/another/unsharek
 ```
 
 Per run: wall time, CPU time across every process (`perf stat` task-clock; `wait4`'s rusage misses
@@ -166,8 +166,8 @@ has them. JSON lines with `--log`. Workloads: `rustc` (regex-syntax 0.8 from `~/
 a chain of dependencies, and a binary, `-C opt-level=3 -C codegen-units=16`, linked by cc), `cargo`
 (the same workspace, `cargo build -j4 --release`; blocked by the crash). Every run has a timeout.
 
-**Counters** (`crates/rt/src/stats.rs`, the cargo feature `stats`: one-line calls where each event
-happens, compiled out without it; `--variant stats` builds it as `target/release/exobox-stats`;
+**Counters** (`crates/unsharek-rt/src/stats.rs`, the cargo feature `stats`: one-line calls where each event
+happens, compiled out without it; `--variant stats` builds it as `target/release/unsharek-stats`;
 earlier, the same counters were spliced into a scratch copy by a script). TSC-based, relaxed atomics
 in the shared section (so fork mode's processes add into one set), printed at the sandbox's end: per
 trapped syscall number, calls and cycles in the dispatcher and how much of that was waiting for the

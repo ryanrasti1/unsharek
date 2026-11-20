@@ -1,13 +1,13 @@
-# The kernel: exobox's LKL series
+# The kernel: unsharek's LKL series
 
-exobox's kernel is stock LKL (`github.com/lkl/linux` master at `d0f76a77e`, Linux 6.12) plus a
+unsharek's kernel is stock LKL (`github.com/lkl/linux` master at `d0f76a77e`, Linux 6.12) plus a
 series of 24 commits: branch `exobox-native` of `github.com/ryanrasti/linux`, checked out here as
 the submodule `crates/lkl-sys/linux`. This file describes that series as it is, commit by commit: what each
 does and why, what it adds to the host interface, and the test in `tools/lkl/tests/boot.c` that
 fails without it. Each commit's message has the full account.
 
 The series is what an in-process kernel needs to host unmodified programs behind seccomp that
-stock LKL doesn't do. Its pieces are numbered **items** (1-16, plus the halt fix): exobox's code
+stock LKL doesn't do. Its pieces are numbered **items** (1-16, plus the halt fix): unsharek's code
 names them that way ("the kernel series' item 8" is signals), and several commits can belong to
 one item.
 
@@ -53,9 +53,9 @@ n`, called by the host through `lkl_syscall`) and functions the host calls direc
 | 21 | `43d42ce36c9f` lkl_net_syscall, the network host code's own syscalls as the tsi task | 15 | The host's network code may make syscalls of its own through a library (a stack probe's `/proc/self/maps`, `getrandom`); made with `lkl_syscall` from a host thread with no task, each got a thread of init's process that never ended, so init's process never did and the sandbox hung after the program's exit. `lkl_net_syscall` runs them as the `tsi` task; the calls that would end it or make it a process's are `-EINVAL`. | `lkl_net_syscall` | `tsi_syscall` |
 | 22 | `35f332685c29` memblk disks of extents: host memory or zeros, in order | 12 | A disk was one mapping, an image file mapped whole. For an image synthesized over the host's own files (its metadata in a buffer, each file's data the host's mapping of it, an ELF slot's zeros), a disk is now an ordered table of extents (`struct lkl_memblk_extent { addr, len }`: whole 512-byte sectors, `addr` 0 for zeros, 1 to 2^20 of them, copied by the kernel), read by bisection and memcpy. | `memblk_add(extents, n)` replaces `memblk_add(addr, len)` | `memblk_extents` |
 | 23 | `7e55ea2daab5` boot.c compiles again | - | Commit 22's merge put `memblk_extents` inside `hostfd_nonblock`'s last `if`: boot.c didn't compile from 22 to here. | - | (boot.c builds) |
-| 24 | `ba962908b0c1` a blocking host fd write is whole, the host asked for the rest | 11 | A blocking write was whole only if the host wrote it all in one call, i.e. waited as long as a full pipe's reader took; exobox can't (its host thread runs every task, or holds the one CPU token). The host may now take a write in pieces, or wait a while taking none and return `-ERESTARTSYS`; the kernel asks for the rest until it is whole or a signal is pending, as `pipe_write` does. | `hostfd_rw`'s contract (host_ops.h) | `hostfd_pieces` |
+| 24 | `ba962908b0c1` a blocking host fd write is whole, the host asked for the rest | 11 | A blocking write was whole only if the host wrote it all in one call, i.e. waited as long as a full pipe's reader took; unsharek can't (its host thread runs every task, or holds the one CPU token). The host may now take a write in pieces, or wait a while taking none and return `-ERESTARTSYS`; the kernel asks for the rest until it is whole or a signal is pending, as `pipe_write` does. | `hostfd_rw`'s contract (host_ops.h) | `hostfd_pieces` |
 
-exobox's own tests of the same items are in `crates/exobox/tests/suite.rs` and
+unsharek's own tests of the same items are in `crates/unsharek/tests/suite.rs` and
 `crates/guest-tests` (e.g. `exit_code`, `thread_fds`, `forkthreads`, `sysaudit`, `abort`,
 `sigterm`, `fork_rng`, `settid`, `exec_reset`, `stdin`, `stdout_full*`, `meminfo`, `python`,
 `idle_cpu`; `net_*` and `passfd_epoll*` in `tests/net.rs`).
@@ -79,7 +79,7 @@ Five files of core Linux, +47 lines, each the smallest hook for what the arch ca
 default); `POSIX_TIMERS` (itimers deliver SIGALRM); no `FUTEX` (the host emulates futexes: the
 program's memory isn't the kernel's); no sysfs (700 KB of slab, 3 ms of boot); `SLUB_TINY`; no
 IPv6; of filesystems only proc, devpts, erofs and ramfs (the root, /tmp). The pool is `mem=` on the
-command line, from exobox's `GuestConfig::kernel_memory` (32 MB by default, 16 MB at least).
+command line, from unsharek's `GuestConfig::kernel_memory` (32 MB by default, 16 MB at least).
 
 ## Known limits
 - **An exec from a thread other than the main one keeps the thread's tid**: after it,
@@ -89,14 +89,14 @@ command line, from exobox's `GuestConfig::kernel_memory` (32 MB by default, 16 M
 - **The kernel never interrupts a thread running outside it.** A signal for a thread in user code
   waits for its next syscall's return, and so does a kill: an exec's, `exit_group`'s or a fatal
   signal's, which the exec or the process's end then waits for. (Go's asynchronous preemption,
-  SIGURG to a loop without calls, isn't delivered: the suite's `go` case leaves it out.) exobox
+  SIGURG to a loop without calls, isn't delivered: the suite's `go` case leaves it out.) unsharek
   works around the rest: threads parked in its own waits (emulated futexes, host fds) are woken
   to make a call (`Sched::interrupt_waits`), and threaded mode's `exit_group` ends the host
   process itself.
 - **The kernel is tickless only while the idle host task is current.** A host task that leaves
   the kernel with nothing else runnable stays current, so while a program thread waits in the
-  host's own wait (exobox's emulated futex) the kernel isn't idle and its timer keeps firing: a
-  1 s futex wait in exobox fires the host timer about 100 times, a 1 s nanosleep 6 times. exobox
+  host's own wait (unsharek's emulated futex) the kernel isn't idle and its timer keeps firing: a
+  1 s futex wait in unsharek fires the host timer about 100 times, a 1 s nanosleep 6 times. unsharek
   doesn't wake its waiters for those fires unless the program armed a signal timer. Making the
   host's waits release the CPU to the idle host task would end them.
 - **`new_exec` leaves out** credentials (no setuid file is executed), personality, dumpability,
@@ -116,16 +116,16 @@ command line, from exobox's `GuestConfig::kernel_memory` (32 MB by default, 16 M
 ## Building
 Built out of tree by `make` (`crates/lkl-sys/Makefile`, into `target/lkl`; incremental, the cold build ~20 s
 on 24 cores) from the submodule `crates/lkl-sys/linux`, in development and in `nix build` alike (`nix build`
-sees it through the flake's `inputs.self.submodules`). `EXOBOX_LKL_SRC` names another checkout
-(a worktree has no submodule checked out), `EXOBOX_LKL_CONFIG` adds a config fragment over
-`crates/lkl-sys/defconfig`. For `nix build` the kernel is its own derivation (`lib.exoboxKernel`), linked
-through lkl-sys's `EXOBOX_LKL_PREBUILT`.
+sees it through the flake's `inputs.self.submodules`). `UNSHAREK_LKL_SRC` names another checkout
+(a worktree has no submodule checked out), `UNSHAREK_LKL_CONFIG` adds a config fragment over
+`crates/lkl-sys/defconfig`. For `nix build` the kernel is its own derivation (`lib.unsharekKernel`), linked
+through lkl-sys's `UNSHAREK_LKL_PREBUILT`.
 
 The series is the branch `exobox-native` of `github.com/ryanrasti/linux`, the submodule's URL
 (`git@github.com:ryanrasti/linux.git`, `.gitmodules`' branch). Work on it happens in a checkout
-of that repository; a commit of it reaches exobox as the submodule's new commit together with
-exobox's side of the change (the host-operations table in `crates/rt`, when the host interface
-moved), in one exobox commit. `crates/lkl-sys` runs the make from its build.rs and links the
-kernel object alone (`liblkl-kernel.a`, tools/lkl's `lib/lkl.o`), not `tools/lkl/lib`: exobox
+of that repository; a commit of it reaches unsharek as the submodule's new commit together with
+unsharek's side of the change (the host-operations table in `crates/unsharek-rt`, when the host interface
+moved), in one unsharek commit. `crates/lkl-sys` runs the make from its build.rs and links the
+kernel object alone (`liblkl-kernel.a`, tools/lkl's `lib/lkl.o`), not `tools/lkl/lib`: unsharek
 provides the host ops itself. The stock posix host (`liblkl-posix.a`) is linked only by lkl-sys's
 smoke test.

@@ -6,12 +6,12 @@
 //! then Python runs the script, which reads both. Inside a `run` closure, `std::fs` acts on the
 //! guest: this thread's syscalls are the guest's, as its init. Host work and closures interleave.
 //!
-//!     cargo run -p exobox-examples --bin setup
+//!     cargo run -p unsharek-examples --bin setup
 
 use std::fs;
 
-use exobox::{Guest, GuestConfig, setup};
-use exobox_examples as ex;
+use unsharek::{Guest, GuestConfig, setup};
+use unsharek_examples as ex;
 
 const SCRIPT: &str = r#"
 import os
@@ -21,10 +21,10 @@ print("/app holds", sorted(os.listdir("/app")), f"(writable: {os.access('/app', 
 print("the host's", os.environ["HOST_DIR"], "exists here:", os.path.exists(os.environ["HOST_DIR"]))
 "#;
 
-fn main() -> Result<(), exobox::Error> {
-    let python = ex::nix_program("EXOBOX_TEST_PYTHON");
+fn main() -> Result<(), unsharek::Error> {
+    let python = ex::nix_program("UNSHAREK_TEST_PYTHON");
 
-    // Host work first: the app's tree, and its image. `exobox_erofs::build` is what the store's
+    // Host work first: the app's tree, and its image. `unsharek_erofs::build` is what the store's
     // cache uses for each store path; here it packs an ordinary directory.
     let dir = tempfile::tempdir()?;
     let app = dir.path().join("app");
@@ -32,7 +32,7 @@ fn main() -> Result<(), exobox::Error> {
     fs::write(app.join("main.py"), SCRIPT)?;
     fs::write(app.join("data.txt"), "hello from an erofs image\n")?;
     let image_path = dir.path().join("app.erofs");
-    exobox_erofs::build(&app, &image_path)?;
+    unsharek_erofs::build(&app, &image_path)?;
 
     let mut g = Guest::boot(GuestConfig::default())?;
     let store = g.map_closure(&python, &[])?;
@@ -45,7 +45,7 @@ fn main() -> Result<(), exobox::Error> {
     })??;
     // The host's again: host data the guest gets is read out here, and moved in by a closure.
     let config = format!("greeting=hi, written by host pid {}\n", std::process::id());
-    // Mapped: the guest's /dev/exobox/app. The mapping is what the guest reads, so the host's
+    // Mapped: the guest's /dev/unsharek/app. The mapping is what the guest reads, so the host's
     // files can go now (and must, here: `run` never returns to drop `dir`).
     let image = g.map_image(&image_path)?;
     let host_dir = dir.path().display().to_string();
@@ -59,6 +59,6 @@ fn main() -> Result<(), exobox::Error> {
     })??;
     let argv = ex::os(&[python.to_str().unwrap(), "/app/main.py"]);
     let env = ex::os(&[&format!("HOST_DIR={host_dir}")]);
-    let Err(e) = g.lockdown(exobox::stdio).and_then(|l| l.exec(&argv, &env));
+    let Err(e) = g.lockdown(unsharek::stdio).and_then(|l| l.exec(&argv, &env));
     ex::fail(e)
 }

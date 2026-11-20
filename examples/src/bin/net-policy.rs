@@ -8,13 +8,13 @@
 //! - the sandbox: Python's `urllib` fetching an allowed URL and some refused ones. Its network
 //!   hooks (`OnConnect`, `OnResolve`) send every connect and lookup over its one held fd
 //!   (`Guest::hold_fd_as`, found by the hooks with `cx.held`) to the proxy
-//!   (`exobox_examples::mux`: a tiny framing), a session started at lockdown (`on_start`). A
+//!   (`unsharek_examples::mux`: a tiny framing), a session started at lockdown (`on_start`). A
 //!   connect carries the name its address was resolved from (`cx.name_of`).
 //!
 //! Run it:
 //!
-//!     cargo run -p exobox-examples --bin net-policy                 # fully local
-//!     cargo run -p exobox-examples --bin net-policy -- --internet   # example.com:80 allowed too
+//!     cargo run -p unsharek-examples --bin net-policy                 # fully local
+//!     cargo run -p unsharek-examples --bin net-policy -- --internet   # example.com:80 allowed too
 //!
 //! **The authority rule.** The hooks run inside the sandbox, in the program's address space: a
 //! compromised program can rewrite them, and drive the held fd itself. So the policy can't live
@@ -27,8 +27,8 @@ use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
-use exobox::{Guest, GuestConfig, NetError, setup};
-use exobox_examples::{self as ex, mux};
+use unsharek::{Guest, GuestConfig, NetError, setup};
+use unsharek_examples::{self as ex, mux};
 
 const CLIENT: &str = r#"
 import sys, urllib.request
@@ -42,7 +42,7 @@ for url in sys.argv[1:]:
 
 /// The allowlist: a name, the one port allowed on it, and where the proxy really connects. Each
 /// name resolves to an address of no one (10.0.0.N): a loopback answer would be the guest's own
-/// loopback, which never reaches the hooks. (Without an `on_resolve` at all, exobox would give
+/// loopback, which never reaches the hooks. (Without an `on_resolve` at all, unsharek would give
 /// each name an address of its own, and the connect would still carry the name.)
 struct Allow {
     name: String,
@@ -83,8 +83,8 @@ fn refuse(pid: i32, addr: SocketAddrV4, why: &str) -> Result<TcpStream, NetError
 }
 
 /// The sandbox, built here and forked off: `sock` is its end of the socketpair, held for the hooks.
-fn sandbox(sock: UnixStream, urls: Vec<String>) -> Result<exobox::Child, exobox::Error> {
-    let python = ex::nix_program("EXOBOX_TEST_PYTHON");
+fn sandbox(sock: UnixStream, urls: Vec<String>) -> Result<unsharek::Child, unsharek::Error> {
+    let python = ex::nix_program("UNSHAREK_TEST_PYTHON");
     let (on_connect, on_resolve) = mux::hooks();
     let mut g = Guest::boot(GuestConfig::default())?;
     g.on_connect(on_connect)?;
@@ -97,7 +97,7 @@ fn sandbox(sock: UnixStream, urls: Vec<String>) -> Result<exobox::Child, exobox:
     argv.extend(urls);
     let argv: Vec<_> = argv.into_iter().map(Into::into).collect();
     let env = ex::os(&["PYTHONUNBUFFERED=1"]); // its lines in order with the proxy's
-    g.spawn(move |g| g.lockdown(exobox::stdio)?.exec(&argv, &env))
+    g.spawn(move |g| g.lockdown(unsharek::stdio)?.exec(&argv, &env))
 }
 
 fn main() {
@@ -112,7 +112,7 @@ fn main() {
         mux::serve(UnixStream::from(unsafe { OwnedFd::from_raw_fd(3) }), Proxy(allow));
         return;
     }
-    let _ = ex::nix_program("EXOBOX_TEST_PYTHON"); // skip before starting anything
+    let _ = ex::nix_program("UNSHAREK_TEST_PYTHON"); // skip before starting anything
     let port = http_server();
     let mut urls = vec![
         format!("http://web.local:{port}/"),     // allowed

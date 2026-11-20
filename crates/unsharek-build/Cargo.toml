@@ -1,0 +1,12 @@
+[package]
+name = "unsharek-build"
+version = "0.0.0"
+description = "For build scripts of binaries that embed unsharek: the fixed-address link the unsharek CLI uses (-400 KB a sandbox)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# finds the C compiler, to ask it for its PIE start files
+cc.workspace = true

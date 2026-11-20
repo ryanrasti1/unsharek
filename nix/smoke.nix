@@ -1,14 +1,14 @@
-# The release smoke test (the flake's checks.<system>.smoke): the release `exobox` runs real
+# The release smoke test (the flake's checks.<system>.smoke): the release `unsharek` runs real
 # programs in all three modes inside Nix's build sandbox, each output checked. What the sandbox
-# changes for exobox, and how it's met:
-# - No Nix database: exobox finds a program's closure with `nix-store --query --requisites`. The
+# changes for unsharek, and how it's met:
+# - No Nix database: unsharek finds a program's closure with `nix-store --query --requisites`. The
 #   programs' closure is registered in a database of the build's own (closureInfo's
-#   registration, loaded with `nix-store --load-db` under NIX_STATE_DIR), which exobox's
+#   registration, loaded with `nix-store --load-db` under NIX_STATE_DIR), which unsharek's
 #   nix-store then reads.
-# - No $HOME: the image cache is $EXOBOX_IMAGE_CACHE, in the build's $TMPDIR.
-# - Nix's own seccomp filter is under exobox's (filters stack: the strictest answer wins), and
-#   /dev and /proc are the sandbox's: exobox's guest has its own of both.
-{ pkgs, exobox, tp }:
+# - No $HOME: the image cache is $UNSHAREK_IMAGE_CACHE, in the build's $TMPDIR.
+# - Nix's own seccomp filter is under unsharek's (filters stack: the strictest answer wins), and
+#   /dev and /proc are the sandbox's: unsharek's guest has its own of both.
+{ pkgs, unsharek, tp }:
 let
   programs = {
     hello = pkgs.hello;
@@ -19,9 +19,9 @@ let
   };
   closure = pkgs.closureInfo { rootPaths = builtins.attrValues programs; };
 in
-pkgs.runCommand "exobox-smoke"
+pkgs.runCommand "unsharek-smoke"
   {
-    nativeBuildInputs = [ exobox pkgs.nix ];
+    nativeBuildInputs = [ unsharek pkgs.nix ];
     env = {
       HELLO = "${programs.hello}/bin/hello";
       PYTHON = "${programs.python}/bin/python3";
@@ -35,7 +35,7 @@ pkgs.runCommand "exobox-smoke"
   ''
     export NIX_STATE_DIR=$TMPDIR/nix-state NIX_REMOTE=
     nix-store --load-db < ${closure}/registration
-    export EXOBOX_IMAGE_CACHE=$TMPDIR/exobox-images
+    export UNSHAREK_IMAGE_CACHE=$TMPDIR/unsharek-images
 
     fails=0
     # check NAME MODE WANT -- PROGRAM ARGS...: the run exits 0 within 60 s and its stdout has WANT.
@@ -43,7 +43,7 @@ pkgs.runCommand "exobox-smoke"
     check() {
       local name=$1 mode=$2 want=$3; shift 4
       local t0=$EPOCHREALTIME out st=0
-      out=$(timeout 60 exobox run --mode "$mode" --allow-path "$COREUTILS" --allow-path "''${HTTPBIN%/bin/*}" \
+      out=$(timeout 60 unsharek run --mode "$mode" --allow-path "$COREUTILS" --allow-path "''${HTTPBIN%/bin/*}" \
         -- "$@" 2>"$TMPDIR/err" <<<"''${IN:-}") || st=$?
       local ms=$(( (''${EPOCHREALTIME/./} - ''${t0/./}) / 1000 ))
       if [[ $st == 0 && $out == *"$want"* ]]; then

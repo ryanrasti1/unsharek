@@ -1,6 +1,6 @@
 //! Sockets on the guest's own loopback (hello.c's TCP part, net.c's `loopback`), and the network
 //! beyond it as a sandbox without network hooks has it (the CLI's: none). What a sandbox's hooks
-//! do with the program's connects is crates/exobox/tests/net.rs's (the library's API).
+//! do with the program's connects is crates/unsharek/tests/net.rs's (the library's API).
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};

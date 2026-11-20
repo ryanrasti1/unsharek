@@ -9,7 +9,7 @@ small versions here were checked to show the same ratios (PERF.md, "The vs-nativ
 
   ./test --vs-native                       every workload, threaded and fork mode
   ./test --vs-native --modes fork --work make,micro
-  ./test --vs-native --exobox PATH         another exobox binary (an experiment's)
+  ./test --vs-native --unsharek PATH         another unsharek binary (an experiment's)
   ./test --vs-native --modes fork,fork:old --variant old=PATH   before and after, interleaved
   ./test --vs-native --modes fork,fork:stats --variant stats     the runtime's counters' build
 
@@ -41,7 +41,7 @@ SINGLE = {'rustc', 'xz', 'micro'}  # one process: every mode; the rest need fork
 
 def fixtures():
     """The fixtures' bin directory (the newest build's)."""
-    dirs = glob.glob(os.path.join(bb.ROOT, 'target', 'release', 'build', 'exobox-fixtures-*', 'out', 'bin'))
+    dirs = glob.glob(os.path.join(bb.ROOT, 'target', 'release', 'build', 'unsharek-fixtures-*', 'out', 'bin'))
     dirs = [d for d in dirs if os.path.exists(os.path.join(d, 'exec_bench'))]
     if not dirs:
         sys.exit('no fixtures with exec_bench under target/release: build first (bench/quick does)')
@@ -64,9 +64,9 @@ FLAGS = '--edition 2021 -C opt-level=3 -C codegen-units=16 -C debuginfo=0'
 
 def setup(tmp, fx):
     rc = bb.rustc_real()
-    bash, make, gcc = os.environ['EXOBOX_TEST_BASH'], os.environ['EXOBOX_TEST_MAKE'], os.environ['EXOBOX_TEST_GCC']
-    cu = os.environ['EXOBOX_TEST_COREUTILS']
-    xz = os.environ['EXOBOX_TEST_XZ']
+    bash, make, gcc = os.environ['UNSHAREK_TEST_BASH'], os.environ['UNSHAREK_TEST_MAKE'], os.environ['UNSHAREK_TEST_GCC']
+    cu = os.environ['UNSHAREK_TEST_COREUTILS']
+    xz = os.environ['UNSHAREK_TEST_XZ']
     w = {}
     # rustc: one crate.
     src = os.path.join(tmp, 'rustc-src')
@@ -161,9 +161,9 @@ def main():
     ap.add_argument('--modes', default='threaded,fork')
     ap.add_argument('--reps', type=int, default=3)
     ap.add_argument('--cpus', default=os.environ.get('BENCH_CPUS', '0-7'))
-    ap.add_argument('--exobox', default=os.path.join(bb.ROOT, 'target', 'release', 'exobox'))
+    ap.add_argument('--unsharek', default=os.path.join(bb.ROOT, 'target', 'release', 'unsharek'))
     ap.add_argument('--variant', action='append', default=[], metavar='NAME=PATH',
-                    help='another exobox binary; a mode MODE:NAME runs it (before/after in one run); '
+                    help='another unsharek binary; a mode MODE:NAME runs it (before/after in one run); '
                     '`stats` alone: the counters\' build')
     ap.add_argument('--timeout', type=float, default=60)
     ap.add_argument('--no-fail', action='store_true', help='report only: exit 0 whatever the ratios')
@@ -179,14 +179,14 @@ def main():
 
     def exe_of(m):
         var = m.partition(':')[2]
-        return variants[var] if var else a.exobox
+        return variants[var] if var else a.unsharek
     fx = fixtures()
     setups = setup(a.tmp, fx)
     cpus = a.cpus or None
     walls = {}   # (work, mode) -> [s]
     micro = {}   # (op, mode) -> [value]
     failed = []
-    counters = {}  # what -> the last run's EXOBOX_STATS (the `stats` build's)
+    counters = {}  # what -> the last run's UNSHAREK_STATS (the `stats` build's)
 
     def go(cmd, env, what):
         st, wall, _, _, out, err, _ = bb.run(cmd, a.timeout, env=env, cpus=cpus)

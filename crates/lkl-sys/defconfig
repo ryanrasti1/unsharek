@@ -1,4 +1,4 @@
-# exobox's kernel config (crates/lkl-sys/Makefile copies it to the build's .config and expands it with
+# unsharek's kernel config (crates/lkl-sys/Makefile copies it to the build's .config and expands it with
 # olddefconfig). Started from capnix tier A's tiera_defconfig: the smallest kernel the programs
 # need. tools/lkl appends its host's kernel.config (64BIT and the like) to it.
 #

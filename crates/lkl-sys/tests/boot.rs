@@ -1,5 +1,5 @@
 //! The plumbing, proven on stock parts: the kernel boots with tools/lkl's posix host, answers
-//! syscalls, and halts. This is the only place the posix host is linked; exobox provides its own
+//! syscalls, and halts. This is the only place the posix host is linked; unsharek provides its own
 //! host operations.
 
 use core::ffi::{CStr, c_long};
@@ -17,9 +17,9 @@ unsafe extern "C" {
 // shim.c's callbacks: the linker may still pull shim.c's object in (when it meets lkl-shim before
 // the posix host's definitions), and then they must exist. Unused here.
 #[unsafe(no_mangle)]
-extern "C" fn exobox_lkl_print(_: *const core::ffi::c_char, _: core::ffi::c_ulong) {}
+extern "C" fn unsharek_lkl_print(_: *const core::ffi::c_char, _: core::ffi::c_ulong) {}
 #[unsafe(no_mangle)]
-extern "C" fn exobox_lkl_panic() -> ! {
+extern "C" fn unsharek_lkl_panic() -> ! {
     std::process::abort()
 }
 

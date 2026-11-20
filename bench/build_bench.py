@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build benchmarks: native against each exobox mode, wall and CPU time, interleaved reps.
+"""Build benchmarks: native against each unsharek mode, wall and CPU time, interleaved reps.
 
 Run through `bench/run` (it enters the devshell and builds release). Every run is bounded
 by a timeout; a run that fails or times out is reported, not retried. See bench/PERF.md for what
@@ -20,8 +20,8 @@ binary (an experiment's build) in that mode, for A/B comparisons in one interlea
 runs every mode once, in order, so load from other processes on the machine hits all of them
 alike; min, median and the paired (same-rep) ratio to native are reported.
 
-`--exobox PATH` runs another exobox binary. `--variant stats` (no path) is the runtime's counters
-(the cargo feature `stats`, built by bench/run): its `EXOBOX_STATS` lines (stderr) are kept
+`--unsharek PATH` runs another unsharek binary. `--variant stats` (no path) is the runtime's counters
+(the cargo feature `stats`, built by bench/run): its `UNSHAREK_STATS` lines (stderr) are kept
 in the log and summarised.
 """
 
@@ -90,8 +90,8 @@ def run(cmd, timeout, env=None, cwd=None, cpus=None, perf=None):
     return status, wall, ru.ru_utime, ru.ru_stime, out.read().decode(errors='replace'), err.read().decode(errors='replace'), pc
 
 
-def sandboxed(exobox, mode, allow, argv, max_procs=None):
-    cmd = [exobox, 'run', '--mode', mode]
+def sandboxed(unsharek, mode, allow, argv, max_procs=None):
+    cmd = [unsharek, 'run', '--mode', mode]
     for a in allow:
         cmd += ['--allow-path', a]
     if max_procs:
@@ -157,7 +157,7 @@ def xz_input(tmp):
 
 
 def w_xz(a, tmp):
-    xz = os.environ.get('EXOBOX_TEST_XZ') or shutil.which('xz')
+    xz = os.environ.get('UNSHAREK_TEST_XZ') or shutil.which('xz')
     inp = xz_input(tmp)
     argv = [xz, '-T4', '-3', '--block-size=2MiB', '-c', inp]
     return lambda: argv, lambda: argv, [store_path(xz), os.path.dirname(inp)], None
@@ -170,8 +170,8 @@ def tools_env(tools):
 
 
 def w_make(a, tmp):
-    bash, make, gcc = os.environ['EXOBOX_TEST_BASH'], os.environ['EXOBOX_TEST_MAKE'], os.environ['EXOBOX_TEST_GCC']
-    cu = os.environ['EXOBOX_TEST_COREUTILS']
+    bash, make, gcc = os.environ['UNSHAREK_TEST_BASH'], os.environ['UNSHAREK_TEST_MAKE'], os.environ['UNSHAREK_TEST_GCC']
+    cu = os.environ['UNSHAREK_TEST_COREUTILS']
     src = os.path.join(tmp, 'make-src')
     if not os.path.exists(src):
         os.makedirs(src)
@@ -195,10 +195,10 @@ def w_make(a, tmp):
 
 
 def w_cargo(a, tmp):
-    bash, cu = os.environ['EXOBOX_TEST_BASH'], os.environ['EXOBOX_TEST_COREUTILS']
+    bash, cu = os.environ['UNSHAREK_TEST_BASH'], os.environ['UNSHAREK_TEST_COREUTILS']
     cargo = shutil.which('cargo')
     rustc = shutil.which('rustc')
-    cc = os.environ['EXOBOX_TEST_GCC']
+    cc = os.environ['UNSHAREK_TEST_GCC']
     src = os.path.join(tmp, 'cargo-src')
     if not os.path.exists(src):
         os.makedirs(src)
@@ -261,8 +261,8 @@ def w_rustmake(a, tmp):
     """cargo's work without cargo (made while cargo crashed the sandbox; kept: no cargo in it): the workspace's
     crates compiled by rustc under make -jN, the binary linked by cc."""
     w_cargo(a, tmp)  # generates the sources and rust.mk
-    bash, make, cu = os.environ['EXOBOX_TEST_BASH'], os.environ['EXOBOX_TEST_MAKE'], os.environ['EXOBOX_TEST_COREUTILS']
-    cc = os.environ['EXOBOX_TEST_GCC']
+    bash, make, cu = os.environ['UNSHAREK_TEST_BASH'], os.environ['UNSHAREK_TEST_MAKE'], os.environ['UNSHAREK_TEST_COREUTILS']
+    cc = os.environ['UNSHAREK_TEST_GCC']
     rc = rustc_real()
     src = os.path.join(tmp, 'cargo-src')
     env = tools_env([os.path.dirname(rc), cc, make, os.path.join(cu, 'bin')])
@@ -280,10 +280,10 @@ FORK_ONLY = {'make', 'cargo', 'rustmake'}
 
 
 def parse_stats(err):
-    """EXOBOX_STATS lines (the `stats` build's) into a dict."""
+    """UNSHAREK_STATS lines (the `stats` build's) into a dict."""
     st = {'k': {}, 'sys': {}}
     for line in err.splitlines():
-        if not line.startswith('EXOBOX_STATS '):
+        if not line.startswith('UNSHAREK_STATS '):
             continue
         f = line.split()[1:]
         kv = {x.split('=')[0]: float(x.split('=')[1]) for x in f if '=' in x}
@@ -297,9 +297,9 @@ def parse_stats(err):
 
 
 def parse_variants(vs):
-    """`--variant NAME=PATH`s into {NAME: PATH}. A NAME alone is target/release/exobox-NAME: `stats`,
+    """`--variant NAME=PATH`s into {NAME: PATH}. A NAME alone is target/release/unsharek-NAME: `stats`,
     the runtime's counters (the cargo feature `stats`), which bench/run builds there."""
-    return {n: p or os.path.join(ROOT, 'target', 'release', 'exobox-' + n) for n, _, p in (v.partition('=') for v in vs)}
+    return {n: p or os.path.join(ROOT, 'target', 'release', 'unsharek-' + n) for n, _, p in (v.partition('=') for v in vs)}
 
 
 def main():
@@ -309,9 +309,9 @@ def main():
     ap.add_argument('--reps', type=int, default=3)
     ap.add_argument('--cpus', default=os.environ.get('BENCH_CPUS', '0-7'),
                     help='taskset CPU list for every run (default: 0-7, this machine\'s P-cores); "" for none')
-    ap.add_argument('--exobox', default=os.path.join(ROOT, 'target', 'release', 'exobox'))
+    ap.add_argument('--unsharek', default=os.path.join(ROOT, 'target', 'release', 'unsharek'))
     ap.add_argument('--variant', action='append', default=[], metavar='NAME=PATH',
-                    help='another exobox binary; a mode MODE:NAME runs it (A/B runs, interleaved)')
+                    help='another unsharek binary; a mode MODE:NAME runs it (A/B runs, interleaved)')
     ap.add_argument('--crate-src', default=None)
     ap.add_argument('--cgu', type=int, default=16)
     ap.add_argument('--jobs', type=int, default=4)
@@ -322,7 +322,7 @@ def main():
     ap.add_argument('--tmp', default=None, help='work directory (default: a fresh one)')
     a = ap.parse_args()
     variants = parse_variants(a.variant)
-    tmp = a.tmp or tempfile.mkdtemp(prefix='exobox-bench-')
+    tmp = a.tmp or tempfile.mkdtemp(prefix='unsharek-bench-')
     os.makedirs(tmp, exist_ok=True)
     log = open(a.log, 'a') if a.log else None
     results = {}
@@ -339,11 +339,11 @@ def main():
                         e = dict(env, CARGO_HOME=os.path.join(tmp, 'cargo-home'))
                     cmd = native()
                 else:
-                    # exobox itself needs the host's PATH (nix-store, for the closures); the
+                    # unsharek itself needs the host's PATH (nix-store, for the closures); the
                     # program sees the tools first.
                     e = dict(env, PATH=env['PATH'] + ':' + os.environ.get('PATH', '')) if env else None
                     mode, _, var = m.partition(':')
-                    exe = variants[var] if var else a.exobox
+                    exe = variants[var] if var else a.unsharek
                     if mode not in ('fork',) and w in FORK_ONLY:
                         continue
                     cmd = sandboxed(exe, mode, allow, sb(), max_procs=32 if mode == 'fork' else None)

@@ -1,0 +1,11 @@
+[package]
+name = "unsharek-fixtures"
+version = "0.0.0"
+description = "The C programs unsharek's test suite runs; built by build.rs, found through DIR"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[build-dependencies]
+cc.workspace = true

@@ -1,6 +1,6 @@
 # Programs from nixpkgs (and one built here) that the suite runs in the sandbox, as the devshell's
-# EXOBOX_TEST_* variables (flake.nix), and that the flake's smoke check runs against the release
-# binary. Static ones first: exobox claims to run static binaries, so the suite runs real ones,
+# UNSHAREK_TEST_* variables (flake.nix), and that the flake's smoke check runs against the release
+# binary. Static ones first: unsharek claims to run static binaries, so the suite runs real ones,
 # each from a different toolchain.
 { pkgs }:
 {
@@ -9,7 +9,7 @@
   # Built here: no nixpkgs program does all of that in one process, which coroutine and threaded
   # mode need (they have no processes). A derivation, not a test-time build: seconds, once.
   goprobe = pkgs.stdenv.mkDerivation {
-    name = "exobox-goprobe";
+    name = "unsharek-goprobe";
     src = ./goprobe;
     nativeBuildInputs = [ pkgs.go ];
     env.CGO_ENABLED = "0";

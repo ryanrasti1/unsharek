@@ -8,23 +8,23 @@
 # `nix-collect-garbage` deleted them under a cache that still named them: the suite's busybox and
 # Go cases failed ("No such file or directory"), and one during a run killed it mid-test (the
 # devshell's own tools gone). A cache without its root (from before) is remade.
-if [[ -z "${EXOBOX_DEVSHELL:-}" ]]; then
-  _exobox_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  _exobox_key="$(cat "$_exobox_root/flake.nix" "$_exobox_root/flake.lock" "$_exobox_root/nix/test-programs.nix" \
-  "$_exobox_root/seccomp-fn/flake.nix" \
-  "$_exobox_root"/nix/goprobe/* 2>/dev/null | sha256sum | cut -c1-16)"
-  _exobox_env="$_exobox_root/.cache/devshell-$_exobox_key.sh"
-  if [[ ! -s "$_exobox_env" || ! -e "$_exobox_root/.cache/devshell-$_exobox_key" ]]; then
-    mkdir -p "$_exobox_root/.cache"
-    nix print-dev-env --profile "$_exobox_root/.cache/devshell-$_exobox_key" "$_exobox_root" >"$_exobox_env.tmp"
-    mv "$_exobox_env.tmp" "$_exobox_env"
+if [[ -z "${UNSHAREK_DEVSHELL:-}" ]]; then
+  _unsharek_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  _unsharek_key="$(cat "$_unsharek_root/flake.nix" "$_unsharek_root/flake.lock" "$_unsharek_root/nix/test-programs.nix" \
+  "$_unsharek_root/seccomp-fn/flake.nix" \
+  "$_unsharek_root"/nix/goprobe/* 2>/dev/null | sha256sum | cut -c1-16)"
+  _unsharek_env="$_unsharek_root/.cache/devshell-$_unsharek_key.sh"
+  if [[ ! -s "$_unsharek_env" || ! -e "$_unsharek_root/.cache/devshell-$_unsharek_key" ]]; then
+    mkdir -p "$_unsharek_root/.cache"
+    nix print-dev-env --profile "$_unsharek_root/.cache/devshell-$_unsharek_key" "$_unsharek_root" >"$_unsharek_env.tmp"
+    mv "$_unsharek_env.tmp" "$_unsharek_env"
   fi
   # print-dev-env's script sets the shell's options and traps; keep the caller's.
-  _exobox_opts="$(set +o)"
+  _unsharek_opts="$(set +o)"
   # shellcheck disable=SC1090
-  source "$_exobox_env"
-  eval "$_exobox_opts"
+  source "$_unsharek_env"
+  eval "$_unsharek_opts"
   trap - EXIT
-  export EXOBOX_DEVSHELL=1
-  unset _exobox_root _exobox_key _exobox_env _exobox_opts
+  export UNSHAREK_DEVSHELL=1
+  unset _unsharek_root _unsharek_key _unsharek_env _unsharek_opts
 fi

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build incrementally and run every test: the unit tests, the in-guest tests (crates/guest-tests:
-# a sandbox per test) and the host-side suite (crates/exobox/tests/suite.rs), natively and in each
+# a sandbox per test) and the host-side suite (crates/unsharek/tests/suite.rs), natively and in each
 # mode. Seconds, warm. Arguments go to cargo-nextest, e.g.:
 #   ./test -E 'test(/::fork$/)'      one mode of the suite
 #   ./test -E 'binary(guest_fork)'   the in-guest tests in fork mode
@@ -9,7 +9,7 @@
 #   ./test --perf                    the performance budgets instead (tests/perf.rs; tens of seconds)
 #   ./test --vs-native               each mode against native on build workloads (bench/quick.py)
 #   ./test --prove                   Kani's proofs: each #[seccomp] function equal to its program
-#                                    (seccomp-fn's examples, exobox-tcb's policy); minutes
+#                                    (seccomp-fn's examples, unsharek-tcb's policy); minutes
 set -euo pipefail
 root="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=devshell.sh
@@ -19,7 +19,7 @@ if [[ "${1:-}" == --prove ]]; then
   shift
   # -j: the harnesses in parallel (one per mode and shape; each a minute or two alone)
   cargo kani --manifest-path seccomp-fn/Cargo.toml -p seccomp-fn -j --output-format=terse "$@"
-  exec cargo kani -p exobox-tcb -j --output-format=terse "$@"
+  exec cargo kani -p unsharek-tcb -j --output-format=terse "$@"
 fi
 if [[ "${1:-}" == --vs-native ]]; then
   # Where each mode stands against native on the workloads that matter, in seconds

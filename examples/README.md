@@ -1,11 +1,11 @@
-# exobox examples
+# unsharek examples
 
-Small programs that use exobox's library the way an application would. Each is one file in
+Small programs that use unsharek's library the way an application would. Each is one file in
 `src/bin/`, runnable from the devshell:
 
 ```sh
-source devshell.sh                     # the toolchain, and $EXOBOX_TEST_PYTHON & co.
-cargo run -p exobox-examples --release --bin nix-program
+source devshell.sh                     # the toolchain, and $UNSHAREK_TEST_PYTHON & co.
+cargo run -p unsharek-examples --release --bin nix-program
 ```
 
 An example whose nixpkgs program isn't in the environment prints `skipped: ...` and exits 0.
@@ -19,21 +19,21 @@ Two things hold in all of them:
   then a template, its child the sandbox)
   and stays the parent. One that needs sandboxes of different configurations (one guest per
   process) or a cold one to measure re-runs itself as a child in a "role"
-  (`exobox_examples::role`, `self_command`).
+  (`unsharek_examples::role`, `self_command`).
 - **Host work and setup interleave until lockdown.** Booting, mapping images, holding and
   passing fds are host work; inside a setup closure (`g.run(|| ...)`) the thread's syscalls are
   the guest's (mounts, files); between closures the process is an ordinary one again (threads,
-  host programs: none may be left at lockdown). `g.lockdown(exobox::stdio)` grants the program's
+  host programs: none may be left at lockdown). `g.lockdown(unsharek::stdio)` grants the program's
   stdio (none is by default) and locks down: after it the host has only the mode's short
   allowlist.
 
 ## nix-program: a Nix program and its closure
 
-`exobox run` spelled out with the library: the program's closure from the image cache
+`unsharek run` spelled out with the library: the program's closure from the image cache
 (`store::Cache::open_default`, `store`), `Guest::boot`, each image mapped (`map_store`;
 `map_closure` is both steps), `setup::mount_closure` in a setup closure, then lockdown and exec. The parent
 measures the sandbox from outside. Arguments are the program to run (default:
-`$EXOBOX_TEST_PYTHON -c 'print(6*7)'`).
+`$UNSHAREK_TEST_PYTHON -c 'print(6*7)'`).
 
 ```
 $ nix-program
@@ -45,13 +45,13 @@ first output after 17.2ms
 wall time 19.8ms; peak PSS 22880 KB (sampled), max RSS 28016 KB
 ```
 
-Most of that PSS is Python's own. These binaries are linked as the `exobox` CLI is, at a fixed
+Most of that PSS is Python's own. These binaries are linked as the `unsharek` CLI is, at a fixed
 address, which saves a few hundred KB a sandbox: their `build.rs` calls
-`exobox_build::link_fixed_address()` (`crates/build`), as any embedder's can.
+`unsharek_build::link_fixed_address()` (`crates/unsharek-build`), as any embedder's can.
 
 ## setup: composing the guest in setup closures
 
-An "app" directory (a Python script and a data file) is packed with `exobox_erofs::build`, mapped,
+An "app" directory (a Python script and a data file) is packed with `unsharek_erofs::build`, mapped,
 and mounted at `/app`; a config file made on the host is written to the guest's `/etc`. All of it
 is ordinary Rust inside setup closures (`g.run`: `std::fs::write`, `setup::mount_erofs`), acting
 on the guest because the thread's syscalls are the guest's init's there; between the two the
@@ -59,7 +59,7 @@ host work (reading host data, mapping the image) is the host's.
 
 ```
 [setup] the closure mounted
-[setup] /dev/exobox/app mounted at /app; /etc/greeter/config written
+[setup] /dev/unsharek/app mounted at /app; /etc/greeter/config written
 app: hello from an erofs image
 config: greeting=hi, written by host pid 1469064
 /app holds ['data.txt', 'main.py'] (writable: False)
@@ -109,7 +109,7 @@ sandbox: exit 0
 ```
 
 (Only A queries reach the hook: glibc's AAAA query beside each is answered with no data by
-exobox. Without an `on_resolve` at all, every name would resolve to an address of exobox's own,
+unsharek. Without an `on_resolve` at all, every name would resolve to an address of unsharek's own,
 and the connect hook would still learn the name.)
 
 ## threads: why threaded mode exists

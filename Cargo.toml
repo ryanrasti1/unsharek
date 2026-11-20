@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["examples", "crates/tcb", "crates/build", "crates/erofs", "crates/exobox", "crates/fixtures", "crates/guest-tests", "crates/lkl-sys", "crates/rt"]
-# its own workspace (its own repository to be): exobox-tcb depends on it by path
+members = ["examples", "crates/unsharek-tcb", "crates/unsharek-build", "crates/unsharek-erofs", "crates/unsharek", "crates/unsharek-fixtures", "crates/guest-tests", "crates/lkl-sys", "crates/unsharek-rt"]
+# its own workspace (its own repository to be): unsharek-tcb depends on it by path
 exclude = ["seccomp-fn"]
 
 [workspace.package]

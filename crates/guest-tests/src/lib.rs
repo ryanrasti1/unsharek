@@ -1,10 +1,10 @@
 //! The in-guest tests: what a program observes inside the sandbox. Each test is an ordinary
 //! function here; the test targets (tests/guest_*.rs) each expand [`all!`] into `#[test]`s calling
 //! them, and nextest runs each test as its own process: natively (guest_native, which checks the
-//! test itself: it must pass on Linux) or under `exobox run --mode M` (crates/guest-tests/
+//! test itself: it must pass on Linux) or under `unsharek run --mode M` (crates/guest-tests/
 //! run-in-guest, nextest's run-wrapper), so every test gets a sandbox of its own. What the host
 //! sees of a run (its exit status, its CPU time, its stdio, the host's files) is
-//! crates/exobox/tests/suite.rs's.
+//! crates/unsharek/tests/suite.rs's.
 //!
 //! What a test may assume: it is the only test in its process (nextest), on a thread of libtest's
 //! (not the main thread, which waits for it): a process-directed signal (`kill(getpid())`, an
@@ -30,9 +30,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// The mode this test runs in: `native`, `coroutine`, `threaded` or `fork` (the wrapper's
-/// EXOBOX_TEST_MODE, which the sandbox passes on with the rest of the environment).
+/// UNSHAREK_TEST_MODE, which the sandbox passes on with the rest of the environment).
 pub fn mode() -> String {
-    std::env::var("EXOBOX_TEST_MODE").unwrap_or_else(|_| "native".into())
+    std::env::var("UNSHAREK_TEST_MODE").unwrap_or_else(|_| "native".into())
 }
 
 /// Whether this run has processes besides its own (natively, and in fork mode).

@@ -1,7 +1,7 @@
 # Wrapper scripts (experimental in nextest 0.9): the guest tests' run-wrappers, below.
 experimental = ["wrapper-scripts"]
 
-# Each trial bounds itself (crates/exobox/tests/suite.rs: per-case timeouts of seconds); this is the
+# Each trial bounds itself (crates/unsharek/tests/suite.rs: per-case timeouts of seconds); this is the
 # backstop for anything that doesn't, and for the unit tests.
 [profile.default]
 default-filter = "not binary(perf)"
@@ -10,7 +10,7 @@ failure-output = "immediate-final"
 status-level = "fail"
 final-status-level = "fail"
 
-# ./test --perf: the budgets (crates/exobox/tests/perf.rs), one at a time so they don't load each
+# ./test --perf: the budgets (crates/unsharek/tests/perf.rs), one at a time so they don't load each
 # other, each printing its measurements.
 [profile.perf]
 default-filter = "binary(perf)"

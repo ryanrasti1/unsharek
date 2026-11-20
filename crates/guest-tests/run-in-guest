@@ -5,9 +5,9 @@
 # --allow-path takes directories, and the binary's own (target/<profile>/deps) holds every test
 # binary and rlib of the workspace. So the binary is hard-linked into a directory of its own,
 # target/<profile>/guest-tests/<binary>/, and only that is allowed; its closure (glibc,
-# libgcc_s) exobox finds from its store references.
+# libgcc_s) unsharek finds from its store references.
 #
-# One directory per binary, not per test: exobox copies an allowed host directory into an erofs
+# One directory per binary, not per test: unsharek copies an allowed host directory into an erofs
 # image, cached under the directory's path and a key of its metadata (inode, link count, mtime).
 # A directory per test built a 3 MB image per test (~100 ms) and left each in the cache; and
 # hard-linking the one binary into many directories at once changed its link count under the
@@ -20,9 +20,9 @@ shift 2
 # Canonical: an allowed path is shown in the guest at the path given, and deps/.. there would be
 # a walk through a directory the guest hasn't.
 profile=$(realpath "$(dirname "$bin")/..")
-exobox=$profile/exobox
-if [[ ! -x $exobox ]]; then
-  echo "run-in-guest: no exobox binary at $exobox (build the workspace: ./test)" >&2
+unsharek=$profile/unsharek
+if [[ ! -x $unsharek ]]; then
+  echo "run-in-guest: no unsharek binary at $unsharek (build the workspace: ./test)" >&2
   exit 125
 fi
 name=${bin##*/}
@@ -34,7 +34,7 @@ mkdir -p "$dir"
   if [[ ! $link -ef $bin ]]; then
     ln -f "$bin" "$link.new" && mv -f "$link.new" "$link" || exit 125
     # The image, built once for the binary's tests (and the binary seen to start in the guest).
-    out=$("$exobox" run --mode "$mode" --allow-path "$dir" -- "$link" --list 2>&1)
+    out=$("$unsharek" run --mode "$mode" --allow-path "$dir" -- "$link" --list 2>&1)
     st=$?
     if ((st != 0)); then
       rm -f "$link"
@@ -43,5 +43,5 @@ mkdir -p "$dir"
     fi
   fi
 } 9>"$dir.lock"
-export EXOBOX_TEST_MODE=$mode
-exec "$exobox" run --mode "$mode" --allow-path "$dir" -- "$link" "$@"
+export UNSHAREK_TEST_MODE=$mode
+exec "$unsharek" run --mode "$mode" --allow-path "$dir" -- "$link" "$@"

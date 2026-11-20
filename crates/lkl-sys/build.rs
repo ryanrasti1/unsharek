@@ -1,14 +1,14 @@
 //! Builds the kernel (crates/lkl-sys/Makefile, incrementally), links its object, and generates the bindings.
 //!
 //! The kernel's source is the submodule crates/lkl-sys/linux, as it is on disk (the one `nix build` links), or
-//! another checkout named by `EXOBOX_LKL_SRC` (a worktree's, whose own submodule isn't checked out).
-//! It is configured by crates/lkl-sys/defconfig and, after it, the fragment `EXOBOX_LKL_CONFIG`
+//! another checkout named by `UNSHAREK_LKL_SRC` (a worktree's, whose own submodule isn't checked out).
+//! It is configured by crates/lkl-sys/defconfig and, after it, the fragment `UNSHAREK_LKL_CONFIG`
 //! names (a file of config lines; relative to the workspace's root, or absolute). Its build lives in
 //! `<target>/lkl`, shared by every profile and by clippy: the kernel doesn't depend on Rust's build
 //! settings.
 //!
-//! `EXOBOX_LKL_PREBUILT=<dir>` instead takes a finished kernel build (crates/lkl-sys/Makefile's `install`;
-//! flake.nix's `lib.exoboxKernel`) and runs no make: the Nix build makes the kernel once, as its
+//! `UNSHAREK_LKL_PREBUILT=<dir>` instead takes a finished kernel build (crates/lkl-sys/Makefile's `install`;
+//! flake.nix's `lib.unsharekKernel`) and runs no make: the Nix build makes the kernel once, as its
 //! own derivation, and the Rust build only links it.
 
 use std::env;
@@ -27,11 +27,11 @@ fn main() {
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
 
-    println!("cargo:rerun-if-env-changed=EXOBOX_LKL_PREBUILT");
-    println!("cargo:rerun-if-env-changed=EXOBOX_LKL_SRC");
-    println!("cargo:rerun-if-env-changed=EXOBOX_LKL_CONFIG");
+    println!("cargo:rerun-if-env-changed=UNSHAREK_LKL_PREBUILT");
+    println!("cargo:rerun-if-env-changed=UNSHAREK_LKL_SRC");
+    println!("cargo:rerun-if-env-changed=UNSHAREK_LKL_CONFIG");
     println!("cargo:rerun-if-changed=wrapper.h");
-    let kernel = match env::var_os("EXOBOX_LKL_PREBUILT").filter(|d| !d.is_empty()) {
+    let kernel = match env::var_os("UNSHAREK_LKL_PREBUILT").filter(|d| !d.is_empty()) {
         Some(dir) => prebuilt(PathBuf::from(dir)),
         None => build(&manifest, &out_dir),
     };
@@ -63,12 +63,12 @@ fn main() {
 fn prebuilt(dir: PathBuf) -> Kernel {
     // Its config is the one it was built with: a fragment here would be silently ignored.
     assert!(
-        env::var_os("EXOBOX_LKL_CONFIG").is_none_or(|c| c.is_empty()),
-        "EXOBOX_LKL_CONFIG configures a kernel build; EXOBOX_LKL_PREBUILT is one already made"
+        env::var_os("UNSHAREK_LKL_CONFIG").is_none_or(|c| c.is_empty()),
+        "UNSHAREK_LKL_CONFIG configures a kernel build; UNSHAREK_LKL_PREBUILT is one already made"
     );
     assert!(
         dir.join("liblkl-kernel.a").is_file(),
-        "EXOBOX_LKL_PREBUILT={}: no liblkl-kernel.a (made by `make -C crates/lkl-sys install PREFIX=...`)",
+        "UNSHAREK_LKL_PREBUILT={}: no liblkl-kernel.a (made by `make -C crates/lkl-sys install PREFIX=...`)",
         dir.display()
     );
     println!("cargo:rerun-if-changed={}", dir.display());
@@ -85,13 +85,13 @@ fn build(manifest: &Path, out_dir: &Path) -> Kernel {
     let lkl_dir = manifest.to_path_buf();
     // OUT_DIR is <target>/<profile>/build/lkl-sys-<hash>/out.
     let kout = out_dir.ancestors().nth(4).unwrap().join("lkl");
-    let src = env::var_os("EXOBOX_LKL_SRC")
+    let src = env::var_os("UNSHAREK_LKL_SRC")
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| lkl_dir.join("linux"));
     // Relative to the workspace's root, where `./test` and cargo are run from (build.rs runs in
     // the package's directory and the Makefile in lkl/: neither is the caller's).
-    let config = env::var_os("EXOBOX_LKL_CONFIG")
+    let config = env::var_os("UNSHAREK_LKL_CONFIG")
         .filter(|c| !c.is_empty())
         .map(|c| root.join(c));
 
@@ -118,7 +118,7 @@ fn build(manifest: &Path, out_dir: &Path) -> Kernel {
     // one builds the kernel from another source or config, the others must run again, or they
     // would link that kernel with their old bindings. crates/lkl-sys/Makefile writes these stamps only when
     // they change (so after a change each script runs once more, finding nothing to do).
-    for stamp in [kout.join(".exobox_defconfig.sha256"), kout.join(".exobox_lkl_src")] {
+    for stamp in [kout.join(".unsharek_defconfig.sha256"), kout.join(".unsharek_lkl_src")] {
         println!("cargo:rerun-if-changed={}", stamp.display());
     }
     Kernel {
@@ -132,10 +132,10 @@ fn make(lkl_dir: &Path, src: &Path, config: Option<&Path>, kout: &Path) {
     let mut cmd = Command::new("timeout");
     // Bounded like everything else: a cold build is well under a minute on 24 cores.
     cmd.args(["600", "make", "-C"]).arg(lkl_dir);
-    cmd.arg(format!("EXOBOX_LKL_SRC={}", src.display()));
+    cmd.arg(format!("UNSHAREK_LKL_SRC={}", src.display()));
     cmd.arg(format!("KOUT={}", kout.display()));
     if let Some(config) = config {
-        cmd.arg(format!("EXOBOX_LKL_CONFIG={}", config.display()));
+        cmd.arg(format!("UNSHAREK_LKL_CONFIG={}", config.display()));
     }
     // cargo's jobserver, so the kernel shares the machine with the crates building beside it.
     if let Some(flags) = env::var_os("CARGO_MAKEFLAGS") {

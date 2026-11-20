@@ -3,9 +3,9 @@
 //! ordinary syscall (trapped: the guest kernel's answer), then makes one forbidden host call,
 //! which kills the sandbox (SIGSYS):
 //!
-//!     cargo run -p exobox-examples --bin escape
+//!     cargo run -p unsharek-examples --bin escape
 //!
-//! The attempts: `getppid` made from exobox's own syscall instruction, the "gate", which the
+//! The attempts: `getppid` made from unsharek's own syscall instruction, the "gate", which the
 //! closure finds by scanning the binary's code for it (it shares the address space: nothing in it
 //! is hidden from the program); a host file opened through the gate; and a host socket made
 //! through it. The gate's address check only routes; what the gate may do is the filter's short
@@ -14,10 +14,10 @@
 
 use std::os::fd::AsRawFd;
 
-use exobox::{Guest, GuestConfig};
-use exobox_examples as ex;
+use unsharek::{Guest, GuestConfig};
+use unsharek_examples as ex;
 
-/// The gate's last instructions: `mov r9, [rsp + 8]; syscall; ret` (exobox-rt's `trap::gate`).
+/// The gate's last instructions: `mov r9, [rsp + 8]; syscall; ret` (unsharek-rt's `trap::gate`).
 const GATE_TAIL: [u8; 8] = [0x4c, 0x8b, 0x4c, 0x24, 0x08, 0x0f, 0x05, 0xc3];
 
 unsafe extern "C" {
@@ -35,7 +35,7 @@ fn find_gate() -> Option<usize> {
 }
 
 /// A raw syscall made from the gate's `syscall` instruction: what the host's filter judges as
-/// one of exobox's own.
+/// one of unsharek's own.
 fn via_gate(gate: usize, nr: i64, a0: usize, a1: usize, a2: usize) -> isize {
     let r: isize;
     // SAFETY: the gate's `syscall; ret`, called: the call's result comes back in rax. Whatever it
@@ -90,14 +90,14 @@ fn hostile(attempt: &str, secret_fd: i32) -> i32 {
 const ATTEMPTS: [&str; 3] = ["getppid", "openat", "socket"];
 
 fn sandbox(attempt: &str) -> ! {
-    let run = || -> Result<std::convert::Infallible, exobox::Error> {
+    let run = || -> Result<std::convert::Infallible, unsharek::Error> {
         let g = Guest::boot(GuestConfig::default())?;
         // A host file opened before lockdown (here, this program's own binary), its fd number
         // kept for the closure: what a program might have inherited.
         let secret = std::fs::File::open(std::env::current_exe()?)?;
         let fd = secret.as_raw_fd();
         std::mem::forget(secret);
-        let locked = g.lockdown(exobox::stdio)?;
+        let locked = g.lockdown(unsharek::stdio)?;
         let attempt = attempt.to_owned();
         locked.run(move || hostile(&attempt, fd))
     };

@@ -1,7 +1,7 @@
 //! Why threaded mode exists: one CPU-bound workload (four threads of pure computation, the
 //! fixtures' `par_compute`) natively, in `Mode::Coroutine` and in `Mode::Threaded`.
 //!
-//!     cargo run -p exobox-examples --release --bin threads
+//!     cargo run -p unsharek-examples --release --bin threads
 //!
 //! Coroutine mode runs the guest kernel and every program thread as coroutines on one host
 //! thread: the smallest filter (no `clone` at all), but four threads take four times as long.
@@ -12,9 +12,9 @@
 use std::process::Stdio;
 use std::time::Instant;
 
-use exobox::{Guest, GuestConfig, Mode, setup};
-use exobox_examples as ex;
-use exobox_fixtures as fx;
+use unsharek::{Guest, GuestConfig, Mode, setup};
+use unsharek_examples as ex;
+use unsharek_fixtures as fx;
 
 const THREADS: &str = "4";
 
@@ -23,14 +23,14 @@ fn iterations() -> &'static str {
 }
 
 fn sandbox(mode: Mode) -> ! {
-    let run = || -> Result<std::convert::Infallible, exobox::Error> {
+    let run = || -> Result<std::convert::Infallible, unsharek::Error> {
         let prog = fx::bin("par_compute");
         let mut g = Guest::boot(GuestConfig { mode, ..Default::default() })?;
         // The fixtures live outside the store: their directory is allowed as is, and brings the
         // closure of whatever its files reference (glibc).
         let store = g.map_closure(&prog, &[fx::bin_dir()])?;
         g.run(|| setup::mount_closure(&store))??;
-        g.lockdown(exobox::stdio)?.exec(&ex::os(&[prog.to_str().unwrap(), THREADS, iterations()]), &[])
+        g.lockdown(unsharek::stdio)?.exec(&ex::os(&[prog.to_str().unwrap(), THREADS, iterations()]), &[])
     };
     let Err(e) = run();
     ex::fail(e)

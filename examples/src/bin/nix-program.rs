@@ -1,9 +1,9 @@
 //! Run a nixpkgs program in a sandbox, with its Nix closure, from the library: the CLI's
-//! `exobox run` spelled out. The parent measures the sandbox from outside: startup, wall time,
+//! `unsharek run` spelled out. The parent measures the sandbox from outside: startup, wall time,
 //! memory.
 //!
-//!     cargo run -p exobox-examples --bin nix-program                       # python -c 'print(6*7)'
-//!     cargo run -p exobox-examples --bin nix-program -- "$(which hello)" --greeting=hi
+//!     cargo run -p unsharek-examples --bin nix-program                       # python -c 'print(6*7)'
+//!     cargo run -p unsharek-examples --bin nix-program -- "$(which hello)" --greeting=hi
 //!
 //! The program must be a store path (or inside one): its closure is what the guest sees.
 
@@ -14,8 +14,8 @@ use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use exobox::{Guest, GuestConfig, setup, store};
-use exobox_examples as ex;
+use unsharek::{Guest, GuestConfig, setup, store};
+use unsharek_examples as ex;
 
 /// The sandbox, in a child process of its own: `run` takes the process over.
 fn sandbox(argv: Vec<OsString>) -> ! {
@@ -45,7 +45,7 @@ fn sandbox(argv: Vec<OsString>) -> ! {
     // 5. Lockdown (the program's stdio granted), then the program exec'd from the guest's files,
     //    behind the mode's filter. `exec` returns only if the program couldn't be started.
     let env = ex::os(&["PATH=/bin", "LANG=C.UTF-8"]);
-    let Err(e) = g.lockdown(exobox::stdio).and_then(|l| l.exec(&argv, &env));
+    let Err(e) = g.lockdown(unsharek::stdio).and_then(|l| l.exec(&argv, &env));
     ex::fail(e)
 }
 
@@ -55,7 +55,7 @@ fn main() {
         sandbox(args);
     }
     if args.is_empty() {
-        let py = ex::nix_program("EXOBOX_TEST_PYTHON");
+        let py = ex::nix_program("UNSHAREK_TEST_PYTHON");
         args = vec![py.into(), "-c".into(), "print(6*7)".into()];
     }
     println!("running {:?} in a sandbox", args);

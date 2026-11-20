@@ -1,4 +1,4 @@
-//! What the examples share: plain host-process plumbing. Nothing here hides exobox's API.
+//! What the examples share: plain host-process plumbing. Nothing here hides unsharek's API.
 //!
 //! A sandbox takes its process over (`run` never returns, and the process ends with the
 //! program's status), so an example that wants to watch or talk to a sandbox forks it off as a
@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 
-const ROLE: &str = "EXOBOX_EXAMPLE_ROLE";
+const ROLE: &str = "UNSHAREK_EXAMPLE_ROLE";
 
 /// This process's role, when an example re-ran itself as a child.
 pub fn role() -> Option<String> {
@@ -44,7 +44,7 @@ pub fn give_fd(cmd: &mut Command, fd: &impl AsRawFd, at: RawFd) {
     }
 }
 
-/// A nixpkgs program named by a devshell variable (`EXOBOX_TEST_PYTHON`, ...), or a clean skip.
+/// A nixpkgs program named by a devshell variable (`UNSHAREK_TEST_PYTHON`, ...), or a clean skip.
 pub fn nix_program(var: &str) -> PathBuf {
     match std::env::var_os(var) {
         Some(p) => p.into(),
@@ -57,13 +57,13 @@ pub fn nix_program(var: &str) -> PathBuf {
 
 /// Small workloads, for the smoke tests (`tests/smoke.rs` sets it).
 pub fn quick() -> bool {
-    std::env::var_os("EXOBOX_EXAMPLE_QUICK").is_some()
+    std::env::var_os("UNSHAREK_EXAMPLE_QUICK").is_some()
 }
 
 /// After a sandbox's start failed: before the program started, so the error is ours to report.
 /// (After lockdown, stderr and exit still work, through the guest.)
-pub fn fail(e: exobox::Error) -> ! {
-    eprintln!("exobox: {e}");
+pub fn fail(e: unsharek::Error) -> ! {
+    eprintln!("unsharek: {e}");
     std::process::exit(125)
 }
 

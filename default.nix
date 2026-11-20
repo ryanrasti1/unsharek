@@ -1,10 +1,10 @@
-# exobox without flakes: `import ./. { inherit pkgs; }` (pkgs: any nixpkgs; the flake pins capnix's
+# unsharek without flakes: `import ./. { inherit pkgs; }` (pkgs: any nixpkgs; the flake pins capnix's
 # revision). Gives nix/lib.nix's functions and the default builds.
 { pkgs ? import <nixpkgs> { } }:
 let
-  exobox = import ./nix/lib.nix { inherit pkgs; };
+  unsharek = import ./nix/lib.nix { inherit pkgs; };
 in
-exobox // {
-  kernel = exobox.exoboxKernel { };
-  exobox = exobox.mkExobox { };
+unsharek // {
+  kernel = unsharek.unsharekKernel { };
+  unsharek = unsharek.mkUnsharek { };
 }
