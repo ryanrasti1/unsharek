@@ -73,6 +73,15 @@ enum Mode {
 }
 
 fn main() -> ExitCode {
+    // The image builder holds each file of a store path open until it writes the image (tzdata:
+    // thousands), past the usual soft limit of 1024 ("Too many open files"). The hard limit is
+    // ours to take; lockdown closes every fd it doesn't keep anyway.
+    if let Ok(l) = rustix::process::getrlimit(rustix::process::Resource::Nofile).maximum.ok_or(()) {
+        let _ = rustix::process::setrlimit(
+            rustix::process::Resource::Nofile,
+            rustix::process::Rlimit { current: Some(l), maximum: Some(l) },
+        );
+    }
     let Cli { mode, mut ro, rw, images, max_procs, setenv, mut keep_env, system, net, publish, mut argv } = Cli::parse();
     if system {
         ro.extend(fs::SYSTEM.iter().filter(|d| std::path::Path::new(d).is_dir()).map(|d| fs::Arg { host: d.into(), at: None, live: true }));
