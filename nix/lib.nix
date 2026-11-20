@@ -29,6 +29,7 @@ let
       # A workspace member: cargo loads every member's manifest, built or not (the
       # package failed to build without it).
       (fs.difference ../examples (fs.fileFilter (f: f.hasExt "md") ../examples))
+      ../xtask
       ../.config
     ];
   };
@@ -44,7 +45,11 @@ let
     name = "unsharek-tcb-proof";
     inherit src;
     cargoLock = ../Cargo.lock;
-    runs = [ [ "-p" "unsharek-tcb" "-j" "--output-format=terse" ] ];
+    runs = [
+      [ "-p" "unsharek-tcb" "-j" "--output-format=terse" ]
+      # the fs plugin's server filter (its policy alone: no fuse-backend-rs)
+      [ "-p" "unsharek-fs-server" "--no-default-features" "-j" "--output-format=terse" ]
+    ];
   };
 
   # The kernel, built once by crates/lkl-sys/Makefile as its own derivation, in the layout lkl-sys's

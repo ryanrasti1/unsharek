@@ -41,7 +41,7 @@ pub mod xabi;
 /// The guest kernel's syscall numbers (the generic table) that host-side setup makes through
 /// [`guest::syscall`]: so the crates above the runtime need no bindings of their own.
 pub mod nr {
-    pub use lkl_sys::{__lkl__NR_clock_settime, __lkl__NR_close, __lkl__NR_dup3, __lkl__NR_fchmodat, __lkl__NR_host_fd, __lkl__NR_ioctl, __lkl__NR_mkdirat, __lkl__NR_mknodat, __lkl__NR_mount, __lkl__NR_openat, __lkl__NR_socket, __lkl__NR_symlinkat, __lkl__NR_write};
+    pub use lkl_sys::{__lkl__NR_virtio_mmio_device_add, __lkl__NR_clock_settime, __lkl__NR_close, __lkl__NR_dup3, __lkl__NR_fchmodat, __lkl__NR_host_fd, __lkl__NR_ioctl, __lkl__NR_mkdirat, __lkl__NR_mknodat, __lkl__NR_mount, __lkl__NR_openat, __lkl__NR_socket, __lkl__NR_symlinkat, __lkl__NR_write};
 }
 #[cfg(test)]
 mod testutil;

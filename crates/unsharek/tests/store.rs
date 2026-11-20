@@ -55,6 +55,7 @@ fn fixture_closure_has_its_glibc_and_its_dir() {
     let config = unsharek::Config {
         argv: vec![fx::bin("hello").into()],
         allow_paths: vec![fx::bin_dir()],
+        host_dirs: vec![],
         image_cache: Some(shared_cache()),
         ..Default::default()
     };

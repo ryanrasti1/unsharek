@@ -57,6 +57,8 @@ enum Arg {
     /// A path that doesn't exist yet, in a directory of this run's own: whether the run created
     /// it on the host is checked afterwards (`Expect::creates`).
     Marker,
+    /// The directory `Marker` is in (empty at the start), which `Case::rw_dir` serves read-write.
+    MarkerDir,
     Fixture(&'static str),
     Denied(&'static str),
     /// The path a devshell variable names (a program from nixpkgs, as data).
@@ -110,6 +112,8 @@ struct Case {
     cpu_budget: Option<Duration>,
     /// Checks stdout beyond `Expect` (sysaudit's table).
     check: Option<fn(&str) -> Result<(), String>>,
+    /// `--rw` the run's own directory (`Arg::MarkerDir`): a host directory served live.
+    rw_dir: bool,
 }
 
 fn case(name: &'static str, prog: Prog, modes: &'static [Mode], sandbox: Expect) -> Case {
@@ -129,6 +133,7 @@ fn case(name: &'static str, prog: Prog, modes: &'static [Mode], sandbox: Expect)
         timeout: Duration::from_secs(5),
         cpu_budget: None,
         check: None,
+        rw_dir: false,
     }
 }
 
@@ -393,6 +398,32 @@ fn cases() -> Vec<Case> {
             .flags(&["--setenv", "SET_BY_FLAG=1"])
             .native(None)
             .expect_also(&["SET_BY_FLAG=1", "UNSHAREK_TEST_MODE="], &["UNSHAREK_TEST_HOST_ONLY"]),
+        // Host directories served live (the CLI's --ro DIR and --rw DIR: virtio-fs, served by
+        // unsharek-fs-server's process). The suite's own --ro of the fixtures' directory is one
+        // already: every fixture runs from it.
+        Case {
+            rw_dir: true,
+            ..case("hostdir_write", Prog::Fixture("hostdir"), ALL, Expect { creates: Some(true), ..ok("HOSTDIR_WRITE") })
+        }
+        .args(vec![Arg::Lit("write"), Arg::MarkerDir]),
+        // A read-only directory refuses every change (the server's early EROFS, and Landlock's
+        // read-only rules under it): on the fixture's own binary, in the suite's --ro directory.
+        // Not natively: there the file is writable, and it would be changed.
+        fixture("hostdir", ALL)
+            .renamed("hostdir_ro")
+            .args(vec![Arg::Lit("ro"), Arg::Fixture("hostdir")])
+            .native(None)
+            .expect_also(&["HOSTDIR_RO"], &[]),
+        // A symlink or a hard link to a host file outside the directory doesn't reach it: the guest
+        // resolves links in its own tree, where the file isn't. Natively the links work: not run.
+        Case { rw_dir: true, ..case("hostdir_escape", Prog::Fixture("hostdir"), ALL, ok("HOSTDIR_ESCAPE")) }
+            .args(vec![Arg::Lit("escape"), Arg::MarkerDir, Arg::Secret])
+            .native(None),
+        Case { rw_dir: true, timeout: Duration::from_secs(20), ..case("hostdir_big", Prog::Fixture("hostdir"), ALL, ok("HOSTDIR_BIG")) }
+            .args(vec![Arg::Lit("big"), Arg::MarkerDir]),
+        // Requests from several host threads (threaded mode) and processes (fork mode) at once.
+        Case { rw_dir: true, timeout: Duration::from_secs(20), ..case("hostdir_par", Prog::Fixture("hostdir"), THREADED_FORK, ok("HOSTDIR_PAR")) }
+            .args(vec![Arg::Lit("par"), Arg::MarkerDir]),
         fixture("forkbomb", FORK).flags(&["--max-procs=16"]).env(&[("UNSHAREK_TEST_MAX_PROCS", "16")]).native(None),
         Case {
             timeout: Duration::from_secs(15),
@@ -630,6 +661,7 @@ fn run(c: &Case, mode: Mode, secret: &PathBuf) -> Result<(), Failed> {
         Arg::Lit(s) => PathBuf::from(s),
         Arg::Secret => secret.clone(),
         Arg::Marker => marker.clone(),
+        Arg::MarkerDir => marker_dir.path().to_owned(),
         Arg::Fixture(name) => fx::bin(name),
         Arg::Denied(name) => fx::denied_dir().join(name),
         Arg::Env(var) => env::var_os(var).map(PathBuf::from).unwrap_or_default(),
@@ -652,6 +684,9 @@ fn run(c: &Case, mode: Mode, secret: &PathBuf) -> Result<(), Failed> {
         let fixed = ["UNSHAREK_TEST_MODE", "UNSHAREK_TEST_SECRET", "UNSHAREK_TEST_TARGET", "PATH", "HOME"];
         for k in fixed.into_iter().chain(c.env.iter().map(|e| e.0)).chain(c.uses.iter().copied()) {
             cmd.arg("--keep-env").arg(k);
+        }
+        if c.rw_dir {
+            cmd.arg("--rw").arg(marker_dir.path());
         }
         cmd.args(&c.flags).arg("--").arg(&prog);
         cmd

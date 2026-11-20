@@ -35,6 +35,13 @@ CONFIG_EROFS_FS=y
 # CONFIG_EROFS_FS_XATTR is not set
 # CONFIG_EROFS_FS_ZIP is not set
 # CONFIG_EROFS_FS_BACKED_BY_FILE is not set
+# Host directories: Linux's own virtio-fs driver (FUSE over a virtqueue) on a virtio-mmio device
+# whose host side is unsharek-fs (crates/unsharek/src/hostfs.rs). Stock code: no kernel change.
+CONFIG_VIRTIO_MENU=y
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_MMIO=y
+CONFIG_FUSE_FS=y
+CONFIG_VIRTIO_FS=y
 # CONFIG_COMPAT_BRK is not set
 # CONFIG_VM_EVENT_COUNTERS is not set
 CONFIG_NET=y

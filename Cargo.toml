@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["examples", "xtask", "crates/unsharek-tcb", "crates/unsharek-build", "crates/unsharek-erofs", "crates/unsharek", "crates/unsharek-fixtures", "crates/guest-tests", "crates/lkl-sys", "crates/unsharek-rt"]
+members = ["examples", "xtask", "crates/unsharek-tcb", "crates/unsharek-build", "crates/unsharek-erofs", "crates/unsharek", "crates/unsharek-fixtures", "crates/guest-tests", "crates/lkl-sys", "crates/unsharek-rt", "crates/unsharek-fs", "crates/unsharek-fs-server"]
 # its own workspace (its own repository to be): unsharek-tcb depends on it by path
 exclude = ["seccomp-fn"]
 

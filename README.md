@@ -21,7 +21,8 @@ units within 9%, `make -j4` at 2x. [bench/STATS.md](bench/STATS.md) has the tabl
 unsharek -- /nix/store/…-hello/bin/hello                # a Nix program: its closure is mounted read-only
 unsharek --mode threaded -- $(which python3) -c 'print(6 * 7)'
 unsharek --mode fork -- $(which bash) -c 'ls / | wc -l'  # anything that forks: fork mode
-unsharek --ro ./data --setenv LANG=C.UTF-8 -- $(which sort) ./data/words
+unsharek --ro ./data --setenv LANG=C.UTF-8 -- $(which sort) ./data/words   # a host directory, live
+unsharek --mode fork --rw $PWD/out -- $(which bash) -c "echo built > $PWD/out/result"  # read-write
 unsharek --image app=./app.erofs:/app -- /app/bin/server
 ```
 
@@ -66,6 +67,8 @@ syscall instruction may reach the host, and only for the mode's few calls.
 | [unsharek-rt](crates/unsharek-rt/README.md) | The runtime: the trap, dispatcher, scheduler, arena and loader |
 | [lkl-sys](crates/lkl-sys/README.md) | The guest kernel: LKL plus unsharek's series, and its bindings |
 | [unsharek-erofs](crates/unsharek-erofs/README.md) | Store images whose ELF files map in place |
+| [unsharek-fs](crates/unsharek-fs/README.md) | Host directories: the virtio-fs device, whose server is a socket |
+| [unsharek-fs-server](crates/unsharek-fs-server/README.md) | Plugin: the Landlock-confined file server for `--ro DIR`, `--rw DIR` |
 | [unsharek-build](crates/unsharek-build/README.md) | The fixed-address link for binaries that embed unsharek |
 | [guest-tests](crates/guest-tests/README.md), [fixtures](crates/unsharek-fixtures/README.md) | The tests: in the guest, and from the host |
 
@@ -93,10 +96,16 @@ process. See [crates/unsharek](crates/unsharek/README.md).
 ## Filesystem
 
 A Nix program's closure is shown as erofs images, one per store path, built once and cached; ELF
-files are mapped in place from them, shared across sandboxes through the host's page cache. `--ro
-PATH` adds a store path (with its closure) or a host directory, read-only, as a snapshot. Writes go
-to the guest's own memory. Live `--ro` and `--rw` directories, through the guest's stock virtio-fs
-driver and a separate, Landlock-confined file server, are in progress.
+files are mapped in place from them, shared across sandboxes through the host's page cache. `--ro`
+of a store path adds it (with its closure) the same way. Anything else the program writes goes to
+the guest's own memory.
+
+**Plugin (experimental): host directories, live.** `--ro DIR[:AT]` and `--rw DIR[:AT]` serve a host
+directory through the guest's stock virtio-fs driver, from a file server of its own
+([unsharek-fs-server](crates/unsharek-fs-server/README.md): virtiofsd's passthrough file system,
+confined by Landlock to the directory and by its own proven filter). The sandbox gains one granted
+socket per directory, and nothing in its filter. The host's changes are seen within a second; reads
+and writes cost a round trip to the server per request (about 5x native on large files today).
 
 ## Status and performance
 
