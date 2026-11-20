@@ -9,7 +9,7 @@ cargo run -p unsharek-examples --release --bin nix-program
 ```
 
 An example whose nixpkgs program isn't in the environment prints `skipped: ...` and exits 0.
-`tests/smoke.rs` runs each one, small, as part of `./test`.
+`tests/smoke.rs` runs each one, small, as part of `cargo xtask test`.
 
 Two things hold in all of them:
 
