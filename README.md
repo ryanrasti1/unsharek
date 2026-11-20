@@ -10,6 +10,11 @@ extremely minimal seccomp profile.
 See [crates/unsharek-tcb/README.md](crates/unsharek-tcb/README.md) for the TCB and the security
 guarantees: about 600 lines, and the filter is proven equal to its policy.
 
+An idle bash costs 4.6 MB (PSS), a sandbox forked from a template 1.9 MB and 3 ms; a syscall the
+guest serves ~2.7 µs; single-threaded CPU work runs within 5% of native, `rustc` with 16 codegen
+units within 9%, `make -j4` at 2x. [bench/STATS.md](bench/STATS.md) has the table,
+`cargo xtask stats` re-measures it.
+
 ## Using it
 
 ```sh
@@ -99,15 +104,18 @@ Works in every mode unless noted: unmodified dynamic and static programs (glibc,
 the guest, signals, ttys, pipes, threads, fork mode's processes, templates (coroutine and threaded),
 the network hooks. `cargo xtask test` runs about 640 cases in seconds.
 
-| | native | sandbox |
-|---|---|---|
-| startup to READY (coroutine) | - | ~5 ms, ~4.2 MB PSS |
-| a template's child | - | ~1 ms, under 2 MB |
-| a syscall (`getppid`) | 0.08 µs | ~1.3 µs |
-| `xz -T4`, 16 MB (threaded) | 0.13 s | 1.12x |
-| `rustc`, 16 codegen units (fork) | 1.57 s | 2.82x |
-| `make -j4`, 32 C files (fork) | 1.21 s | 3.19x |
+| | native | coroutine | threaded | fork |
+|---|---|---|---|---|
+| idle bash, PSS (8 at once) | 0.9 MB | 4.6 MB | 4.6 MB | 4.8 MB |
+| template child, PSS / start | - | 1.9 MB / 3.0 ms | 1.9 MB / 3.8 ms | - |
+| `getppid` | 0.16 µs | 2.7 µs | 2.8 µs | 2.8 µs |
+| `xz -T1`, 8 MB | 0.44 s | 1.05x | 1.05x | 1.06x |
+| `xz -T4`, 8 MB | 0.15 s | 3.30x | 1.10x | 1.13x |
+| `rustc`, 16 codegen units | 1.24 s | - | 1.09x | 1.05x |
+| `make -j4`, 12 C files | 0.70 s | - | - | 2.04x |
 
+Medians on a 24-CPU Core Ultra 9, 2026-11-19: the full table, with spreads, is
+[bench/STATS.md](bench/STATS.md) (`cargo xtask stats`, under a minute; [bench/](bench/README.md)).
 The guest has one CPU, which is most of the build gap ([bench/PERF.md](bench/PERF.md)). Known
 limits:
 
@@ -125,6 +133,7 @@ direnv allow                 # the devshell (.envrc, nix-direnv); or prefix: nix
 cargo xtask test             # everything, incremental, seconds warm (cargo-nextest; args pass through)
 cargo xtask test -E 'test(/::fork$/)'   # one mode of the suite
 cargo xtask perf             # the performance budgets; `vs-native` for build workloads
+cargo xtask stats            # the headline numbers, into bench/STATS.md
 cargo xtask prove            # Kani: the filter is its policy (minutes)
 nix build                    # the distributed binary; .#checks.x86_64-linux.smoke, the release check
 ```

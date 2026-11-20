@@ -41,7 +41,7 @@ SINGLE = {'rustc', 'xz', 'micro'}  # one process: every mode; the rest need fork
 
 def fixtures():
     """The fixtures' bin directory (the newest build's)."""
-    dirs = glob.glob(os.path.join(bb.ROOT, 'target', 'release', 'build', 'unsharek-fixtures-*', 'out', 'bin'))
+    dirs = glob.glob(os.path.join(bb.TARGET, 'release', 'build', 'unsharek-fixtures-*', 'out', 'bin'))
     dirs = [d for d in dirs if os.path.exists(os.path.join(d, 'exec_bench'))]
     if not dirs:
         sys.exit('no fixtures with exec_bench under target/release: build first (bench/quick does)')
@@ -161,13 +161,13 @@ def main():
     ap.add_argument('--modes', default='threaded,fork')
     ap.add_argument('--reps', type=int, default=3)
     ap.add_argument('--cpus', default=os.environ.get('BENCH_CPUS', '0-7'))
-    ap.add_argument('--unsharek', default=os.path.join(bb.ROOT, 'target', 'release', 'unsharek'))
+    ap.add_argument('--unsharek', default=os.path.join(bb.TARGET, 'release', 'unsharek'))
     ap.add_argument('--variant', action='append', default=[], metavar='NAME=PATH',
                     help='another unsharek binary; a mode MODE:NAME runs it (before/after in one run); '
                     '`stats` alone: the counters\' build')
     ap.add_argument('--timeout', type=float, default=60)
     ap.add_argument('--no-fail', action='store_true', help='report only: exit 0 whatever the ratios')
-    ap.add_argument('--tmp', default=os.path.join(bb.ROOT, 'target', 'vs-native'))
+    ap.add_argument('--tmp', default=os.path.join(bb.TARGET, 'vs-native'))
     a = ap.parse_args()
     os.makedirs(a.tmp, exist_ok=True)
     works = [w for w in a.work.split(',') if w]

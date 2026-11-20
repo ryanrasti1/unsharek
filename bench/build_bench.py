@@ -39,6 +39,8 @@ import tempfile
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# cargo's target directory (CARGO_TARGET_DIR, else the tree's target/)
+TARGET = os.environ.get('CARGO_TARGET_DIR') or os.path.join(ROOT, 'target')
 TASKSET = shutil.which('taskset') or 'taskset'
 
 
@@ -299,7 +301,7 @@ def parse_stats(err):
 def parse_variants(vs):
     """`--variant NAME=PATH`s into {NAME: PATH}. A NAME alone is target/release/unsharek-NAME: `stats`,
     the runtime's counters (the cargo feature `stats`), which bench/run builds there."""
-    return {n: p or os.path.join(ROOT, 'target', 'release', 'unsharek-' + n) for n, _, p in (v.partition('=') for v in vs)}
+    return {n: p or os.path.join(TARGET, 'release', 'unsharek-' + n) for n, _, p in (v.partition('=') for v in vs)}
 
 
 def main():
@@ -309,7 +311,7 @@ def main():
     ap.add_argument('--reps', type=int, default=3)
     ap.add_argument('--cpus', default=os.environ.get('BENCH_CPUS', '0-7'),
                     help='taskset CPU list for every run (default: 0-7, this machine\'s P-cores); "" for none')
-    ap.add_argument('--unsharek', default=os.path.join(ROOT, 'target', 'release', 'unsharek'))
+    ap.add_argument('--unsharek', default=os.path.join(TARGET, 'release', 'unsharek'))
     ap.add_argument('--variant', action='append', default=[], metavar='NAME=PATH',
                     help='another unsharek binary; a mode MODE:NAME runs it (A/B runs, interleaved)')
     ap.add_argument('--crate-src', default=None)

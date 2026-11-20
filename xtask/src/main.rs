@@ -9,6 +9,8 @@
 //! - `prove [kani args]`: Kani's proofs, each `policy!` harness (seccomp-fn's examples,
 //!   unsharek-tcb's filter, a harness per mode); minutes.
 //! - `vs-native [args]`: each mode against native on build workloads (bench/quick.py).
+//! - `stats [args]`: the headline numbers (memory, startup, a syscall, CPU) into bench/STATS.md
+//!   (bench/stats.py); minutes, on a quiet machine.
 //!
 //! Any step's failure is the task's: its exit status is nonzero.
 
@@ -35,13 +37,13 @@ fn main() -> ExitCode {
             cargo(&["kani", "--manifest-path", "seccomp-fn/Cargo.toml", "-p", "seccomp-fn", "--tests", "-j", "--output-format=terse"], &rest),
             cargo(&["kani", "-p", "unsharek-tcb", "-j", "--output-format=terse"], &rest),
         ],
-        "vs-native" => {
-            let mut c = Command::new(root().join("bench/quick"));
+        "vs-native" | "stats" => {
+            let mut c = Command::new(root().join(if task == "stats" { "bench/stats" } else { "bench/quick" }));
             c.args(&rest);
             vec![c]
         }
         _ => {
-            eprintln!("usage: cargo xtask test|perf|prove|vs-native [args] (xtask/src/main.rs)");
+            eprintln!("usage: cargo xtask test|perf|prove|vs-native|stats [args] (xtask/src/main.rs)");
             return ExitCode::from(2);
         }
     };

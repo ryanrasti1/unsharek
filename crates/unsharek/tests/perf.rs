@@ -215,6 +215,15 @@ fn startup(mode: Mode) -> Result<(), Failed> {
     if median > STARTUP_BUDGET { Err(format!("startup {median:?} > {STARTUP_BUDGET:?}").into()) } else { Ok(()) }
 }
 
+/// `key value`, appended to `$UNSHAREK_STATS_OUT` when it is set: the numbers `cargo xtask stats`
+/// (bench/stats.py) publishes, read from the same trials as the budgets.
+fn report(key: &str, value: f64) {
+    if let Some(path) = env::var_os("UNSHAREK_STATS_OUT") {
+        let line = format!("{key} {value}\n");
+        let _ = fs::OpenOptions::new().create(true).append(true).open(path).and_then(|mut f| f.write_all(line.as_bytes()));
+    }
+}
+
 /// Proportional set size of a process, in KB.
 fn pss_kb(pid: u32) -> Result<u64, Failed> {
     let s = fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).map_err(|e| format!("smaps_rollup: {e}"))?;
@@ -347,6 +356,8 @@ fn template(mode: Mode) -> Result<(), Failed> {
     let per = per?;
     times.sort();
     let median = times[N / 2];
+    report(&format!("template_ready_ms {}", mode.name()), median.as_secs_f64() * 1e3);
+    report(&format!("template_pss_kb {}", mode.name()), per as f64);
     println!("template children: start to READY median {median:?} of {times:?} (budget {TEMPLATE_STARTUP_BUDGET:?}); PSS {per} KB each, {N} at once (budget {MEM_TEMPLATE_BUDGET_KB} KB)");
     let mut over = vec![];
     if median > TEMPLATE_STARTUP_BUDGET {
