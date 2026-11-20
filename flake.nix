@@ -22,7 +22,7 @@
       inherit (exobox) exoboxKernel mkExobox;
       # Programs the suite and the smoke check run: nix/test-programs.nix.
       tp = import ./nix/test-programs.nix { inherit pkgs; };
-      # Kani, the model checker the filter's proof runs on (seccomp-fn/nix/kani.nix).
+      # Kani, the model checker the filter's proof runs on (seccomp-fn/flake.nix).
       kani = seccomp-fn.packages.${system}.kani;
     in
     {

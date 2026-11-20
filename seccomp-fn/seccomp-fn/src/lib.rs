@@ -63,48 +63,6 @@ mod bpf;
 pub use bpf::{MAX_INSNS, SeccompData, run_bpf};
 use bpf::*;
 
-/// Why [`install`] failed.
-#[derive(Debug)]
-pub enum InstallError {
-    /// More than the kernel takes.
-    TooLong(usize),
-    /// `seccomp(2)` failed.
-    Os(std::io::Error),
-    /// With TSYNC: a thread that couldn't be synced (its tid).
-    Thread(i32),
-}
-
-impl std::fmt::Display for InstallError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            InstallError::TooLong(n) => write!(f, "{n} instructions, more than the kernel takes"),
-            InstallError::Os(e) => write!(f, "seccomp: {e}"),
-            InstallError::Thread(t) => write!(f, "thread {t} couldn't be synced to the filter"),
-        }
-    }
-}
-
-impl std::error::Error for InstallError {}
-
-/// `prog` installed on the calling thread (`SECCOMP_SET_MODE_FILTER`), or with `tsync` on every
-/// thread of the process. Unprivileged, the thread needs `no_new_privs` first.
-pub fn install(prog: &[SockFilter], tsync: bool) -> Result<(), InstallError> {
-    let len = u16::try_from(prog.len()).map_err(|_| InstallError::TooLong(prog.len()))?;
-    // the kernel only reads the instructions
-    let fprog = libc::sock_fprog { len, filter: prog.as_ptr() as *mut SockFilter };
-    let flags = if tsync { libc::SECCOMP_FILTER_FLAG_TSYNC } else { 0 };
-    // SAFETY: seccomp reads `fprog` and the instructions, both live for the call.
-    let r = unsafe { libc::syscall(libc::SYS_seccomp, libc::SECCOMP_SET_MODE_FILTER, flags, &fprog as *const libc::sock_fprog) };
-    if r < 0 {
-        return Err(InstallError::Os(std::io::Error::last_os_error()));
-    }
-    // With TSYNC, a positive result is the id of a thread that couldn't be synced.
-    if r != 0 {
-        return Err(InstallError::Thread(r as i32));
-    }
-    Ok(())
-}
-
 /// A field of [`SeccompData`] a program compares.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Field {

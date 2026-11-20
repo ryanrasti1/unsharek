@@ -41,7 +41,7 @@ Anything else is a compile error naming it.
 ## Not guaranteed
 - **The policy is right**: the proof says the program is the function, not that the function is the policy you want.
 - **Your reading of the ABI**: whether the kernel reads an argument as 32 or 64 bits, signed or not. Full 64-bit equality is the stricter choice.
-- **Installing it**: `install()` passes the program to `seccomp(2)`; when and how you lock down is yours.
+- **Installing it**: the crate only compiles; passing the program to `seccomp(2)`, and when, is yours.
 
 # Design
 1. `#[seccomp]` keeps the function, and emits:

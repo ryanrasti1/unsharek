@@ -124,7 +124,8 @@ fn kernel(prog: &[SockFilter], d: &SeccompData) -> Outcome {
         0 => unsafe {
             libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
             libc::signal(libc::SIGSYS, trapped as *const () as libc::sighandler_t);
-            if install(prog, false).is_err() {
+            let fprog = libc::sock_fprog { len: prog.len() as u16, filter: prog.as_ptr() as *mut SockFilter };
+            if libc::syscall(libc::SYS_seccomp, libc::SECCOMP_SET_MODE_FILTER, 0, &fprog) != 0 {
                 libc::_exit(201);
             }
             let a = d.args;

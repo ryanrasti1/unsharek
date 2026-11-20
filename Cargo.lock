@@ -296,6 +296,7 @@ name = "exobox-tcb"
 version = "0.0.0"
 dependencies = [
  "libc",
+ "rustix",
  "seccomp-fn",
 ]
 

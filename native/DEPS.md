@@ -254,7 +254,7 @@ seccomp-fn (`seccomp-fn/`, its own workspace and repository to be; exobox-tcb de
 path) and proven equal to it by Kani (`./test --prove`; the release build requires the proof).
 **seccompiler is removed**: exobox-tcb's run-time dependencies are seccomp-fn and libc.
 seccomp-fn's macro crate brings syn (with `full`), quote and proc-macro2, at build time only
-(versions already in the lock). Kani itself is a Nix derivation (seccomp-fn/nix/kani.nix: the
+(versions already in the lock). Kani itself is a Nix derivation (seccomp-fn/flake.nix: the
 0.68.0 release bundle and its pinned nightly), in the devshell and the release's check, never in
 the binary.
 
@@ -263,3 +263,14 @@ the binary.
 | seccomp-fn (path) | `run_bpf`, `install`, the builder the generated code calls | exobox-tcb (the TCB) | not measured here (the worktree has no release kernel build): its run-time code is the builder, `install` and `run_bpf`, a few KB, against seccompiler's ~24 KB |
 | seccomp-fn-macros (path): syn 3 (`full`), quote, proc-macro2 | `#[seccomp]` | build time only | ~5.6 s cold release build of the pair (syn `full` most of it), under load |
 | seccompiler 0.5 | removed | | -~24 KB stripped |
+
+## rustix in exobox-tcb (2026-11-19): lockdown's syscalls typed
+exobox-tcb's lockdown (`tcb/src/lockdown.rs`) makes its calls through rustix: getpid, gettid,
+statfs, setrlimit, PR_SET_DUMPABLE, no_new_privs, the bounding and ambient sets, capget/capset.
+`close_range` and `seccomp` stay `libc::syscall` (rustix wraps neither). rustix was in the build
+already (exobox, exobox-rt); the tcb, its own repository, names it itself, not the workspace's.
+`seccomp-fn`'s `install` moved into the tcb (it only compiles now).
+
+| Crate | For | Where | Cost noted |
+|---|---|---|---|
+| rustix 1 (`std`, `thread`, `process`, `fs`) | lockdown's calls but two, without `unsafe` | exobox-tcb (the TCB) | +2,048 B `.text`, +2.5 KB unstripped binary (release, x86_64-unknown-linux-gnu); stripped size unchanged (page rounding); no new crate in the build |

@@ -2,9 +2,8 @@
 # `exoboxKernel` and `mkExobox`, the same functions the flake's `lib` has (flake.nix imports this).
 # The kernel's default source is the submodule lkl/linux: a checkout of exobox used this way needs
 # it checked out (`git submodule update --init lkl/linux`, or a recursive clone).
-# `seccompFn` is seccomp-fn's Nix library (seccomp-fn/nix/lib.nix: Kani, kaniCheck); the flake
-# passes its input's.
-{ pkgs, seccompFn ? import ../seccomp-fn/nix/lib.nix { inherit pkgs; } }:
+# `seccompFn` is seccomp-fn's flake's `lib` (Kani, kaniCheck); the flake passes its input's.
+{ pkgs, seccompFn ? (builtins.getFlake (toString ../seccomp-fn)).lib }:
 let
   inherit (pkgs) lib;
   fs = lib.fileset;
