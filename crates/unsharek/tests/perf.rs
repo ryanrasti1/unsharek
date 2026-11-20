@@ -1,6 +1,6 @@
 //! Performance budgets: what each mode costs, checked against native measured in the same run, or
 //! against an absolute budget where native has no equivalent (memory per sandbox, startup).
-//! Run with `./test --perf` (its own nextest profile; not part of the default loop). Every trial
+//! Run with `cargo xtask perf` (its own nextest profile; not part of the default loop). Every trial
 //! prints its measurements; budgets come from capnix's tier A (noted at each) with headroom for a
 //! loaded machine, so a failure is a regression, not noise.
 
@@ -103,7 +103,7 @@ fn own_userns(mut cmd: Command) -> Command {
 }
 
 fn external(var: &str) -> Result<PathBuf, Failed> {
-    env::var_os(var).map(PathBuf::from).ok_or_else(|| format!("{var} unset: run in the devshell (./test --perf)").into())
+    env::var_os(var).map(PathBuf::from).ok_or_else(|| format!("{var} unset: run in the devshell (cargo xtask perf)").into())
 }
 
 /// The store path a program in the store belongs to (`/nix/store/<hash>-<name>`).

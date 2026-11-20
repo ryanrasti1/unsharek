@@ -1,13 +1,13 @@
 # Working on unsharek
 
 ## Iterate in seconds
-- `./test` builds incrementally and runs everything. Warm, it takes seconds; keep it that way. A
+- `cargo xtask test` builds incrementally and runs everything. Warm, it takes seconds; keep it that way. A
   change that makes it slower needs a reason in its commit message.
 - Every run of anything is bounded: the suite gives each case a timeout of seconds (`timeout` in
   `crates/unsharek/tests/suite.rs`, 5 s by default), nextest kills a guest test at 5 s and
   backstops the rest (`.config/nextest.toml`), and commands run by hand get `timeout 10 …`. A hang is a failure, found in seconds, never a
   wait.
-- Run the narrowest set while iterating (`./test -E 'test(/^idle::/)'`, `./test -E
+- Run the narrowest set while iterating (`cargo xtask test -E 'test(/^idle::/)'`, `cargo xtask test -E
   'package(guest-tests) & test(/^signals::/)'`), then all of it before a
   commit.
 - Never wait on a long build to see a result. If a step takes minutes (the kernel's cold build),
@@ -45,7 +45,7 @@
 - Each test runs natively too, unless it can't (it needs the sandbox) or mustn't (it is unsafe on
   the host). The native run checks the test: a leak test must leak natively.
 - Escape tests make one forbidden call each and expect death by SIGSYS (`escape_gate.c`'s
-  probes); every number's verdict is unsharek-tcb's policy, proven (`./test --prove`).
+  probes); every number's verdict is unsharek-tcb's policy, proven (`cargo xtask prove`).
 
 ## Code
 - The trusted computing base is the crate `unsharek-tcb` (`crates/unsharek-tcb/`) and nothing else
@@ -55,7 +55,7 @@
   the host allows (a filter rule, a kind of guest fd or mapping lockdown accepts) is a TCB change,
   with a test in `crates/unsharek-tcb/tests/` (`filter.rs`; `lockdown.rs`), and
   crates/unsharek-tcb/README.md's table and checklist follow it (a test checks the table's rows against the
-  policy's, in order; Kani proves the filter is the policy: `./test --prove`). Everything else (unsharek's
+  policy's, in order; Kani proves the filter is the policy: `cargo xtask prove`). Everything else (unsharek's
   API and batteries in `crates/unsharek`, the runtime `crates/unsharek-rt`, the kernel) is not trusted: it
   is given grants, never produces values the filter trusts, and knows nothing of the filter. A
   network hook is never a policy point.

@@ -65,7 +65,7 @@ and ~0.1 s of rustc's.
 
 ## Fixes (phase 2) and where they leave each workload
 
-Commits on the branch after this analysis, each measured with `./test --vs-native` (A/B: an
+Commits on the branch after this analysis, each measured with `cargo xtask vs-native` (A/B: an
 interleaved run with the commit before, `--variant`) and at the end with the full harness. The
 machine was shared and loaded through most of phase 2 (load 10-17 for the final runs, against 1-5
 for the analysis above), which slows sleeping hand-offs most: absolute ratios came out worse than
@@ -73,7 +73,7 @@ the analysis's for every binary, the old one included. Compare within a run.
 
 | # | Commit | What | Measured |
 |---|---|---|---|
-| suite | `84de615`, `df3ce03` | `./test --vs-native` (bench/quick.py): rustc cgu16, rustc under make -j4, make -j4 of C, xz -T4, and syscall, futex/pipe ping-pong and fork+exec micro costs, scaled down, ratios against targets; `--variant` A/B | ~30 s a run (3 reps). The small workloads track the direction of the full-size ones but exaggerate per-process cost (small rustmake 1.36x when full-size is 1.12x; small make 3.4-3.9x for 2.2-3.2x) |
+| suite | `84de615`, `df3ce03` | `cargo xtask vs-native` (bench/quick.py): rustc cgu16, rustc under make -j4, make -j4 of C, xz -T4, and syscall, futex/pipe ping-pong and fork+exec micro costs, scaled down, ratios against targets; `--variant` A/B | ~30 s a run (3 reps). The small workloads track the direction of the full-size ones but exaggerate per-process cost (small rustmake 1.36x when full-size is 1.12x; small make 3.4-3.9x for 2.2-3.2x) |
 | 1 | `26de534` | `sched_getaffinity` reports the host's CPUs (threaded, fork) | rustc 2.82x -> 1.2-1.4x; rustmake 1.82x -> 1.05-1.12x (full size, quiet machine) |
 | 2 | `6239209`, `203a295` | Exec without copies: the image zone is read-only on the host but for each ELF's writable segments (from the image's layout and the ELFs' program headers, made writable before lockdown); in place at every exec in every mode; library code faults when written, `mprotect(PROT_WRITE)` on it is EACCES. Then no `madvise` in any mode (one memory model), and ELF headers read with `pread` (reading them through the mapping cost 1.5 MB PSS) | make -j4: zeroing 764 -> 215 MiB, copies 2189 -> 1550 MiB, 2.45x -> 2.23x (1 rep). What is still copied is gcc's `cc1`/`collect2`, non-PIE: they must sit at their own addresses, 51 MB a compile; only a filter widening (a host `mmap` of an image fd at a fixed arena address) or a PIE gcc removes it. PSS per idle sandbox 4447/4479/4659 KB (budget 5120; 4321 before) |
 | - | `71ec27b` | A timed futex wait woken for nothing waits again to the same deadline (it returned 0 after ~1 ms, every mode) | guest-tests' `futex_timeout` runs in every mode |
@@ -200,7 +200,7 @@ processes works, and the questions were about waiting, which sampling doesn't sh
 | ... of `cc1 --version` (51 MB binary) | 8.2 ms | - | - | 21.1 ms |
 | host fork (parent's side, in the kernel's clone) | - | - | - | 0.28-0.42 ms |
 
-(`./test --perf` syscalls and `bench`'s exec loop.) The trap round trip itself (SIGSYS
+(`cargo xtask perf` syscalls and `bench`'s exec loop.) The trap round trip itself (SIGSYS
 delivery, frame move, `rt_sigreturn`) is ~0.8 µs of the ~1.3 µs; an uncontended token adds little
 (threaded ≈ coroutine). What makes the parallel modes slow is never the single call: it is
 contention, hand-offs and the work done while holding the token.
@@ -425,7 +425,7 @@ Suggested order: #1 (hours), #6 (a day), #3 (a week), #5, #2 (two weeks), #4, th
 ## Bugs found while measuring
 
 - **cargo crashed the sandbox** in every mode (a NULL dereference after Rust std's `statx(0, NULL, ...)` probe): fixed on main by `22f1bd0` (statx checks the program's pointers before LKL reads them); the `cargo` workload runs since.
-- `./test --perf`'s `xz::threaded` and `xz::fork` time out: the full-stdout-pipe hang (`xz -T2 |
+- `cargo xtask perf`'s `xz::threaded` and `xz::fork` time out: the full-stdout-pipe hang (`xz -T2 |
   cat`), known and being fixed; the harness writes stdout to files.
 - In fork mode `wait4`'s rusage doesn't include the build's processes (init reaps them with
   `SA_NOCLDWAIT`): use `perf stat` (the harness's `--perf`) for CPU time.

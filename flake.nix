@@ -40,7 +40,7 @@
       # all three modes inside Nix's build sandbox (nix/smoke.nix). `nix build .#checks.x86_64-linux.smoke`.
       checks.${system} = {
         smoke = import ./nix/smoke.nix { inherit pkgs tp; unsharek = self.packages.${system}.default; };
-        # The filter's proof (`./test --prove`), which the package requires: nix/lib.nix's
+        # The filter's proof (`cargo xtask prove`), which the package requires: nix/lib.nix's
         # `kaniCheck`.
         kani = self.packages.${system}.default.kani;
       };

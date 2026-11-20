@@ -57,9 +57,9 @@ Measured on stock LKL (`d0f76a77e`, Linux 6.12) with `crates/lkl-sys/defconfig`,
   no link flags are needed. A change to the kernel's flags rebuilds it all (~45 s under load).
 - **Cold kernel build**: ~20 s wall (3.5 min CPU), by make or through cargo (build.rs passes cargo's
   jobserver). **No-op make**: ~3.5 s (kbuild walking its tree); build.rs only runs it when lkl/,
-  wrapper.h or the kernel's source changed, so a warm `./test` doesn't pay it (a no-op
+  wrapper.h or the kernel's source changed, so a warm `cargo xtask test` doesn't pay it (a no-op
   `cargo build` stays ~0.1 s, the source tree's mtimes scanned by cargo).
-- `./test -E 'package(lkl-sys)'` warm: ~0.7 s (the boot to halt takes ~35 ms; objdump of the test
+- `cargo xtask test -E 'package(lkl-sys)'` warm: ~0.7 s (the boot to halt takes ~35 ms; objdump of the test
   binary ~0.5 s; readelf of lkl.o's relocations, the shim's test: fractions of that).
 
 | Crate | For | Where | Cost noted |
@@ -93,7 +93,7 @@ Nothing new from crates.io. What it costs:
 - **Binary**: the kernel object (~5.9 MB, see above) is linked only where `lkl_init` is referenced;
   the host ops themselves are a few KB of code plus static pools (tens of KB: 1024 semaphores, 8
   mutexes, 4 timers) and the 0.3 KB table.
-- `./test -E 'package(unsharek-rt)'`: the boot test (`tests/lkl_boot.rs`) adds ~0.1 s (a forked child
+- `cargo xtask test -E 'package(unsharek-rt)'`: the boot test (`tests/lkl_boot.rs`) adds ~0.1 s (a forked child
   that boots, sleeps 50 ms, halts).
 
 | Crate | For | Where | Cost noted |
@@ -178,7 +178,7 @@ the tree). The release `unsharek` binary: 9,616,256 / 8,400,120 bytes (unstrippe
 9,799,104 / 8,596,664: its 17,861 relative relocations (`.rela.dyn`) are gone.
 
 An idle sandbox (`ready_idle`, release): PSS 11.3 MB alone (3.1 MB anonymous), 4.2 MB each with 8
-at once (from 19.3 MB and 9.9 MB anonymous; the debug build `./test --perf` measures: 11.5 MB to
+at once (from 19.3 MB and 9.9 MB anonymous; the debug build `cargo xtask perf` measures: 11.5 MB to
 4.5 MB at 8). Start to READY ~5 ms (from ~30 ms), the closure's `nix-store` query now cached.
 
 | Crate | For | Where | Cost noted |
@@ -251,7 +251,7 @@ unchanged, only who depends on what.
 ## seccomp-fn (2026-11-19): the filter is a Rust function, proven; seccompiler is gone
 unsharek-tcb's filter is one `#[seccomp]` function (`crates/unsharek-tcb/src/filter.rs`), compiled to classic BPF by
 seccomp-fn (`seccomp-fn/`, its own workspace and repository to be; unsharek-tcb depends on it by
-path) and proven equal to it by Kani (`./test --prove`; the release build requires the proof).
+path) and proven equal to it by Kani (`cargo xtask prove`; the release build requires the proof).
 **seccompiler is removed**: unsharek-tcb's run-time dependencies are seccomp-fn and libc.
 seccomp-fn's macro crate brings syn (with `full`), quote and proc-macro2, at build time only
 (versions already in the lock). Kani itself is a Nix derivation (seccomp-fn/flake.nix: the

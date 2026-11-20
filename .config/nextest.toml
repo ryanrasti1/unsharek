@@ -10,7 +10,7 @@ failure-output = "immediate-final"
 status-level = "fail"
 final-status-level = "fail"
 
-# ./test --perf: the budgets (crates/unsharek/tests/perf.rs), one at a time so they don't load each
+# cargo xtask perf: the budgets (crates/unsharek/tests/perf.rs), one at a time so they don't load each
 # other, each printing its measurements.
 [profile.perf]
 default-filter = "binary(perf)"

@@ -126,7 +126,7 @@ let
       preCheck = "cat $UNSHAREK_KANI_PROOF/summary";
 
       # The hermetic tests only, with nextest (lkl-sys's boot test needs a process per test, as
-      # in ./test): lkl-sys's (the given kernel boots, answers syscalls and halts; lkl.o has no
+      # in cargo xtask test): lkl-sys's (the given kernel boots, answers syscalls and halts; lkl.o has no
       # relaxable relocations; the shim), unsharek-tcb's (the filter against its policy, sampled;
       # lockdown and each of its refusals in forked children), and unsharek's and unsharek-erofs's
       # unit tests. Not the

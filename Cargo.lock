@@ -221,87 +221,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f0d310082fd5de539d4f41601182241147498444a7695c520288a0cdbead6"
 
 [[package]]
-name = "unsharek"
-version = "0.0.0"
-dependencies = [
- "clap",
- "unsharek-build",
- "unsharek-erofs",
- "unsharek-fixtures",
- "unsharek-rt",
- "unsharek-tcb",
- "futures-core",
- "futures-io",
- "libc",
- "libtest-mimic",
- "rustix",
- "syscalls",
- "talc",
- "tempfile",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "unsharek-build"
-version = "0.0.0"
-dependencies = [
- "cc",
-]
-
-[[package]]
-name = "unsharek-erofs"
-version = "0.0.0"
-dependencies = [
- "clap",
- "object",
- "tempfile",
- "thiserror",
-]
-
-[[package]]
-name = "unsharek-examples"
-version = "0.0.0"
-dependencies = [
- "unsharek",
- "unsharek-build",
- "unsharek-erofs",
- "unsharek-fixtures",
- "futures-io",
- "libc",
- "tempfile",
-]
-
-[[package]]
-name = "unsharek-fixtures"
-version = "0.0.0"
-dependencies = [
- "cc",
-]
-
-[[package]]
-name = "unsharek-rt"
-version = "0.0.0"
-dependencies = [
- "unsharek-fixtures",
- "libc",
- "lkl-sys",
- "object",
- "proptest",
- "rustix",
-]
-
-[[package]]
-name = "unsharek-tcb"
-version = "0.0.0"
-dependencies = [
- "libc",
- "rustix",
- "seccomp-fn",
- "seccomp-fn-verify",
-]
-
-[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -746,6 +665,87 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
+name = "unsharek"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "futures-core",
+ "futures-io",
+ "libc",
+ "libtest-mimic",
+ "rustix",
+ "syscalls",
+ "talc",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "unsharek-build",
+ "unsharek-erofs",
+ "unsharek-fixtures",
+ "unsharek-rt",
+ "unsharek-tcb",
+]
+
+[[package]]
+name = "unsharek-build"
+version = "0.0.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
+name = "unsharek-erofs"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "object",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "unsharek-examples"
+version = "0.0.0"
+dependencies = [
+ "futures-io",
+ "libc",
+ "tempfile",
+ "unsharek",
+ "unsharek-build",
+ "unsharek-erofs",
+ "unsharek-fixtures",
+]
+
+[[package]]
+name = "unsharek-fixtures"
+version = "0.0.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
+name = "unsharek-rt"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "lkl-sys",
+ "object",
+ "proptest",
+ "rustix",
+ "unsharek-fixtures",
+]
+
+[[package]]
+name = "unsharek-tcb"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "rustix",
+ "seccomp-fn",
+ "seccomp-fn-verify",
+]
+
+[[package]]
 name = "utf8parse"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -765,3 +765,7 @@ checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
 ]
+
+[[package]]
+name = "xtask"
+version = "0.0.0"

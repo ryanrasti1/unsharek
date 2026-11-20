@@ -89,7 +89,7 @@ fn build(manifest: &Path, out_dir: &Path) -> Kernel {
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| lkl_dir.join("linux"));
-    // Relative to the workspace's root, where `./test` and cargo are run from (build.rs runs in
+    // Relative to the workspace's root, where `cargo xtask test` and cargo are run from (build.rs runs in
     // the package's directory and the Makefile in lkl/: neither is the caller's).
     let config = env::var_os("UNSHAREK_LKL_CONFIG")
         .filter(|c| !c.is_empty())
@@ -108,7 +108,7 @@ fn build(manifest: &Path, out_dir: &Path) -> Kernel {
         println!("cargo:rerun-if-changed={}", config.display());
     }
     // The whole checkout, so a kernel change (a submodule bump, or work in it) is rebuilt by the
-    // next `./test`. cargo compares the newest mtime under it with the last run: a walk of the
+    // next `cargo xtask test`. cargo compares the newest mtime under it with the last run: a walk of the
     // whole tree, yet a no-op `cargo build` stays ~0.1 s. kbuild then decides what to recompile.
     println!("cargo:rerun-if-changed={}", src.display());
 

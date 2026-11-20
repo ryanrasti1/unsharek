@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """The vs-native suite: where each mode stands against native, in seconds.
 
-Not correctness (./test) and not perf.rs's budgets (./test --perf): each workload that matters for
+Not correctness (cargo xtask test) and not perf.rs's budgets (cargo xtask perf): each workload that matters for
 parallel builds, scaled down until a run takes a fraction of a second, run natively and in each
 mode, reported as the ratio to native with a pass/fail against a target ratio (the goal: builds
 within 5% of native). The full-size measurements are bench/run's (bench/PERF.md); the
 small versions here were checked to show the same ratios (PERF.md, "The vs-native suite").
 
-  ./test --vs-native                       every workload, threaded and fork mode
-  ./test --vs-native --modes fork --work make,micro
-  ./test --vs-native --unsharek PATH         another unsharek binary (an experiment's)
-  ./test --vs-native --modes fork,fork:old --variant old=PATH   before and after, interleaved
-  ./test --vs-native --modes fork,fork:stats --variant stats     the runtime's counters' build
+  cargo xtask vs-native                       every workload, threaded and fork mode
+  cargo xtask vs-native --modes fork --work make,micro
+  cargo xtask vs-native --unsharek PATH         another unsharek binary (an experiment's)
+  cargo xtask vs-native --modes fork,fork:old --variant old=PATH   before and after, interleaved
+  cargo xtask vs-native --modes fork,fork:stats --variant stats     the runtime's counters' build
 
 Workloads: rustc (a generated crate, -C codegen-units=16 --emit=obj: rustc's threads),
 rustmake (4 generated crates and a binary by rustc under make -j4: processes and threads), make

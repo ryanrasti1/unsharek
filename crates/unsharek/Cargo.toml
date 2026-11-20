@@ -64,7 +64,7 @@ harness = false
 name = "net"
 harness = false
 
-# The performance budgets (./test --perf).
+# The performance budgets (cargo xtask perf).
 [[test]]
 name = "perf"
 harness = false

@@ -621,7 +621,7 @@ fn run(c: &Case, mode: Mode, secret: &PathBuf) -> Result<(), Failed> {
         Prog::Fixture(name) => fx::bin(name),
         Prog::External(var) => match env::var_os(var) {
             Some(p) => PathBuf::from(p),
-            None => return Err(format!("{var} unset: run in the devshell (./test)").into()),
+            None => return Err(format!("{var} unset: run in the devshell (cargo xtask test)").into()),
         },
     };
     let marker_dir = tempfile::tempdir()?;
@@ -640,7 +640,7 @@ fn run(c: &Case, mode: Mode, secret: &PathBuf) -> Result<(), Failed> {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_unsharek"));
         cmd.args(["--mode", mode.name(), "--ro"]).arg(fx::bin_dir());
         for var in &c.uses {
-            let Some(p) = env::var_os(var) else { return Err(format!("{var} unset: run in the devshell (./test)").into()) };
+            let Some(p) = env::var_os(var) else { return Err(format!("{var} unset: run in the devshell (cargo xtask test)").into()) };
             let p = PathBuf::from(p);
             // Its store path (`/nix/store/<hash>-<name>`), which brings its closure.
             let store = p.ancestors().find(|a| a.parent() == Some(std::path::Path::new("/nix/store"))).unwrap_or(&p);

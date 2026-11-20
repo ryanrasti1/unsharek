@@ -12,7 +12,7 @@ use unsharek::store::{self, Cache, Closure, Error};
 use unsharek_fixtures as fx;
 
 fn bash() -> PathBuf {
-    env::var_os("UNSHAREK_TEST_BASH").expect("UNSHAREK_TEST_BASH (run in the devshell: ./test)").into()
+    env::var_os("UNSHAREK_TEST_BASH").expect("UNSHAREK_TEST_BASH (run in the devshell: cargo xtask test)").into()
 }
 
 /// The store path a path is in: `/nix/store/<hash>-<name>`.

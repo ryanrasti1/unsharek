@@ -1,5 +1,5 @@
 //! Each example run once, small (`UNSHAREK_EXAMPLE_QUICK`), under a timeout, its key output
-//! checked: so `./test` keeps them from rotting. An example whose nixpkgs program isn't in the
+//! checked: so `cargo xtask test` keeps them from rotting. An example whose nixpkgs program isn't in the
 //! environment says "skipped:", which passes.
 
 use std::io::Read;

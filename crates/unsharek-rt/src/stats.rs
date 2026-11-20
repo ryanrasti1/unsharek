@@ -1,6 +1,6 @@
 //! Measurement counters, for bench/PERF.md: where a sandboxed program's time goes. Built with
 //! the cargo feature `stats` (`unsharek/stats`; `bench/run --variant stats` and
-//! `./test --vs-native --variant stats` build it). Without it every call here is empty, its guard
+//! `cargo xtask vs-native --variant stats` build it). Without it every call here is empty, its guard
 //! a zero-sized value without a destructor: the shipped binary has no trace of them.
 //!
 //! Each event is one line where it happens: `let _t = stats::timed(K::Exec, 0);` times the rest of
