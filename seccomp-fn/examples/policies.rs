@@ -126,7 +126,11 @@ pub mod table {
         seccomp_fn::compile!(policy(pid, allow_exit))
     }
 
-    seccomp_fn_validate::policy!(policy, filter);
+    // A harness per value of the bool (with it symbolic: over 400 s).
+    seccomp_fn_validate::policy!(policy, filter, unwind = 100, [
+        exit: (kani::any(), true),
+        no_exit: (kani::any(), false),
+    ]);
 }
 
 /// Match guards: arms in order, a guard that fails going on to the next arm, a pattern repeated,
@@ -150,7 +154,11 @@ pub mod guarded {
         seccomp_fn::compile!(policy(pid, on))
     }
 
-    seccomp_fn_validate::policy!(policy, filter);
+    // A harness per value of the bool (with it symbolic: over 400 s).
+    seccomp_fn_validate::policy!(policy, filter, unwind = 100, [
+        on: (kani::any(), true),
+        off: (kani::any(), false),
+    ]);
 }
 
 /// Each field's halves: `==`, `<` and `<=` on every 64-bit field against `v` (whose halves the
@@ -196,7 +204,8 @@ pub mod halves {
         seccomp_fn::compile!(policy(v, w))
     }
 
-    seccomp_fn_validate::policy!(policy, filter);
+    // (its program: over 100 instructions, the default bound)
+    seccomp_fn_validate::policy!(policy, filter, unwind = 160);
 }
 
 /// Another ABI and the x32 bit: KILL. Anything else: an errno.
