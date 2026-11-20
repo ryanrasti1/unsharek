@@ -1,0 +1,408 @@
+diff -ruN /tmp/claude-1000/-home-ryan-src-unsharek/52d2fb81-1284-4408-bc36-e404785cc144/scratchpad/lkl-orig/include/uapi/asm/host_ops.h /tmp/claude-1000/-home-ryan-src-unsharek/52d2fb81-1284-4408-bc36-e404785cc144/scratchpad/linux/arch/lkl/include/uapi/asm/host_ops.h
+--- a/arch/lkl/include/uapi/asm/host_ops.h	2026-11-19 20:36:36.497222987 -0800
++++ b/arch/lkl/include/uapi/asm/host_ops.h	2026-11-19 20:41:13.259473409 -0800
+@@ -280,6 +280,13 @@
+  * waiting. For any not ready, the host watches the fd and calls
+  * lkl_hostfd_ready(fd) once one is (the guest's pollers then ask again).
+  * Called with the CPU held. Without it, the files poll as always ready.
++ *
++ * @net_fd_shutdown - the program shut down (how: SHUT_RD, SHUT_WR, SHUT_RDWR)
++ * a connection backed by host fd fd (lkl_net_done_fd, lkl_net_accept_fd),
++ * which the host may not shut down itself: it asks whoever can.
++ *
++ * @net_fd_close - the program's last reference to such a connection is
++ * gone: the host closes fd (and ends the connection).
+  */
+ /* hostfd_rw's flags */
+ #define LKL_HOSTFD_WRITE	1
+@@ -353,6 +360,8 @@
+ 	int (*net_listen)(void *sock, int pid, const struct sockaddr *addr, int len);
+ 	int (*net_sendto)(void *sock, int pid, const struct sockaddr *addr, int len, const void *buf, unsigned long size);
+ 	void (*net_ready)(void *obj);
++	void (*net_fd_shutdown)(long fd, int how);
++	void (*net_fd_close)(long fd);
+ 	unsigned int (*hostfd_poll)(int fd, unsigned int events);
+ };
+ 
+@@ -403,6 +412,13 @@
+  * program's accept, which sees peer as getpeername. NULL: refused (the
+  * program closed sock, its backlog is full, no memory).
+  *
++ * lkl_net_done_fd, lkl_net_accept_fd - as lkl_net_done(sock, 0) for a
++ * connect and lkl_net_accept, the connection a host fd: the program's
++ * socket reads and writes fd itself, as a host_fd file does (hostfd_rw,
++ * hostfd_poll), with no end and no copy; its shutdown and close are
++ * net_fd_shutdown and net_fd_close. 0, or -errno: nothing took fd (the
++ * host still owns it).
++ *
+  * lkl_net_reply - a datagram for sock, from address from (the resolver's,
+  * as the program sent to): 0 or -errno.
+  *
+@@ -428,6 +444,8 @@
+  */
+ void *lkl_net_done(void *sock, int err);
+ void *lkl_net_accept(void *sock, const struct sockaddr *peer, int len);
++int lkl_net_done_fd(void *sock, long fd);
++int lkl_net_accept_fd(void *sock, const struct sockaddr *peer, int len, long fd);
+ long lkl_net_reply(void *sock, const struct sockaddr *from, int len,
+ 		   const void *buf, unsigned long size);
+ long lkl_net_recv(void *end, void *buf, unsigned long len);
+diff -ruN /tmp/claude-1000/-home-ryan-src-unsharek/52d2fb81-1284-4408-bc36-e404785cc144/scratchpad/lkl-orig/kernel/hostfd.c /tmp/claude-1000/-home-ryan-src-unsharek/52d2fb81-1284-4408-bc36-e404785cc144/scratchpad/linux/arch/lkl/kernel/hostfd.c
+--- a/arch/lkl/kernel/hostfd.c	2026-11-19 20:36:36.497506484 -0800
++++ b/arch/lkl/kernel/hostfd.c	2026-11-19 20:37:57.139867961 -0800
+@@ -24,8 +24,13 @@
+ #include <asm/host_ops.h>
+ #include <asm/sched.h>
+ 
+-static ssize_t hostfd_rw(struct file *file, char __user *buf, size_t len,
+-			 int write)
++/*
++ * One host read or write of host fd fd (blocking unless nonblock), the
++ * calling task asleep meanwhile: a host_fd file's, and a connection's that
++ * a host fd backs (tsi.c).
++ */
++long lkl_hostfd_io(long fd, char __user *buf, size_t len, int write,
++		   int nonblock)
+ {
+ 	struct task_struct *task = current;
+ 	ssize_t done = 0;
+@@ -38,8 +43,7 @@
+ 
+ 	for (;;) {
+ 		flags = write ? LKL_HOSTFD_WRITE : 0;
+-		/* (f_flags read once a call: an fcntl meanwhile applies to the next) */
+-		if (READ_ONCE(file->f_flags) & O_NONBLOCK)
++		if (nonblock)
+ 			flags |= LKL_HOSTFD_NONBLOCK;
+ 		/*
+ 		 * Schedule out, as a host task leaving the kernel does: the CPU
+@@ -47,8 +51,7 @@
+ 		 * it.
+ 		 */
+ 		thread_sched_jb();
+-		ret = lkl_ops->hostfd_rw((long)file->private_data, buf + done,
+-					 len - done, flags);
++		ret = lkl_ops->hostfd_rw(fd, buf + done, len - done, flags);
+ 		/* the kernel halted meanwhile: nothing to return to */
+ 		if (lkl_cpu_get() < 0)
+ 			lkl_ops->thread_exit();
+@@ -79,6 +82,14 @@
+ 	return done ? done : ret;
+ }
+ 
++static ssize_t hostfd_rw(struct file *file, char __user *buf, size_t len,
++			 int write)
++{
++	/* (f_flags read once a call: an fcntl meanwhile applies to the next) */
++	return lkl_hostfd_io((long)file->private_data, buf, len, write,
++			     READ_ONCE(file->f_flags) & O_NONBLOCK);
++}
++
+ static ssize_t hostfd_read(struct file *file, char __user *buf, size_t len,
+ 			   loff_t *pos)
+ {
+@@ -104,19 +115,16 @@
+  * channel the host passed in, become readable without a read blocked on
+  * it.
+  */
+-static __poll_t hostfd_poll(struct file *file, poll_table *wait)
++__poll_t lkl_hostfd_poll_fd(struct file *file, long fd, __poll_t want,
++			    poll_table *wait)
+ {
+-	__poll_t want = 0, ready;
++	__poll_t ready;
+ 
+ 	if (!lkl_ops->hostfd_poll)
+ 		return EPOLLIN | EPOLLRDNORM | EPOLLOUT | EPOLLWRNORM;
+ 	poll_wait(file, &hostfd_wait, wait);
+-	if (file->f_mode & FMODE_READ)
+-		want |= EPOLLIN;
+-	if (file->f_mode & FMODE_WRITE)
+-		want |= EPOLLOUT;
+ 	/* (POLLHUP and POLLERR whatever was asked, as poll(2) gives them) */
+-	ready = lkl_ops->hostfd_poll((long)file->private_data, want) &
++	ready = lkl_ops->hostfd_poll(fd, want) &
+ 		(want | EPOLLHUP | EPOLLERR);
+ 	if (ready & EPOLLIN)
+ 		ready |= EPOLLRDNORM;
+@@ -125,6 +133,17 @@
+ 	return ready;
+ }
+ 
++static __poll_t hostfd_poll(struct file *file, poll_table *wait)
++{
++	__poll_t want = 0;
++
++	if (file->f_mode & FMODE_READ)
++		want |= EPOLLIN;
++	if (file->f_mode & FMODE_WRITE)
++		want |= EPOLLOUT;
++	return lkl_hostfd_poll_fd(file, (long)file->private_data, want, wait);
++}
++
+ void lkl_hostfd_ready(int fd)
+ {
+ 	if (lkl_cpu_get() < 0)
+diff -ruN /tmp/claude-1000/-home-ryan-src-unsharek/52d2fb81-1284-4408-bc36-e404785cc144/scratchpad/lkl-orig/kernel/tsi.c /tmp/claude-1000/-home-ryan-src-unsharek/52d2fb81-1284-4408-bc36-e404785cc144/scratchpad/linux/arch/lkl/kernel/tsi.c
+--- a/arch/lkl/kernel/tsi.c	2026-11-19 20:36:36.497758782 -0800
++++ b/arch/lkl/kernel/tsi.c	2026-11-19 20:38:07.348478253 -0800
+@@ -86,6 +86,9 @@
+ struct tsi_pending {
+ 	struct list_head list;
+ 	struct socket *transport;
++	/* or a host fd (lkl_net_accept_fd), if hosted */
++	bool hosted;
++	long hostfd;
+ 	struct sockaddr_in peer;
+ };
+ 
+@@ -95,6 +98,9 @@
+ 	struct socket *isocket;
+ 	/* host-backed: the guest end of the socketpair */
+ 	struct socket *transport;
++	/* host-backed by a host fd instead (lkl_net_done_fd): no transport */
++	bool hosted;
++	long hostfd;
+ 	struct tsi_hook ihook, thook;
+ 	int status;
+ 	int conn;
+@@ -123,6 +129,12 @@
+ static const struct proto_ops tsi_stream_ops;
+ static const struct proto_ops tsi_dgram_ops;
+ 
++/* hostfd.c's I/O and poll by fd */
++long lkl_hostfd_io(long fd, char __user *buf, size_t len, int write,
++		   int nonblock);
++__poll_t lkl_hostfd_poll_fd(struct file *file, long fd, __poll_t want,
++			    poll_table *wait);
++
+ /* the task the host's calls run as: see the top */
+ static struct task_struct *tsi_task;
+ 
+@@ -351,9 +363,19 @@
+ 	tsk->transport = NULL;
+ 	tsk->isocket = NULL;
+ 	list_for_each_entry_safe(p, n, &pending, list) {
+-		sock_release(p->transport);
++		if (p->hosted) {
++			if (lkl_ops->net_fd_close)
++				lkl_ops->net_fd_close(p->hostfd);
++		} else {
++			sock_release(p->transport);
++		}
+ 		kfree(p);
+ 	}
++	if (tsk->hosted) {
++		tsk->hosted = false;
++		if (lkl_ops->net_fd_close)
++			lkl_ops->net_fd_close(tsk->hostfd);
++	}
+ 	skb_queue_purge(&sk->sk_receive_queue);
+ 	if (host_holds && lkl_ops->net_ready)
+ 		lkl_ops->net_ready(sk);
+@@ -675,7 +697,12 @@
+ 	nsk = tsi_sk_alloc(newsock, SOCK_STREAM);
+ 	if (!nsk) {
+ 		if (p) {
+-			sock_release(p->transport);
++			if (p->hosted) {
++				if (lkl_ops->net_fd_close)
++					lkl_ops->net_fd_close(p->hostfd);
++			} else {
++				sock_release(p->transport);
++			}
+ 			kfree(p);
+ 		} else {
+ 			sock_release(nsock);
+@@ -685,11 +712,14 @@
+ 	ntsk = tsi_sk(nsk);
+ 	if (p) {
+ 		ntsk->transport = p->transport;
++		ntsk->hosted = p->hosted;
++		ntsk->hostfd = p->hostfd;
+ 		ntsk->peer = p->peer;
+ 		tsi_getname(sock, (struct sockaddr *)&ntsk->local, 0);
+ 		ntsk->status = TSI_HOST;
+ 		ntsk->conn = TSI_CONNECTED;
+-		tsi_hook(ntsk, ntsk->transport, &ntsk->thook);
++		if (!p->hosted)
++			tsi_hook(ntsk, ntsk->transport, &ntsk->thook);
+ 		kfree(p);
+ 	} else {
+ 		struct sock *csk = nsock->sk;
+@@ -723,6 +753,10 @@
+ 		case TSI_CONNECTING:
+ 			return 0;
+ 		case TSI_CONNECTED:
++			if (tsk->hosted)
++				return lkl_hostfd_poll_fd(file, tsk->hostfd,
++							  EPOLLIN | EPOLLOUT,
++							  wait);
+ 			return tsk->transport->ops->poll(file, tsk->transport,
+ 							 NULL);
+ 		default:
+@@ -780,6 +814,13 @@
+ 	struct tsi_sock *tsk = tsi_sk(sock->sk);
+ 
+ 	if (tsk->status == TSI_HOST) {
++		if (tsk->hosted) {
++			if (how < SHUT_RD || how > SHUT_RDWR)
++				return -EINVAL;
++			if (lkl_ops->net_fd_shutdown)
++				lkl_ops->net_fd_shutdown(tsk->hostfd, how);
++			return 0;
++		}
+ 		if (!tsk->transport)
+ 			return sock->type == SOCK_DGRAM ? 0 : -ENOTCONN;
+ 		return tsk->transport->ops->shutdown(tsk->transport, how);
+@@ -789,6 +830,42 @@
+ 	return tsk->isocket->ops->shutdown(tsk->isocket, how);
+ }
+ 
++/*
++ * A host-fd-backed connection's send or receive: the host's write or read
++ * of its fd, a segment of msg at a time (the program's own buffers: no
++ * MMU, so a user address is the host's), as a host_fd file's. A receive is
++ * one read; a send all of msg, unless nonblocking or cut short. Neither
++ * MSG_PEEK nor out-of-band data: the host fd has no such call.
++ */
++static int tsi_hostfd_msg(struct socket *sock, struct msghdr *msg, int flags,
++			  int write)
++{
++	struct tsi_sock *tsk = tsi_sk(sock->sk);
++	int nonblock = (flags & MSG_DONTWAIT) ||
++		       (sock->file && (READ_ONCE(sock->file->f_flags) & O_NONBLOCK));
++	long done = 0, ret = 0;
++
++	if (flags & (MSG_PEEK | MSG_OOB))
++		return -EOPNOTSUPP;
++	if (!user_backed_iter(&msg->msg_iter))
++		return -EINVAL;
++	while (iov_iter_count(&msg->msg_iter)) {
++		void __user *base = iter_iov_addr(&msg->msg_iter);
++		size_t seg = iter_iov_len(&msg->msg_iter);
++
++		ret = lkl_hostfd_io(tsk->hostfd, base, seg, write, nonblock);
++		if (ret <= 0)
++			break;
++		iov_iter_advance(&msg->msg_iter, ret);
++		done += ret;
++		if (!write || (size_t)ret < seg)
++			break;
++	}
++	if (write && ret == -EPIPE && !done && !(flags & MSG_NOSIGNAL))
++		send_sig(SIGPIPE, current, 0);
++	return done ? done : ret;
++}
++
+ static int tsi_stream_sendmsg(struct socket *sock, struct msghdr *msg,
+ 			      size_t len)
+ {
+@@ -805,6 +882,8 @@
+ 	/* a connected TCP socket ignores the address; AF_UNIX's would not */
+ 	msg->msg_name = NULL;
+ 	msg->msg_namelen = 0;
++	if (tsk->hosted)
++		return tsi_hostfd_msg(sock, msg, msg->msg_flags, 1);
+ 	return tsk->transport->ops->sendmsg(tsk->transport, msg, len);
+ }
+ 
+@@ -824,6 +903,8 @@
+ 		return err;
+ 	/* TCP's recvfrom gives no address (AF_UNIX's would give its own) */
+ 	msg->msg_name = NULL;
++	if (tsk->hosted)
++		return tsi_hostfd_msg(sock, msg, flags, 0);
+ 	return tsk->transport->ops->recvmsg(tsk->transport, msg, len, flags);
+ }
+ 
+@@ -1224,6 +1305,77 @@
+ 	return end;
+ }
+ 
++int lkl_net_done_fd(void *sock, long fd)
++{
++	struct sock *sk = sock;
++	struct tsi_sock *tsk = tsi_sk(sk);
++	int err = 0;
++
++	if (fd < 0 || sk->sk_type != SOCK_STREAM)
++		return -EINVAL;
++	err = tsi_enter();
++	if (err)
++		return err;
++	lock_sock(sk);
++	if (tsk->conn != TSI_CONNECTING) {
++		err = -EINVAL;
++	} else if (tsk->released) {
++		/* the program gave up: the host keeps fd */
++		tsk->conn = TSI_NONE;
++		err = -ECONNABORTED;
++	} else {
++		tsk->hosted = true;
++		tsk->hostfd = fd;
++		tsk->conn = TSI_CONNECTED;
++		sk->sk_socket->state = SS_CONNECTED;
++		sk->sk_state = TCP_ESTABLISHED;
++	}
++	tsi_wake(tsk);
++	release_sock(sk);
++	sock_put(sk);
++	tsi_leave();
++	return err;
++}
++
++int lkl_net_accept_fd(void *sock, const struct sockaddr *peer, int len,
++		      long fd)
++{
++	struct sock *sk = sock;
++	struct tsi_sock *tsk = tsi_sk(sk);
++	struct tsi_pending *p;
++	int err;
++
++	if (fd < 0 || len < (int)sizeof(struct sockaddr_in))
++		return -EINVAL;
++	err = tsi_enter();
++	if (err)
++		return err;
++	p = kzalloc(sizeof(*p), GFP_KERNEL);
++	err = -ENOMEM;
++	if (!p)
++		goto out;
++	lock_sock(sk);
++	if (tsk->released || !tsk->host_listening ||
++	    tsk->npending >= max(tsk->backlog, 1)) {
++		release_sock(sk);
++		kfree(p);
++		err = -ECONNREFUSED;
++		goto out;
++	}
++	p->hosted = true;
++	p->hostfd = fd;
++	memcpy(&p->peer, peer, sizeof(p->peer));
++	p->peer.sin_family = AF_INET;
++	list_add_tail(&p->list, &tsk->pending);
++	tsk->npending++;
++	tsi_wake(tsk);
++	release_sock(sk);
++	err = 0;
++out:
++	tsi_leave();
++	return err;
++}
++
+ void *lkl_net_accept(void *sock, const struct sockaddr *peer, int len)
+ {
+ 	struct sock *sk = sock;
+diff -ruN /tmp/claude-1000/-home-ryan-src-unsharek/52d2fb81-1284-4408-bc36-e404785cc144/scratchpad/lkl-orig/Makefile /tmp/claude-1000/-home-ryan-src-unsharek/52d2fb81-1284-4408-bc36-e404785cc144/scratchpad/linux/arch/lkl/Makefile
+--- a/arch/lkl/Makefile	2026-11-19 20:36:36.495934726 -0800
++++ b/arch/lkl/Makefile	2026-11-19 20:42:45.363835533 -0800
+@@ -54,7 +54,7 @@
+ 	lkl_get_free_irq lkl_put_irq lkl_is_running lkl_bug lkl_printf \
+ 	lkl_init lkl_cleanup lkl_hostfd_ready
+ ifdef CONFIG_LKL_TSI
+-LKL_ENTRY_POINTS += lkl_net_done lkl_net_accept lkl_net_reply lkl_net_recv \
++LKL_ENTRY_POINTS += lkl_net_done lkl_net_accept lkl_net_reply lkl_net_done_fd lkl_net_accept_fd lkl_net_recv \
+ 	lkl_net_send lkl_net_shutdown lkl_net_close lkl_net_syscall
+ endif
+ 

@@ -5,7 +5,7 @@
 //!
 //! The hooks run on the sandbox's executor, as every hook does, and decide nothing: `connect` and
 //! `listen` ask the provider, whose policy holds, and the socket it passes in becomes the stream
-//! the guest's socket is copied to and from (a [`HeldFd`] over the received fd). Not trusted:
+//! backs the guest's socket itself (no copy). Not trusted:
 //! a compromised program can make the same calls itself, and gets only what the provider allows.
 
 use std::net::{IpAddr, SocketAddr};
@@ -22,7 +22,7 @@ use unsharek_net::protocol;
 pub use unsharek_net::{Policy, Publish};
 use unsharek_rt::executor::{self, POLLIN, POLLOUT};
 
-use crate::net::{Cx, HeldFd, NetError, OnConnect, OnListen, OnResolve};
+use crate::net::{Cx, FdConn, NetError, OnConnect, OnListen, OnResolve};
 use crate::{Error, Guest};
 
 /// The network the CLI's `--net` and `--publish` ask for.
@@ -85,7 +85,7 @@ pub fn install(g: &mut Guest, ctl: OwnedFd, dials: bool) -> Result<RawFd, Error>
     let client = Client::new(runtime, GateCtl(fd));
     if dials {
         let c = Arc::clone(&client);
-        g.on_connect(OnConnect::new(move |_cx, _pid, addr: SocketAddr| {
+        g.on_connect(OnConnect::fd(move |_cx, _pid, addr: SocketAddr| {
             let call = c.connect(addr.ip(), addr.port());
             let c = Arc::clone(&c);
             async move { call.await.map(|(fd, conn)| Conn::new(c, fd, conn)).map_err(net_error) }
@@ -97,7 +97,7 @@ pub fn install(g: &mut Guest, ctl: OwnedFd, dials: bool) -> Result<RawFd, Error>
         }))?;
     }
     let c = Arc::clone(&client);
-    g.on_listen(OnListen::new(move |_cx, _pid, addr: SocketAddr| {
+    g.on_listen(OnListen::fd(move |_cx, _pid, addr: SocketAddr| {
         let c = Arc::clone(&c);
         async move {
             let listener = c.listen(addr.port()).await.map_err(net_error)?;
@@ -120,58 +120,44 @@ fn net_error(r: Rejection) -> NetError {
 
 type Accept = Pin<Box<dyn Future<Output = Result<(RawFd, SocketAddr, capnweb::RpcStub), Rejection>> + Send>>;
 
-/// A connection the provider passed in: its bytes are the received fd's (a [`HeldFd`]); its
-/// half-close is the provider's (`conn.shutdownWrite()`, the sandbox can't `shutdown` its own
-/// fd), and its drop releases `conn`, which the provider shuts down both ways. The fd itself
-/// stays open (no `close` is allowed after lockdown).
+/// A connection the provider passed in, the guest's socket backed by its fd (the kernel's
+/// `lkl_net_done_fd`): the program reads and writes the fd itself, nothing copied here. What the
+/// sandbox can't do on the fd is the provider's: the half-close (`conn.shutdownWrite()`) and, at
+/// the program's close, the release of `conn` (the provider shuts its copy down both ways); our
+/// fd is then closed (a received fd: the one kind unsharek-tcb's `close` row allows).
 pub struct Conn {
     client: Arc<Client<GateCtl>>,
-    fd: HeldFd,
+    fd: RawFd,
     conn: Option<capnweb::RpcStub>,
-    closing: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
 }
 
 impl Conn {
-    fn new(client: Arc<Client<GateCtl>>, fd: RawFd, conn: capnweb::RpcStub) -> Conn {
-        Conn { client, fd: HeldFd::from_raw(fd), conn: Some(conn), closing: None }
+    fn new(client: Arc<Client<GateCtl>>, fd: RawFd, conn: capnweb::RpcStub) -> (RawFd, Conn) {
+        (fd, Conn { client, fd, conn: Some(conn) })
     }
 }
 
-impl futures_io::AsyncRead for Conn {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.fd).poll_read(cx, buf)
-    }
-}
-
-impl futures_io::AsyncWrite for Conn {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.fd).poll_write(cx, buf)
-    }
-    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-    /// The half-close, by the provider: done once it has shut its copy down.
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let this = &mut *self;
-        if this.closing.is_none() {
-            let Some(conn) = &this.conn else { return Poll::Ready(Ok(())) };
-            this.closing = Some(Box::pin(this.client.shutdown_write(conn)));
+impl FdConn for Conn {
+    fn shutdown(&mut self, how: i32) {
+        // Reading's end is ours alone (the program stops reading); writing's is the peer's EOF.
+        if how == libc::SHUT_RD {
+            return;
         }
-        let done = this.closing.as_mut().expect("closing").as_mut().poll(cx);
-        done.map(Ok)
+        if let Some(conn) = &self.conn {
+            Cx.spawn(self.client.shutdown_write(conn));
+        }
     }
 }
 
 impl Drop for Conn {
-    /// The close: `conn` released (the provider shuts the socket down both ways), with the
-    /// executor's runtime entered for the release message.
+    /// The close: `conn` released, with the executor's runtime entered for the release
+    /// message, then our fd closed.
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
             let rt: Arc<dyn Runtime> = Arc::new(ExecutorRuntime);
             capnweb::runtime::enter(&rt, || drop(conn));
         }
-        // Our copy of the socket: a received fd, the one kind the filter lets us close.
-        let _ = unsharek_rt::trap::close(self.fd.as_raw_fd() as u32);
+        let _ = unsharek_rt::trap::close(self.fd as u32);
     }
 }
 
@@ -183,7 +169,7 @@ struct Incoming {
 }
 
 impl futures_core::Stream for Incoming {
-    type Item = (SocketAddr, Conn);
+    type Item = (SocketAddr, (RawFd, Conn));
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = &mut *self;
         let next = this.next.get_or_insert_with(|| Box::pin(this.client.accept(&this.listener)));

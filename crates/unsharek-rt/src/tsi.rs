@@ -102,9 +102,17 @@ pub trait ByteStream {
 pub type BoxStream = Pin<Box<dyn ByteStream>>;
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T>>>;
 
-/// A `listen` hook's inbound connections: each its peer and its stream; `None` when it stops.
+/// A `listen` hook's inbound connections: each its peer and its connection; `None` when it stops.
 pub trait Incoming {
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<(SocketAddrV4, BoxStream)>>;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<(SocketAddrV4, Conn)>>;
+}
+
+/// A connection a host fd backs ([`Conn::Fd`]): the guest's socket reads and writes the fd itself
+/// (the kernel's `lkl_net_done_fd`), with nothing copied here. What the sandbox can't do on the fd
+/// is this object's: the program's `shutdown`, and, when it drops, the close (the fd's too).
+pub trait FdConn {
+    /// The program's `shutdown(how)`. Called inside a host op: it must not block (spawn a task).
+    fn shutdown(&mut self, how: i32);
 }
 
 pub type BoxIncoming = Pin<Box<dyn Incoming>>;
@@ -115,6 +123,8 @@ pub enum Conn {
     Stream(BoxStream),
     /// The provider drives the guest's socket itself: called once it is connected.
     Drive(Box<dyn FnOnce(GuestSocket)>),
+    /// A host fd, the guest's socket's own: nothing copied ([`FdConn`]).
+    Fd(i32, Box<dyn FdConn>),
 }
 
 /// The `connect` hook: `(cx, pid, addr)` to a connection or the connect's errno.
@@ -139,6 +149,8 @@ struct Registry {
     /// Kernel objects the host waits on: ends (data, room, the guest's shutdown) and lent socks
     /// (the program's close). `net_ready(obj)` wakes them.
     objs: RefCell<Vec<Obj>>,
+    /// The host-fd-backed connections the guest's sockets hold ([`Conn::Fd`]), by fd.
+    fds: RefCell<Vec<(i32, Box<dyn FdConn>)>>,
 }
 
 struct Obj {
@@ -152,7 +164,11 @@ struct Obj {
 // SAFETY: one host thread (see the module comment).
 unsafe impl Sync for Registry {}
 
-static R: Registry = Registry { hooks: RefCell::new(Hooks { connect: None, listen: None, resolve: None }), objs: RefCell::new(Vec::new()) };
+static R: Registry = Registry {
+    hooks: RefCell::new(Hooks { connect: None, listen: None, resolve: None }),
+    objs: RefCell::new(Vec::new()),
+    fds: RefCell::new(Vec::new()),
+};
 
 /// Install the hooks (unsharek's `Guest::lockdown`, before the program starts).
 pub fn set_hooks(h: Hooks) {
@@ -244,6 +260,13 @@ async fn connect_task(sock: usize, pid: i32, addr: SocketAddrV4) {
         Some(Err(e)) => {
             done(sock, neg(e));
         }
+        Some(Ok(Conn::Fd(fd, c))) => {
+            // SAFETY: a sock the kernel lent us, given back once (with the fd, or not taken).
+            if kernel(|| unsafe { l::lkl_net_done_fd(sock as *mut c_void, fd as core::ffi::c_long) }) == 0 {
+                R.fds.borrow_mut().push((fd, c));
+            }
+            // Not taken (the program closed its socket): `c` drops, the connection with it.
+        }
         Some(Ok(conn)) => {
             let end = done(sock, 0);
             if end.is_null() {
@@ -254,6 +277,7 @@ async fn connect_task(sock: usize, pid: i32, addr: SocketAddrV4) {
             match conn {
                 Conn::Stream(s) => splice(g, s).await,
                 Conn::Drive(f) => f(g),
+                Conn::Fd(..) => unreachable!("an fd connection is given above"),
             }
         }
     }
@@ -322,8 +346,24 @@ async fn listen_task(sock: usize, pid: i32, addr: SocketAddrV4) {
             if closed(sock, cx) { Poll::Ready(None) } else { Poll::Pending }
         })
         .await;
-        let Some((peer, stream)) = next else { break };
+        let Some((peer, conn)) = next else { break };
         let a = sockaddr(peer);
+        let stream = match conn {
+            Conn::Fd(fd, c) => {
+                // SAFETY: the lent sock; the address is a sockaddr_in.
+                let r = kernel(|| unsafe {
+                    l::lkl_net_accept_fd(sock as *mut c_void, a.as_ptr() as *const l::lkl_sockaddr, 16, fd as core::ffi::c_long)
+                });
+                // Refused (the backlog is full, or it closed): `c` drops, the connection with it.
+                if r == 0 {
+                    R.fds.borrow_mut().push((fd, c));
+                }
+                continue;
+            }
+            Conn::Stream(s) => s,
+            // A driver of its own isn't a listen's: dropped.
+            Conn::Drive(_) => continue,
+        };
         // SAFETY: the lent sock; the address is a sockaddr_in.
         let end = kernel(|| unsafe { l::lkl_net_accept(sock as *mut c_void, a.as_ptr() as *const l::lkl_sockaddr, 16) });
         if end.is_null() {
@@ -389,6 +429,31 @@ async fn resolve_task(sock: usize, pid: i32, ns: SocketAddrV4, msg: Vec<u8>) {
         });
     }
     done(sock, 0);
+}
+
+/// The program's `shutdown` of a host-fd-backed connection: its [`FdConn`]'s.
+///
+/// # Safety
+/// A host op: called by the kernel.
+pub unsafe extern "C" fn net_fd_shutdown(fd: core::ffi::c_long, how: c_int) {
+    if let Some((_, c)) = R.fds.borrow_mut().iter_mut().find(|(f, _)| *f as core::ffi::c_long == fd) {
+        c.shutdown(how);
+    }
+}
+
+/// The program's last reference to a host-fd-backed connection is gone: its [`FdConn`] dropped
+/// (which closes the connection and the fd), on the executor (a drop may call the provider).
+///
+/// # Safety
+/// A host op: called by the kernel.
+pub unsafe extern "C" fn net_fd_close(fd: core::ffi::c_long) {
+    let c = {
+        let mut fds = R.fds.borrow_mut();
+        fds.iter().position(|(f, _)| *f as core::ffi::c_long == fd).map(|i| fds.remove(i))
+    };
+    if let Some((_, c)) = c {
+        executor::spawn(async move { drop(c) });
+    }
 }
 
 /// An end's readiness changed, or a lent sock was closed: whoever waits on it looks again.

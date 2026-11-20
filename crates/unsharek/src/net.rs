@@ -195,6 +195,20 @@ impl OnConnect {
         })))
     }
 
+    /// For a provider that hands over a host fd, the connection itself: the guest's socket is
+    /// backed by it, nothing copied ([`FdConn`]: its shutdown and close).
+    pub fn fd<F, Fut, C>(mut f: F) -> OnConnect
+    where
+        F: FnMut(Cx, i32, SocketAddr) -> Fut + 'static,
+        Fut: Future<Output = Result<(RawFd, C), NetError>> + 'static,
+        C: FdConn + 'static,
+    {
+        OnConnect(Some(Box::new(move |_, pid, a| {
+            let fut = f(Cx, pid, SocketAddr::V4(a));
+            Box::pin(async move { fut.await.map(|(fd, c)| Conn::Fd(fd, Box::new(c))).map_err(errno) })
+        })))
+    }
+
     /// For a provider that drives the program's socket itself: `Ok(drive)` connects it, and
     /// `drive` is called with the program's end ([`GuestSocket`]) once connected.
     pub fn drive<F, Fut, D>(mut f: F) -> OnConnect
@@ -228,6 +242,32 @@ impl OnConnect {
     }
 }
 
+/// A connection a host fd backs, from [`OnConnect::fd`] or [`OnListen::fd`]: the guest's socket
+/// reads and writes the fd itself (no copy). The program's `shutdown(how)` is this object's (it
+/// must not block: spawn on [`Cx`]); its close is this object's drop, which must close the fd.
+pub use unsharek_rt::tsi::FdConn;
+
+/// [`OnListen::fd`]'s connections: a published port's, by fd.
+struct FdIncoming<St>(St);
+
+impl<St, C> tsi::Incoming for FdIncoming<St>
+where
+    St: futures_core::Stream<Item = (SocketAddr, (RawFd, C))> + Unpin,
+    C: FdConn + 'static,
+{
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<(SocketAddrV4, tsi::Conn)>> {
+        loop {
+            match Pin::new(&mut self.0).poll_next(cx) {
+                Poll::Ready(Some((SocketAddr::V4(peer), (fd, c)))) => return Poll::Ready(Some((peer, tsi::Conn::Fd(fd, Box::new(c))))),
+                // (dropped: closes it)
+                Poll::Ready(Some((SocketAddr::V6(_), _))) => continue,
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
 /// The program's listens on anything but loopback: `async |cx, pid, addr| -> Result<incoming,
 /// NetError>`, `incoming` a `Stream` of `(peer, stream)`.
 ///
@@ -239,6 +279,27 @@ impl OnConnect {
 pub struct OnListen(pub(crate) Option<ListenFn>);
 
 impl OnListen {
+    /// As [`OnListen::new`], each inbound connection a host fd ([`OnConnect::fd`]).
+    pub fn fd<F, Fut, St, C>(mut f: F) -> OnListen
+    where
+        F: FnMut(Cx, i32, SocketAddr) -> Fut + 'static,
+        Fut: Future<Output = Result<St, NetError>> + 'static,
+        St: futures_core::Stream<Item = (SocketAddr, (RawFd, C))> + Unpin + 'static,
+        C: FdConn + 'static,
+    {
+        OnListen(Some(Box::new(move |_, pid, a| {
+            let fut = f(Cx, pid, SocketAddr::V4(a));
+            Box::pin(async move {
+                fut.await
+                    .map(|st| {
+                        let b: tsi::BoxIncoming = Box::pin(FdIncoming(st));
+                        b
+                    })
+                    .map_err(errno)
+            })
+        })))
+    }
+
     pub fn new<F, Fut, St, S>(mut f: F) -> OnListen
     where
         F: FnMut(Cx, i32, SocketAddr) -> Fut + 'static,
@@ -438,10 +499,10 @@ where
     St: futures_core::Stream<Item = (SocketAddr, S)> + Unpin,
     F: Fn(S) -> tsi::BoxStream + Unpin,
 {
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<(SocketAddrV4, tsi::BoxStream)>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<(SocketAddrV4, tsi::Conn)>> {
         loop {
             match Pin::new(&mut self.0).poll_next(cx) {
-                Poll::Ready(Some((SocketAddr::V4(peer), s))) => return Poll::Ready(Some((peer, (self.1)(s)))),
+                Poll::Ready(Some((SocketAddr::V4(peer), s))) => return Poll::Ready(Some((peer, tsi::Conn::Stream((self.1)(s))))),
                 Poll::Ready(Some((SocketAddr::V6(_), _))) => continue,
                 Poll::Ready(None) => return Poll::Ready(None),
                 Poll::Pending => return Poll::Pending,
