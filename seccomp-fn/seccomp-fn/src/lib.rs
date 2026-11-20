@@ -19,8 +19,9 @@
 //!
 //! The output: each condition without `d` (`if threads`, a guard's `fork && …`) is decided when
 //! the program is built, so the program has one shape per combination of their values; each
-//! shape is a constant array of instructions whose `k` fields are the params' values (patched
-//! in: computed from the arguments as the array is built). No runtime library: the types are
+//! shape is a function returning a fixed-length array of instructions whose `k` fields are the
+//! params' values (patched in: computed from the arguments as the array is built), made a `Vec`
+//! at the end. No runtime library: the types are
 //! libc's (`libc::sock_filter`), so the calling crate depends on `libc`.
 //!
 //! The subset (anything else is a compile error naming it): `if`/`else`, `return`, `match` on
@@ -115,7 +116,7 @@ fn expand(call: &syn::ExprCall) -> R<Ts> {
     let ast = syn::parse_file(&src).map_err(|e| syn::Error::new(Span::call_site(), format!("seccomp_fn::compile!: parsing {}: {e}", file.display())))?;
     let f = find(&ast.items, &p.path)?;
     // the params, bound to the call's arguments
-    let (mut binds, mut params) = (vec![], vec![]);
+    let (mut binds, mut params, mut typed) = (vec![], vec![], vec![]);
     if f.sig.inputs.len() != call.args.len() {
         return err(&call.args, &format!("a call with {} arguments of `{name}`, which takes {}", call.args.len(), f.sig.inputs.len()));
     }
@@ -125,6 +126,7 @@ fn expand(call: &syn::ExprCall) -> R<Ts> {
         let (n, ty) = (&i.ident, &t.ty);
         binds.push(quote!(let #n: #ty = #v;));
         params.push(n.clone());
+        typed.push(quote!(#n: #ty));
     }
     // the closure it returns: its block's only expression
     let closure = match f.block.stmts.as_slice() {
@@ -155,21 +157,33 @@ fn expand(call: &syn::ExprCall) -> R<Ts> {
         return err(&body, "more than 6 conditions without `d`");
     }
     let lets = std::mem::take(&mut cx.lets);
-    let mut arms = vec![];
+    // A function per shape returning its program as an array (its length fixed: what the proof
+    // runs is a constant-length program, its `k` fields the params'), the Vec made at the end.
+    let (mut arms, mut shapes) = (vec![], vec![]);
     for bits in 0..(1u32 << switches.len()) {
         let values: Vec<bool> = (0..switches.len()).map(|i| bits >> i & 1 == 1).collect();
         cx.values = Some(values.clone());
         cx.asm = Asm::default();
         cx.block(&body, &Pos::Tail)?;
+        let n = cx.asm.insns.len();
         let insns = cx.asm.insns.iter().rev().map(|i| {
             let (code, jt, jf, k) = (i.code, i.jt, i.jf, &i.k);
             quote!(::libc::sock_filter { code: #code, jt: #jt, jf: #jf, k: #k })
         });
-        arms.push(quote!((#(#values,)*) => ::std::vec![#(#insns),*],));
+        let shape = format_ident!("__shape{}", bits);
+        shapes.push(quote! {
+            #[allow(unused_variables, unused_parens, non_snake_case, clippy::all)]
+            fn #shape(#(#typed),*) -> [::libc::sock_filter; #n] {
+                #(#lets)*
+                [#(#insns),*]
+            }
+        });
+        arms.push(quote!((#(#values,)*) => #shape(#(#params),*).to_vec(),));
     }
     let names: Vec<Ident> = (0..switches.len()).map(|i| format_ident!("__switch{}", i)).collect();
     let conds: Vec<&Expr> = switches.iter().map(|(_, e)| e).collect();
     Ok(quote! {{
+        #(#shapes)*
         #[allow(unused_variables, unused_parens, non_snake_case, clippy::all)]
         let __prog: ::std::vec::Vec<::libc::sock_filter> = {
             #(#binds)*
