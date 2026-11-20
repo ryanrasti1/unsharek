@@ -85,9 +85,14 @@ pub fn prove_at<Args: Copy>(policy: impl Policy<Args>, filter: impl Filter<Args>
 }
 
 /// The Kani harness for `policy` and `filter` (functions of the same params), in a module of its
-/// own here: `<module>::policy_proof::policy_is_filter` (one per module). The params are
-/// `kani::any()`; `[values…]` instead lists param tuples to prove one harness each (with
-/// `kani::any()` among them as wanted), `unwind` bounds the program's length (default 100).
+/// own here: `<module>::policy_proof::policy_is_filter` (one per module), every param
+/// `kani::any()`. `unwind` bounds the program's length (default 100).
+///
+/// `(…)` instead gives each param in order: `_` (`kani::any()`), or a fieldless enum's or a
+/// bool's values, each named: `Mode = [coroutine: Coroutine, fork: Fork]`, `bool = [off: false,
+/// on: true]`. A harness is proved for each combination of the listed values
+/// (`policy_proof::coroutine::off::proof`), and each list is a `match` with no wildcard, so a
+/// value left out (a variant added later) doesn't compile: the list covers the type.
 #[macro_export]
 macro_rules! policy {
     ($policy:ident, $filter:ident) => {
@@ -103,19 +108,60 @@ macro_rules! policy {
             }
         }
     };
-    ($policy:ident, $filter:ident, unwind = $u:literal, [$($name:ident: $args:expr),* $(,)?]) => {
+    ($policy:ident, $filter:ident, unwind = $u:literal, ($($spec:tt)*)) => {
         #[cfg(kani)]
+        #[allow(non_snake_case, unused_imports)]
         mod policy_proof {
-            #[allow(unused_imports)]
             use super::*;
-            $(
-                #[kani::proof]
-                #[kani::unwind($u)]
-                fn $name() {
-                    $crate::prove_at(super::$policy, super::$filter, $args)
-                }
-            )*
+            use super::{$filter as __filter, $policy as __policy};
+            $crate::__policy_cases!($u [] $($spec)*);
         }
+    };
+}
+
+/// `policy!`'s params, one at a time: `$u [args so far] params left…`.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __policy_cases {
+    ($u:tt [$($done:expr,)*]) => {
+        #[kani::proof]
+        #[kani::unwind($u)]
+        fn proof() {
+            $crate::prove_at(__policy, __filter, ($($done,)*))
+        }
+    };
+    ($u:tt [$($done:expr,)*] _ $(, $($rest:tt)*)?) => {
+        $crate::__policy_cases!($u [$($done,)* kani::any(),] $($($rest)*)?);
+    };
+    ($u:tt [$($done:expr,)*] bool = [$($n:ident : $v:literal),* $(,)?] $(, $($rest:tt)*)?) => {
+        fn __covers(x: bool) {
+            match x {
+                $($v)|* => {}
+            }
+        }
+        $crate::__policy_values!($u [$($done,)*] [$($n: $v,)*] [$($($rest)*)?]);
+    };
+    ($u:tt [$($done:expr,)*] $t:ident = [$($n:ident : $v:ident),* $(,)?] $(, $($rest:tt)*)?) => {
+        fn __covers(x: $t) {
+            match x {
+                $($t::$v)|* => {}
+            }
+        }
+        $crate::__policy_values!($u [$($done,)*] [$($n: $t::$v,)*] [$($($rest)*)?]);
+    };
+}
+
+/// A module per listed value: `$u [args so far] [name: value, …] [params left]`.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __policy_values {
+    ($u:tt $done:tt [] $rest:tt) => {};
+    ($u:tt [$($done:expr,)*] [$n:ident : $v:expr, $($more:tt)*] [$($rest:tt)*]) => {
+        mod $n {
+            use super::*;
+            $crate::__policy_cases!($u [$($done,)* $v,] $($rest)*);
+        }
+        $crate::__policy_values!($u [$($done,)*] [$($more)*] [$($rest)*]);
     };
 }
 

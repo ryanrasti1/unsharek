@@ -85,12 +85,9 @@ pub mod compares {
     }
 
     // A harness per shape: one with the bool and the enum symbolic ran over 35 minutes.
-    seccomp_fn_validate::policy!(policy, filter, unwind = 100, [
-        loose_low: (kani::any(), kani::any(), false, Level::Low),
-        loose_high: (kani::any(), kani::any(), false, Level::High),
-        strict_low: (kani::any(), kani::any(), true, Level::Low),
-        strict_high: (kani::any(), kani::any(), true, Level::High),
-    ]);
+    seccomp_fn_validate::policy!(policy, filter, unwind = 100, (
+        _, _, bool = [loose: false, strict: true], Level = [low: Low, high: High]
+    ));
 }
 
 /// `match d.nr`, with `|` and `_`, nested in and around `if`.
@@ -128,10 +125,7 @@ pub mod table {
     }
 
     // A harness per value of the bool (with it symbolic: over 400 s).
-    seccomp_fn_validate::policy!(policy, filter, unwind = 100, [
-        exit: (kani::any(), true),
-        no_exit: (kani::any(), false),
-    ]);
+    seccomp_fn_validate::policy!(policy, filter, unwind = 100, (_, bool = [no_exit: false, exit: true]));
 }
 
 /// Match guards: arms in order, a guard that fails going on to the next arm, a pattern repeated,
@@ -156,10 +150,7 @@ pub mod guarded {
     }
 
     // A harness per value of the bool (with it symbolic: over 400 s).
-    seccomp_fn_validate::policy!(policy, filter, unwind = 100, [
-        on: (kani::any(), true),
-        off: (kani::any(), false),
-    ]);
+    seccomp_fn_validate::policy!(policy, filter, unwind = 100, (_, bool = [off: false, on: true]));
 }
 
 /// Each field's halves: `==`, `<` and `<=` on every 64-bit field against `v` (whose halves the

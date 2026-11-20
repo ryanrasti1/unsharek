@@ -32,6 +32,7 @@ The claim then rests on:
 - `run_bpf` (`src/bpf.rs`) being classic BPF as the kernel's seccomp runs it: checked against Linux by installing programs in forked children and comparing verdicts (`tests/kernel.rs`), with argument values whose 32-bit halves differ; and its refusals being the kernel's (`tests/sampled.rs`)
 - the harness (`prove`, `policy!` in `src/lib.rs`): every input `kani::any()`, the policy called as written; the unwind bound an upper bound on the program's length (Kani fails an unwinding assertion rather than pass a short bound)
 - each param type's `kani::Arbitrary` being all its values (derived, for an enum)
+- a param given by its values (`Mode = [coroutine: Coroutine, …]`, `bool = [off: false, on: true]`) having them all: not trusted to the list's author, but enforced by rustc's exhaustiveness check, as `policy!` makes each list a `match` with no wildcard, so a missing value (a variant added later) doesn't compile
 - Toolchain correctness: `rustc`; Kani and CBMC; `libc` (opcodes, `seccomp_data`'s layout)
 
 ## The rule
@@ -43,7 +44,7 @@ Nothing here relies on a trait, type or item the compiler could emit or implemen
 - **Installing it**: passing the program to `seccomp(2)`, and when, is the caller's.
 
 # Design
-1. `policy!(policy, filter)`: a `macro_rules` (no proc macro, no syn) emitting `mod policy_proof { #[kani::proof] fn policy_is_filter() { prove(super::policy, super::filter) } }`. With `unwind = N` it bounds the program's length (default 100); with `[name: params, …]` one harness per listed params (`kani::any()` where wanted).
+1. `policy!(policy, filter)`: a `macro_rules` (no proc macro, no syn) emitting `mod policy_proof { #[kani::proof] fn policy_is_filter() { prove(super::policy, super::filter) } }`. With `unwind = N` it bounds the program's length (default 100); with `(…)` each param in order, `_` (`kani::any()`) or its named values (`Mode = [coroutine: Coroutine, fork: Fork]`, `bool = [off: false, on: true]`): a harness per combination of values (`policy_proof::coroutine::off::proof`), each list also a wildcard-free `match` over its type.
 2. `prove`: `kani::any()` params and `seccomp_data`, the assertion above.
 3. `run_bpf`: one forward pass over the program (seccomp's jumps only go forward), after the kernel's checks (`bpf_check_classic`, `seccomp_check_filter`).
 
