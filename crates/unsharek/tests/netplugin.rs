@@ -150,6 +150,39 @@ fn publish_reaches_the_guests_listener() {
     }
 }
 
+/// Fork mode, from forked processes (a child, a grandchild): connects through the provider, a
+/// denial, and a published port's connection taken by a server that isn't init. The provider's
+/// fds are init's process's (its control socket): a forked process's host ops were refused
+/// (ENETUNREACH: `bash -c 'curl …; echo'`, every interactive shell); they are forwarded to init's
+/// executor, which serves the connection's bytes.
+#[test]
+fn forked_processes_have_the_network() {
+    let port = echo_server().to_string();
+    for depth in ["1", "2"] {
+        let (code, out) = run("fork", &["--net", "all"], &s(&["fork", depth, "echo", &host_ip(), &port]));
+        assert!(code == Some(0) && out.contains("NET_ECHO_OK"), "depth {depth}: {code:?}\n{out}");
+    }
+    let (code, out) = run("fork", &["--net", "public"], &s(&["fork", "1", "denied", "10.1.2.3", &port]));
+    assert!(code == Some(0) && out.contains("NET_DENIED_OK"), "denied: {code:?}\n{out}");
+    let free = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let child = unsharek("fork", &s(&["--publish", &format!("127.0.0.1:{free}:80")]), &s(&["fork", "1", "serve", "80"]));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut c = loop {
+        match TcpStream::connect(("127.0.0.1", free)) {
+            Ok(c) => break c,
+            Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            Err(e) => panic!("connect to the published port: {e}"),
+        }
+    };
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    c.write_all(b"ping").unwrap();
+    let mut got = [0u8; 4];
+    let read = c.read_exact(&mut got);
+    let (code, out) = finish(child);
+    assert!(read.is_ok() && &got == b"pong", "serve: read {read:?} {got:?}\n{out}");
+    assert!(code == Some(0) && out.contains("NET_SERVE_OK"), "serve: {code:?}\n{out}");
+}
+
 /// 1000 connections, each closed: the sandbox's host fds don't grow with them (each received fd
 /// is closed when the guest closes its socket).
 #[test]

@@ -119,6 +119,46 @@ fn interactive_bash_on_a_guest_pty() {
     assert_eq!(status(pid, t), Some(7), "{}", String::from_utf8_lossy(&out));
 }
 
+/// The network from the interactive shell: on a terminal the program is a child of the pty's init
+/// (src/pty_init.c), and a forked process had no network (the provider's fds are init's process's):
+/// a typed command's connect was ENETUNREACH. Forwarded to init's executor now, it echoes through
+/// the provider (`--net all`) to a host server.
+#[test]
+fn interactive_shell_has_the_network() {
+    use std::io::{Read, Write};
+    // The host's address on its default route: the guest's 127.0.0.1 is its own loopback.
+    let u = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    u.connect("192.0.2.1:9").unwrap();
+    let ip = u.local_addr().unwrap().ip().to_string();
+    let l = std::net::TcpListener::bind((ip.as_str(), 0)).unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for c in l.incoming() {
+            let Ok(mut c) = c else { continue };
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok(n @ 1..) = c.read(&mut buf) {
+                    if c.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+                let _ = c.shutdown(std::net::Shutdown::Write);
+            });
+        }
+    });
+    let bin_dir = unsharek_fixtures::bin_dir().display().to_string();
+    let (m, pid) = spawn(&["--mode", "fork", "--net", "all", "--ro", &bin_dir, "--", &bash(), "--norc", "-i"]);
+    let mut out = vec![];
+    let t = Duration::from_secs(5);
+    assert!(wait_for(&m, &mut out, "# ", t), "no prompt: {}", String::from_utf8_lossy(&out));
+    let net = unsharek_fixtures::bin("net").display().to_string();
+    send(&m, format!("{net} echo {ip} {port}\r").as_bytes());
+    assert!(wait_for(&m, &mut out, "NET_ECHO_OK", t), "{}", String::from_utf8_lossy(&out));
+    send(&m, b"exit 0\r");
+    read_for(&m, &mut out, Duration::from_millis(300));
+    assert_eq!(status(pid, t), Some(0), "{}", String::from_utf8_lossy(&out));
+}
+
 /// The terminal's settings after the CLI are those before it (raw mode undone), and a run that
 /// isn't on a terminal is as ever: no pty (the suite's cases, whose stdin is a pipe or /dev/null).
 #[test]

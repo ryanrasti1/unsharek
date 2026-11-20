@@ -383,9 +383,11 @@ fn provider() -> (OnConnect, OnResolve, OnListen) {
 /// guest-tests' net::unreachable and net::tcp_loopback.)
 fn child(kind: &str) -> ! {
     let argv: Vec<OsString> = std::env::var(ARGV).unwrap().split('\x1f').map(OsString::from).collect();
-    let mut g = unsharek::Guest::boot(unsharek::GuestConfig::default()).unwrap();
+    let fork = kind == "provider_fork";
+    let mode = if fork { unsharek::Mode::Fork } else { unsharek::Mode::Coroutine };
+    let mut g = unsharek::Guest::boot(unsharek::GuestConfig { mode, ..Default::default() }).unwrap();
     match kind {
-        "provider" | "provider_syscall" | "provider_user" => {
+        "provider" | "provider_syscall" | "provider_user" | "provider_fork" => {
             STRAY_SYSCALL.store(kind == "provider_syscall", std::sync::atomic::Ordering::Relaxed);
             let (connect, resolve, listen) = provider();
             // The session up before the program: no first hook has to start it.
@@ -402,7 +404,7 @@ fn child(kind: &str) -> ! {
     // SAFETY: fd 3 is this process's, from the parent, and nothing else owns it.
     let fd3 = unsafe { OwnedFd::from_raw_fd(3) };
     match kind {
-        "provider" | "provider_syscall" | "provider_user" | "named" => drop(g.hold_fd_as("net", fd3).unwrap()),
+        "provider" | "provider_syscall" | "provider_user" | "provider_fork" | "named" => drop(g.hold_fd_as("net", fd3).unwrap()),
         "passfd" => g.pass_fd(fd3, 1000).unwrap(),
         _ => drop(fd3),
     }
@@ -415,7 +417,7 @@ fn child(kind: &str) -> ! {
         }
     })
     .unwrap();
-    let env: Vec<OsString> = vec!["UNSHAREK_TEST_MODE=coroutine".into()];
+    let env: Vec<OsString> = vec![if fork { "UNSHAREK_TEST_MODE=fork" } else { "UNSHAREK_TEST_MODE=coroutine" }.into()];
     let locked = g
         .lockdown(|s| {
             s.grant(0).grant(1).grant(2);
@@ -678,9 +680,30 @@ fn main() {
             "NET_NAMED_OK",
         );
     }
-    // A socket used after fork is fork mode's (the hooks run in init's process, the child's host
-    // ops would forward to it): not yet.
-    trials.push(Trial::test("net_fork::fork", || Ok(())).with_ignored_flag(true));
+    // Fork mode, from forked processes: the hooks are init's process's, and a forked process's
+    // host ops were refused (ENETUNREACH, no answers, its listen the guest's own: bash running
+    // curl, every interactive shell). They are forwarded to init's executor now; a child and a
+    // grandchild connect, resolve, and take a host connection. And init itself still does.
+    let forked = |depth: &str, c: &str, a: &[&str]| -> Vec<String> {
+        let mut v = vec![fx::bin("net").display().to_string(), "fork".into(), depth.into(), c.to_string()];
+        v.extend(a.iter().map(|s| s.to_string()));
+        v
+    };
+    let mut fork_case = |name: &'static str, argv: Vec<String>, marker: &'static str| {
+        trials.push(Trial::test(format!("{name}::fork"), move || check("provider_fork", argv, marker)));
+    };
+    fork_case("net_echo", net("echo", &["10.0.0.1", &echo]), "NET_ECHO_OK");
+    fork_case("net_echo_child", forked("1", "echo", &["10.0.0.1", &echo]), "NET_ECHO_OK");
+    fork_case("net_echo_grandchild", forked("2", "echo", &["10.0.0.1", &echo]), "NET_ECHO_OK");
+    fork_case("net_many_child", forked("1", "many", &["10.0.0.1", &echo]), "NET_MANY_OK");
+    fork_case("net_nonblock_child", forked("1", "nonblock", &["10.0.0.1", &echo]), "NET_NONBLOCK_OK");
+    fork_case("net_refused_child", forked("1", "refused", &["10.0.0.66", &echo]), "NET_REFUSED_OK");
+    fork_case(
+        "net_resolve_child",
+        forked("1", "resolve", &["echo.test", "10.0.0.1", "nx.test", "denied.test"]),
+        "NET_RESOLVE_OK",
+    );
+    fork_case("net_listen_child", forked("1", "listen", &["7000", "10.9.9.9:4242"]), "NET_LISTEN_OK");
     trials.push(Trial::test("passfd_epoll::coroutine", || {
         let argv = vec![fx::bin("fd_epoll").display().to_string()];
         let (code, out, err) = run("passfd", &argv, |mut sock| {

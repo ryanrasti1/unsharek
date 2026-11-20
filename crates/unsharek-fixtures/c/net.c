@@ -18,6 +18,7 @@
 //   churn IP PORT N       N connections one after another, each a ping echoed and closed, then
 //                         a pause on stdin's EOF... (the host counts the sandbox's fds)
 //   serve PORT            a listen on 0.0.0.0:PORT: one connection, "ping" read, "pong" written
+//   fork N CASE ARGS...   CASE in a process N forks down (fork mode's forked processes)
 //                         (the network plugin's --publish: crates/unsharek/tests/netplugin.rs)
 #include "unsharek_test.h"
 #include <arpa/inet.h>
@@ -28,7 +29,9 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/epoll.h>
+#include <stdlib.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static struct sockaddr_in addr(const char *ip, const char *port)
@@ -295,6 +298,24 @@ int main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
 	CHECK(argc >= 2, "usage: net CASE ARGS...");
+	// `fork N CASE ARGS...`: CASE in a process N forks down (a child, a grandchild), each parent
+	// waiting and exiting as its child did. Fork mode's network was init's process's alone: a
+	// forked process's connect was ENETUNREACH, its lookups unanswered, its listen the guest's
+	// own (bash running curl, and every interactive shell).
+	if (!strcmp(argv[1], "fork")) {
+		CHECK(argc >= 4, "usage: net fork N CASE ARGS...");
+		int n = atoi(argv[2]);
+		for (int i = 0; i < n; i++) {
+			pid_t p = fork();
+			CHECK(p >= 0, "fork: %s", strerror(errno));
+			if (p > 0) {
+				int st;
+				CHECK(waitpid(p, &st, 0) == p, "waitpid: %s", strerror(errno));
+				return WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+			}
+		}
+		argv += 2;
+	}
 	const char *c = argv[1];
 	char **a = argv + 2;
 	if (!strcmp(c, "echo"))

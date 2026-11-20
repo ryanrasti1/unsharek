@@ -63,6 +63,8 @@ pub fn enable_fork(max_procs: u32, init_pidfd: i32) -> Result<(), Error> {
     par::root_on_shared_stack().map_err(err("init's kernel stack"))?;
     // The hooks' executor is init's process's: its coroutine runs only on init's kernel thread.
     crate::executor::set_home(par::KERNEL);
+    // Made now, bound there: a forked process's network forwards to it (`tsi`).
+    crate::executor::start_for_fork();
     // SAFETY: written once before the kernel's first clone reads it.
     unsafe { (*host::ops()).fork = Some(fork_op) };
     ENABLED.store(true, core::sync::atomic::Ordering::Relaxed);
