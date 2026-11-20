@@ -117,11 +117,15 @@ pub struct Config {
     pub fds: Vec<RawFd>,
     /// The most pollfds one `ppoll` may pass: at least what the guest waits on at once.
     pub ppoll_max: u64,
+    /// Plugin: capnweb (experimental). A control socket, kept like a grant, on which the process
+    /// may `recvmsg` (`MSG_CMSG_CLOEXEC`) the fds the provider's process sends: lockdown checks it
+    /// is a unix `SOCK_SEQPACKET` socket. None: no `recvmsg`.
+    pub recv_fds: Option<RawFd>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { mode: Mode::default(), fds: vec![], ppoll_max: PPOLL_FDS }
+        Config { mode: Mode::default(), fds: vec![], ppoll_max: PPOLL_FDS, recv_fds: None }
     }
 }
 

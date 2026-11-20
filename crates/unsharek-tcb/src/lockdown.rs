@@ -46,8 +46,13 @@ pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Resul
     // and checks nothing.
     let mut all = config;
     all.fds.extend(guest_fds.iter().copied());
+    all.fds.extend(all.recv_fds);
+    // Plugin: capnweb. Received fds may be closed: those at or above `floor`, one above every
+    // kept fd (step 4b leaves no free fd below it).
+    let floor = all.fds.iter().copied().max().unwrap_or(2).max(2) as u64 + 1;
+    let ctl = all.recv_fds.map(|fd| (fd as u64, floor));
     let pid = rustix::process::getpid().as_raw_nonzero().get() as u32;
-    let prog = filter::filter(all.mode, pid as u64, all.ppoll_max, guest.gate_ip());
+    let prog = filter::filter(all.mode, pid as u64, all.ppoll_max, guest.gate_ip(), ctl);
 
     let t = Instant::now();
     // The checks read /proc/self: it must be the kernel's procfs, not whatever is mounted there
@@ -73,6 +78,11 @@ pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Resul
             return Err(Error::NotOpen(fd));
         }
     }
+    // Plugin: capnweb. The control socket is a unix seqpacket socket: `recvmsg` on it brings in
+    // only what its peer (the provider's process) sends, in whole messages.
+    if let Some(fd) = all.recv_fds {
+        control_socket(fd)?;
+    }
     // 3. Every mapping.
     check_maps(mode)?;
     // 4. Every other fd closed, not refused (a CLI inherits stray fds): between and above the
@@ -81,6 +91,12 @@ pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Resul
     keep.sort_unstable();
     keep.dedup();
     close_except(&keep)?;
+    // 4b. Plugin: capnweb. Every free fd below the floor taken (/dev/null, read-only): the
+    // kernel hands out the lowest free number, so what `recvmsg` brings lands at or above it,
+    // and the `close` row (fd >= floor) reaches only those.
+    if all.recv_fds.is_some() {
+        fill_below(&keep, ctl.map_or(0, |c| c.1) as RawFd)?;
+    }
     CHECK_NS.store(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     // 5. No core dump, not dumpable.
     rustix::process::setrlimit(Resource::Core, Rlimit { current: Some(0), maximum: Some(0) }).map_err(rx("RLIMIT_CORE"))?;
@@ -91,6 +107,37 @@ pub(crate) fn lockdown<C: Confined + ?Sized>(config: Config, guest: &C) -> Resul
     rustix::thread::set_no_new_privs(true).map_err(rx("PR_SET_NO_NEW_PRIVS"))?;
     // 8. The filter, with TSYNC.
     install(&prog)
+}
+
+/// Open /dev/null at every fd below `floor` that isn't in `keep` (sorted): after
+/// [`close_except`] those are free, and each open takes the lowest.
+fn fill_below(keep: &[RawFd], floor: RawFd) -> Result<()> {
+    for fd in 0..floor {
+        if keep.binary_search(&fd).is_ok() {
+            continue;
+        }
+        let f = rustix::fs::open("/dev/null", rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC, rustix::fs::Mode::empty())
+            .map_err(rx("/dev/null"))?;
+        let got = std::os::fd::IntoRawFd::into_raw_fd(f);
+        if got != fd {
+            return Err(Error::Os { what: "/dev/null", source: io::Error::other(format!("took fd {got}, wanted {fd}")) });
+        }
+    }
+    Ok(())
+}
+
+/// The control socket ([`Config::recv_fds`]): open, `AF_UNIX`, `SOCK_SEQPACKET`.
+fn control_socket(fd: RawFd) -> Result<()> {
+    if fd < 0 || fd_kind(fd).is_err() {
+        return Err(Error::NotOpen(fd));
+    }
+    // SAFETY: `fd` is open (above), borrowed for the two getsockopts only.
+    let s = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    let (domain, kind) = (rustix::net::sockopt::socket_domain(s), rustix::net::sockopt::socket_type(s));
+    match (domain, kind) {
+        (Ok(rustix::net::AddressFamily::UNIX), Ok(rustix::net::SocketType::SEQPACKET)) => Ok(()),
+        _ => Err(Error::FdKind { fd, kind: fd_kind(fd).unwrap_or_default() }),
+    }
 }
 
 /// `/proc/self` is on procfs (`PROC_SUPER_MAGIC`).

@@ -7,6 +7,8 @@ use clap::{Parser, ValueEnum};
 
 #[path = "cli/fs.rs"]
 mod fs;
+#[path = "cli/net.rs"]
+mod net;
 
 /// Run a program in a sandbox of its own kernel; exits with the program's status.
 #[derive(Parser)]
@@ -41,9 +43,24 @@ struct Cli {
     /// there, `/etc` included, is the program's to read.
     #[arg(long)]
     system: bool,
+    /// The network beyond loopback (plugin, experimental): `none`, `public` (public addresses
+    /// only) or `all`, dialled by a provider process under that policy.
+    #[arg(long, value_enum, default_value_t = Net::None)]
+    net: Net,
+    /// Publish a port: connections to HOST_PORT on the host (127.0.0.1 unless IP is given) reach
+    /// the program's listener on GUEST_PORT, as docker's -p. Repeatable.
+    #[arg(long, value_name = "[IP:]HOST_PORT:GUEST_PORT")]
+    publish: Vec<unsharek::provider::Publish>,
     /// The program and its arguments: a bare name is looked up on this process's PATH.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     argv: Vec<OsString>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Net {
+    None,
+    Public,
+    All,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -54,7 +71,7 @@ enum Mode {
 }
 
 fn main() -> ExitCode {
-    let Cli { mode, mut ro, rw, images, max_procs, setenv, mut keep_env, system, mut argv } = Cli::parse();
+    let Cli { mode, mut ro, rw, images, max_procs, setenv, mut keep_env, system, net, publish, mut argv } = Cli::parse();
     if system {
         ro.extend(fs::SYSTEM.iter().filter(|d| std::path::Path::new(d).is_dir()).map(|d| fs::Arg { host: d.into(), at: None, live: true }));
         keep_env.extend(["PATH", "TERM", "LANG"].map(OsString::from));
@@ -74,6 +91,19 @@ fn main() -> ExitCode {
         Ok(d) => d,
         Err(e) => {
             eprintln!("unsharek: a host directory's server: {e}");
+            return ExitCode::from(125);
+        }
+    };
+    // Plugin: the network, through a provider (cli/net.rs).
+    let policy = match net {
+        Net::None => None,
+        Net::Public => Some(unsharek::provider::Policy::Public),
+        Net::All => Some(unsharek::provider::Policy::All),
+    };
+    let net = match net::spawn(&net::Args { policy, publish }) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("unsharek: the network provider: {e}");
             return ExitCode::from(125);
         }
     };
@@ -99,9 +129,21 @@ fn main() -> ExitCode {
         argv,
         env,
         image_cache: None,
-        host_dirs,
+        host_dirs: host_dirs.clone(),
     };
-    let Err(e) = unsharek::run(config);
+    let prepare = |g: &mut unsharek::Guest| {
+        if let Some(n) = &net {
+            n.install(g)?;
+        }
+        Ok(())
+    };
+    let grants = |s: &mut unsharek::tcb::Config| {
+        fs::grant(&host_dirs, s);
+        if let Some(n) = &net {
+            n.grant(s);
+        }
+    };
+    let Err(e) = unsharek::run_with(config, prepare, grants);
     eprintln!("unsharek: {e}");
     // As env(1) and container runtimes: the sandbox itself failed, not the program.
     ExitCode::from(125)

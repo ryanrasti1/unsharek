@@ -90,7 +90,8 @@ pub fn prove_at<Args: Copy>(policy: impl Policy<Args>, filter: impl Filter<Args>
 ///
 /// `(…)` instead gives each param in order: `_` (`kani::any()`), or a fieldless enum's or a
 /// bool's values, each named: `Mode = [coroutine: Coroutine, fork: Fork]`, `bool = [off: false,
-/// on: true]`. A harness is proved for each combination of the listed values
+/// on: true]`, or an enum's variants with a payload left symbolic, `Option<u64> = [none: None,
+/// some: Some(_)]`. A harness is proved for each combination of the listed values
 /// (`policy_proof::coroutine::off::proof`), and each list is a `match` with no wildcard, so a
 /// value left out (a variant added later) doesn't compile: the list covers the type.
 #[macro_export]
@@ -148,6 +149,25 @@ macro_rules! __policy_cases {
             }
         }
         $crate::__policy_values!($u [$($done,)*] [$($n: $t::$v,)*] [$($($rest)*)?]);
+    };
+    // An enum's variants, a payload symbolic: `Option<u64> = [none: None, some: Some(_)]`, the
+    // harness's value `Some(kani::any())`, the match's pattern `Some(_)`.
+    ($u:tt [$($done:expr,)*] $t:ty = [$($n:ident : $v:ident $(($p:tt))?),* $(,)?] $(, $($rest:tt)*)?) => {
+        fn __covers(x: $t) {
+            match x {
+                $($v $(($p))?)|* => {}
+            }
+        }
+        $crate::__policy_values!($u [$($done,)*] [$($n: $v $(($crate::__any!($p)))?,)*] [$($($rest)*)?]);
+    };
+}
+
+/// `_` in a `policy!` payload: `kani::any()`.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __any {
+    (_) => {
+        kani::any()
     };
 }
 

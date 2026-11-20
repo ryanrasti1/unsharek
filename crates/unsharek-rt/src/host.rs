@@ -325,6 +325,8 @@ pub static HOST_OPS: HostOps = HostOps(UnsafeCell::new(lkl_host_operations {
     net_listen: Some(crate::tsi::net_listen),
     net_sendto: Some(crate::tsi::net_sendto),
     net_ready: Some(crate::tsi::net_ready),
+    net_fd_shutdown: Some(crate::tsi::net_fd_shutdown),
+    net_fd_close: Some(crate::tsi::net_fd_close),
     hostfd_poll: Some(crate::tsi::hostfd_poll),
 }));
 

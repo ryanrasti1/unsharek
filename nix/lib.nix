@@ -26,6 +26,8 @@ let
       ../crates/unsharek-tcb/README.md
       # seccomp-fn, the filter's compiler and proof (its own repository to be)
       (fs.difference ../seccomp-fn (fs.maybeMissing ../seccomp-fn/target))
+      # capnweb-rs, vendored with the network plugin's transport (vendor/capnweb-rs/PATCHES.md)
+      ../vendor
       # A workspace member: cargo loads every member's manifest, built or not (the
       # package failed to build without it).
       (fs.difference ../examples (fs.fileFilter (f: f.hasExt "md") ../examples))
