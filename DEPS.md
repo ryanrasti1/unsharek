@@ -274,3 +274,16 @@ already (unsharek, unsharek-rt); the tcb, its own repository, names it itself, n
 | Crate | For | Where | Cost noted |
 |---|---|---|---|
 | rustix 1 (`std`, `thread`, `process`, `fs`) | lockdown's calls but two, without `unsafe` | unsharek-tcb (the TCB) | +2,048 B `.text`, +2.5 KB unstripped binary (release, x86_64-unknown-linux-gnu); stripped size unchanged (page rounding); no new crate in the build |
+
+## seccomp-fn / seccomp-fn-verify (2026-11-19): the compiler untrusted, the proof the TCB
+The filter is a plain function (`crates/unsharek-tcb/src/filter.rs` `policy`), its program `seccomp_fn::compile!`'s
+output, and the proof `seccomp_fn_verify::policy!`'s harnesses. The section above's macro crate is
+gone: seccomp-fn is now the proc-macro compiler (syn, quote, proc-macro2: build time only), and
+emits constant instruction arrays with libc's types, so nothing of it runs in the binary.
+seccomp-fn-verify (`run_bpf`, `policy!`, the sampled check) is what unsharek-tcb depends on to
+prove, and to test; `install` lives in unsharek-tcb's lockdown.
+
+| Crate | For | Where | Cost noted |
+|---|---|---|---|
+| seccomp-fn (path): syn 3 (`full`), quote, proc-macro2 | `compile!` | build time only | as the macro crate before |
+| seccomp-fn-verify (path) | the proof and the sampled test | unsharek-tcb (`policy!` expands only under `cfg(kani)`; `check_sampled` in its tests) | none in the binary |

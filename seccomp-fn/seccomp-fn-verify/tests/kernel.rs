@@ -11,39 +11,27 @@
 //! as numbers on purpose, from the kernel's documentation: independent of the library's
 //! constants, so that a layout both the library and the macro got wrong shows here.
 
-use seccomp_fn::examples::*;
-use seccomp_fn::*;
+// The example policies' programs (seccomp-fn's `compile!`: a dev-dependency, only for inputs
+// here; what is checked is `run_bpf`, against the kernel).
+#[path = "../../examples/policies.rs"]
+mod policies;
+use policies::*;
+use seccomp_fn_verify::run_bpf;
 
-// Over 255 instructions, so its far jumps go through JA. Here, not in the examples: its proof
-// takes more than ten minutes (the proof's cost grows with the program's length, about
-// quadratically), so it is checked by its sampled test and against the kernel only.
-/// Long enough that its jumps go through JA: a row per number, all to one shared verdict.
-#[seccomp]
-fn long(d: &SeccompData, k: u64) -> u32 {
-    if d.nr == 2000 || d.args[0] == k || d.args[1] == k || d.args[2] == k || d.args[3] == k
-        || d.args[4] == k || d.args[5] == k || d.instruction_pointer == k
-        || d.args[0] == 1 || d.args[1] == 1 || d.args[2] == 1 || d.args[3] == 1 || d.args[4] == 1 || d.args[5] == 1
-        || d.args[0] == 2 || d.args[1] == 2 || d.args[2] == 2 || d.args[3] == 2 || d.args[4] == 2 || d.args[5] == 2
-        || d.args[0] == 3 || d.args[1] == 3 || d.args[2] == 3 || d.args[3] == 3 || d.args[4] == 3 || d.args[5] == 3
-        || d.args[0] == 4 || d.args[1] == 4 || d.args[2] == 4 || d.args[3] == 4 || d.args[4] == 4 || d.args[5] == 4
-        || d.args[0] == 5 || d.args[1] == 5 || d.args[2] == 5 || d.args[3] == 5 || d.args[4] == 5 || d.args[5] == 5
-        || d.args[0] == 6 || d.args[1] == 6 || d.args[2] == 6 || d.args[3] == 6 || d.args[4] == 6 || d.args[5] == 6
-        || d.args[0] == 7 || d.args[1] == 7 || d.args[2] == 7 || d.args[3] == 7 || d.args[4] == 7 || d.args[5] == 7
-        || d.args[0] == 8 || d.args[1] == 8 || d.args[2] == 8 || d.args[3] == 8 || d.args[4] == 8 || d.args[5] == 8
-        || d.args[0] == 9 || d.args[1] == 9 || d.args[2] == 9 || d.args[3] == 9 || d.args[4] == 9 || d.args[5] == 9
-        || d.args[0] < 10 || d.args[1] > 10 || d.args[2] <= 10 || d.args[3] >= 10 || d.args[4] != 10
-    {
-        return SECCOMP_RET_ERRNO | (100 + 10);
-    }
-    SECCOMP_RET_ALLOW
+type SockFilter = sock_filter;
+type SeccompData = seccomp_data;
+
+/// `d` as a call: its fields (libc's `seccomp_data` has no `Debug`).
+fn show(d: &SeccompData) -> String {
+    format!("nr {} arch {:#x} ip {:#x} args {:x?}", d.nr, d.arch, d.instruction_pointer, d.args)
 }
 
-
-#[test]
-fn long_needs_ja() {
-    let prog = long_bpf(11);
-    assert!(prog.len() > 256, "{} instructions", prog.len());
-    assert!(prog.iter().any(|i| i.code == 0x05), "no JA");
+/// `prog` installed on the calling thread (`SECCOMP_SET_MODE_FILTER`).
+fn install(prog: &[SockFilter]) -> Result<(), ()> {
+    let fprog = libc::sock_fprog { len: prog.len() as u16, filter: prog.as_ptr() as *mut SockFilter };
+    // SAFETY: seccomp reads `fprog` and the instructions, both live for the call.
+    let r = unsafe { libc::syscall(libc::SYS_seccomp, libc::SECCOMP_SET_MODE_FILTER, 0, &fprog as *const libc::sock_fprog) };
+    if r == 0 { Ok(()) } else { Err(()) }
 }
 
 std::arch::global_asm!(
@@ -124,15 +112,14 @@ fn kernel(prog: &[SockFilter], d: &SeccompData) -> Outcome {
         0 => unsafe {
             libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
             libc::signal(libc::SIGSYS, trapped as *const () as libc::sighandler_t);
-            let fprog = libc::sock_fprog { len: prog.len() as u16, filter: prog.as_ptr() as *mut SockFilter };
-            if libc::syscall(libc::SYS_seccomp, libc::SECCOMP_SET_MODE_FILTER, 0, &fprog) != 0 {
+            if install(prog).is_err() {
                 libc::_exit(201);
             }
             let a = d.args;
             let r = if d.arch == AUDIT_ARCH_I386 {
-                seccomp_fn_probe80(d.nr as u64)
+                seccomp_fn_probe80(d.nr as u32 as u64)
             } else {
-                seccomp_fn_probe(d.nr as u64, a[0], a[1], a[2], a[3], a[4], a[5])
+                seccomp_fn_probe(d.nr as u32 as u64, a[0], a[1], a[2], a[3], a[4], a[5])
             };
             // an allowed exit doesn't return; anything else is an errno (or a success)
             libc::_exit(if r < 0 { (-r).min(199) as i32 } else { 0 })
@@ -172,8 +159,8 @@ fn behind_prefix(prog: &[SockFilter], ip: u64) -> Vec<SockFilter> {
 fn same(prog: &[SockFilter], calls: &[(u32, [u64; 6])]) {
     let p = behind_prefix(prog, probe_ip());
     for &(nr, args) in calls {
-        let d = SeccompData { nr, arch: AUDIT_ARCH_X86_64, instruction_pointer: probe_ip(), args };
-        assert_eq!(kernel(&p, &d), expected(run_bpf(&p, &d)), "{d:x?}");
+        let d = SeccompData { nr: nr as i32, arch: AUDIT_ARCH_X86_64, instruction_pointer: probe_ip(), args };
+        assert_eq!(kernel(&p, &d), expected(run_bpf(&p, &d)), "{}", show(&d));
     }
 }
 
@@ -196,7 +183,7 @@ fn compares_as_linux() {
     .collect();
     for level in [Level::Low, Level::High] {
         for strict in [false, true] {
-            same(&compares_bpf(5, 9, strict, level), &calls);
+            same(&compares::filter(5, 9, strict, level), &calls);
         }
     }
 }
@@ -206,7 +193,7 @@ fn table_as_linux() {
     // the pid nobody has; `kill` to it fails with ESRCH; fds that aren't open
     let pid = 0x7fff_fff0u64;
     let mut calls = vec![];
-    for nr in [SYS_read, SYS_write, SYS_kill, SYS_exit, SYS_exit_group, 1000, 1001] {
+    for nr in [SYS_read, SYS_write, SYS_kill, SYS_exit, SYS_exit_group, 1000, 1001].map(|n| n as u32) {
         for a0 in [pid, pid + 1, u64::MAX] {
             for a1 in [0, 1, 9, 64, 65] {
                 calls.push((nr, [a0, a1, 0, 0, 0, 0]));
@@ -214,16 +201,16 @@ fn table_as_linux() {
         }
     }
     for allow_exit in [false, true] {
-        same(&table_bpf(pid, allow_exit), &calls);
+        same(&table::filter(pid, allow_exit), &calls);
         // the instruction pointer's row: the probe's
-        same(&table_bpf(probe_ip(), allow_exit), &[(1000, [0; 6])]);
+        same(&table::filter(probe_ip(), allow_exit), &[(1000, [0; 6])]);
     }
 }
 
 #[test]
 fn long_as_linux() {
     let calls = [(NONE, [11, 10, 11, 9, 10, 0]), (NONE, [11, 10, 11, 9, 11, 0]), (NONE, [10, 10, 11, 9, 10, 0]), (2000, [11, 10, 11, 9, 10, 0])];
-    same(&long_bpf(11), &calls);
+    same(&long::filter(11), &calls);
 }
 
 /// The opcodes the macro doesn't emit: ALU, X, scratch memory, RET A, JSET.
@@ -254,7 +241,7 @@ fn alu_as_linux() {
 fn guarded_as_linux() {
     let pid = 0x7fff_fff0u64;
     let mut calls = vec![];
-    for nr in [SYS_read, SYS_kill, 1000, 1001, NONE] {
+    for nr in [SYS_read as u32, SYS_kill as u32, 1000, 1001, NONE] {
         for a0 in [pid, 2, 3] {
             for a1 in [0, 9, 65] {
                 for a2 in [0, 6] {
@@ -266,7 +253,7 @@ fn guarded_as_linux() {
         }
     }
     for on in [false, true] {
-        same(&guarded_bpf(pid, on), &calls);
+        same(&guarded::filter(pid, on), &calls);
     }
 }
 
@@ -285,16 +272,16 @@ fn halves_as_linux() {
                 calls.push((NONE, args));
             }
         }
-        same(&halves_bpf(v, 0), &calls);
+        same(&halves::filter(v, 0), &calls);
     }
     // the instruction pointer: v around the probe's
     let ip = probe_ip();
     for v in [ip, ip + 1, ip - 1, ip ^ (1 << 32), ip ^ 1 ^ (1 << 32), ip.rotate_left(32)] {
-        same(&halves_bpf(v, 0), &[(NONE, [u64::MAX; 6])]);
+        same(&halves::filter(v, 0), &[(NONE, [u64::MAX; 6])]);
     }
     // nr: at, under and over w
     for nr in [997, 998, 999, 1000, 1001] {
-        same(&halves_bpf(0, 999), &[(nr, [u64::MAX; 6])]);
+        same(&halves::filter(0, 999), &[(nr, [u64::MAX; 6])]);
     }
 }
 
@@ -302,8 +289,8 @@ fn halves_as_linux() {
 /// bit are killed, an x86-64 call isn't.
 #[test]
 fn abi_as_linux() {
-    same(&abi_bpf(), &[(NONE, [0; 6]), (X32_SYSCALL_BIT | NONE, [0; 6]), (X32_SYSCALL_BIT, [0; 6]), (u32::MAX, [0; 6])]);
-    let p = behind_prefix(&abi_bpf(), probe80_ip());
+    same(&abi::filter(), &[(NONE, [0; 6]), (X32_SYSCALL_BIT | NONE, [0; 6]), (X32_SYSCALL_BIT, [0; 6]), (u32::MAX, [0; 6])]);
+    let p = behind_prefix(&abi::filter(), probe80_ip());
     let d = SeccompData { nr: 20, arch: AUDIT_ARCH_I386, instruction_pointer: probe80_ip(), args: [0; 6] };
     assert_eq!(run_bpf(&p, &d), SECCOMP_RET_KILL_PROCESS);
     assert_eq!(kernel(&p, &d), Outcome::Killed);

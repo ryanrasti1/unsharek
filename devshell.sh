@@ -19,8 +19,11 @@ if [[ -z "${UNSHAREK_DEVSHELL:-}" ]]; then
     nix print-dev-env --profile "$_unsharek_root/.cache/devshell-$_unsharek_key" "$_unsharek_root" >"$_unsharek_env.tmp"
     mv "$_unsharek_env.tmp" "$_unsharek_env"
   fi
-  # print-dev-env's script sets the shell's options and traps; keep the caller's.
+  # print-dev-env's script sets the shell's options and traps; keep the caller's. ($(set +o)
+  # runs in a subshell, where bash turns errexit off, so it is kept from $- instead: without it
+  # ./test went on past a failed build and exited with the last command's status.)
   _unsharek_opts="$(set +o)"
+  [[ $- == *e* ]] && _unsharek_opts+=$'\nset -e'
   # shellcheck disable=SC1090
   source "$_unsharek_env"
   eval "$_unsharek_opts"

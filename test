@@ -8,8 +8,9 @@
 #   ./test --no-fail-fast            (the default stops at the first failure)
 #   ./test --perf                    the performance budgets instead (tests/perf.rs; tens of seconds)
 #   ./test --vs-native               each mode against native on build workloads (bench/quick.py)
-#   ./test --prove                   Kani's proofs: each #[seccomp] function equal to its program
-#                                    (seccomp-fn's examples, unsharek-tcb's policy); minutes
+#   ./test --prove                   Kani's proofs: each policy! harness, a policy function equal
+#                                    to its compiled program (seccomp-fn's examples, unsharek-tcb's
+#                                    filter, a harness per mode); minutes
 set -euo pipefail
 root="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=devshell.sh
@@ -18,7 +19,7 @@ cd "$root"
 if [[ "${1:-}" == --prove ]]; then
   shift
   # -j: the harnesses in parallel (one per mode and shape; each a minute or two alone)
-  cargo kani --manifest-path seccomp-fn/Cargo.toml -p seccomp-fn -j --output-format=terse "$@"
+  cargo kani --manifest-path seccomp-fn/Cargo.toml -p seccomp-fn --tests -j --output-format=terse "$@"
   exec cargo kani -p unsharek-tcb -j --output-format=terse "$@"
 fi
 if [[ "${1:-}" == --vs-native ]]; then

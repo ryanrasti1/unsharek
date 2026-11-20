@@ -51,7 +51,7 @@ pub use net::{Cx, GuestSocket, HeldFd, NetError, OnConnect, OnListen, OnResolve}
 /// superset of the one before.
 pub use tcb::Mode;
 /// One classic-BPF instruction (`struct sock_filter`): [`tcb::filter`]'s output.
-pub use tcb::SockFilter;
+pub use tcb::sock_filter as SockFilter;
 /// The auxiliary-vector tag under which a sandboxed program finds the gate's address (what the
 /// escape tests call, as a compromised program that found the gate would).
 pub use unsharek_rt::exec::AT_UNSHAREK_GATE;
