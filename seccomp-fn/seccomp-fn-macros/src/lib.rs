@@ -41,13 +41,95 @@ fn conjuncts<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
 #[proc_macro_attribute]
 pub fn seccomp(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let f = syn::parse_macro_input!(item as ItemFn);
-    match expand(&f) {
+    match expand(&f, Front::Attr) {
         Ok(t) => t.into(),
         Err(e) => {
             let e = e.to_compile_error();
             quote!(#f #e).into()
         }
     }
+}
+
+/// `seccomp_expr!(|d: &SeccompData, a: A, b: B| -> u32 { ... })`: the same function, as a value
+/// of a type of its own implementing `seccomp_fn::Seccomp<(A, B)>` (`run`, `bpf`, `constants`,
+/// `check_sampled`), with its Kani proofs as items nested in the expression's block (Kani finds
+/// them there; libtest doesn't run a nested `#[test]`, hence `check_sampled`, called from a test
+/// of the caller's). Parameters are the closure's typed arguments, never captures.
+#[proc_macro]
+pub fn seccomp_expr(input: TokenStream) -> TokenStream {
+    let c = syn::parse_macro_input!(input as syn::ExprClosure);
+    match expand_closure(&c) {
+        Ok(t) => t.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+fn expand_closure(c: &syn::ExprClosure) -> R<Ts> {
+    let mut inputs = c.inputs.iter();
+    let d = match inputs.next() {
+        Some(Pat::Type(t)) => match &*t.pat {
+            Pat::Ident(i) => i.ident.clone(),
+            p => return err(p, "a first parameter other than `d: &SeccompData`"),
+        },
+        _ => return err(c, "a closure without `d: &SeccompData` first"),
+    };
+    let (mut names, mut tys) = (vec![], vec![]);
+    for a in inputs {
+        let Pat::Type(t) = a else { return err(a, "a parameter without its type") };
+        let Pat::Ident(i) = &*t.pat else { return err(&t.pat, "a parameter pattern") };
+        names.push(i.ident.clone());
+        tys.push((*t.ty).clone());
+    }
+    let block: Block = match &*c.body {
+        Expr::Block(b) => b.block.clone(),
+        e => syn::parse_quote!({ #e }),
+    };
+    let run = format_ident!("__seccomp_fn");
+    let f: ItemFn = syn::parse_quote! {
+        #[allow(clippy::all)]
+        fn #run(#d: &::seccomp_fn::SeccompData, #(#names: #tys),*) -> u32 #block
+    };
+    let items = expand(&f, Front::Expr)?;
+    let tuple = quote!((#(#tys,)*));
+    let pat = quote!((#(#names,)*));
+    let mut sample_loops = quote!(__configs.push((#(#names,)*)););
+    for (n, t) in names.iter().zip(&tys).rev() {
+        sample_loops = quote!(for #n in <#t as ::seccomp_fn::Sample>::samples() { #sample_loops });
+    }
+    Ok(quote! {{
+        #items
+        struct __Seccomp;
+        impl ::seccomp_fn::Seccomp<#tuple> for __Seccomp {
+            fn run(&self, #d: &::seccomp_fn::SeccompData, #pat: #tuple) -> u32 {
+                #run(#d, #(#names),*)
+            }
+            fn bpf(&self, #pat: #tuple) -> ::std::vec::Vec<::seccomp_fn::SockFilter> {
+                __seccomp_fn_builder(#(#names),*).finish()
+            }
+            fn constants(&self, #pat: #tuple) -> ::std::vec::Vec<(::seccomp_fn::Field, u64)> {
+                __seccomp_fn_builder(#(#names),*).constants
+            }
+            fn check_sampled(&self) {
+                let mut __configs = vec![];
+                #sample_loops
+                let __n = ::seccomp_fn::sampled_budget(__configs.len());
+                for #pat in __configs {
+                    let __prog = self.bpf((#(#names,)*));
+                    let __k = self.constants((#(#names,)*));
+                    ::seccomp_fn::check_sampled(&__prog, &__k, __n, |__d| #run(__d, #(#names),*));
+                }
+            }
+        }
+        __Seccomp
+    }})
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Front {
+    /// `#[seccomp] fn`: the function, `_bpf`, `_constants` and the sampled `#[test]` beside it
+    Attr,
+    /// `seccomp_expr!`: the function, its builder and the proofs only (the rest is the trait's)
+    Expr,
 }
 
 /// Where a construct's code goes on to: it is the function's value (`Tail`), or falls through to
@@ -338,7 +420,7 @@ impl Cx {
     }
 }
 
-fn expand(f: &ItemFn) -> R<Ts> {
+fn expand(f: &ItemFn, front: Front) -> R<Ts> {
     let sig = &f.sig;
     let mut inputs = sig.inputs.iter();
     let d = match inputs.next() {
@@ -439,15 +521,26 @@ fn expand(f: &ItemFn) -> R<Ts> {
             )*
         }
     });
-    Ok(quote! {
-        #f
-
+    let builder_fn = quote! {
         #[allow(unused_variables, unused_braces, clippy::all)]
         fn #builder(#params) -> ::seccomp_fn::Builder<#bound> {
             let mut __b = ::seccomp_fn::Builder::<#bound>::new();
             let _: ::seccomp_fn::Label = #body;
             __b
         }
+    };
+    if front == Front::Expr {
+        return Ok(quote! {
+            #f
+            #builder_fn
+            #(#proofs)*
+            #complete
+        });
+    }
+    Ok(quote! {
+        #f
+
+        #builder_fn
 
         /// The function's program (`#[seccomp]`), for these params.
         #vis fn #bpf(#params) -> ::std::vec::Vec<::seccomp_fn::SockFilter> {

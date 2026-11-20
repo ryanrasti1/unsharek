@@ -3,7 +3,7 @@
 
 #![allow(non_upper_case_globals)] // libc's names, as patterns
 
-use crate::{Sample, SeccompData, seccomp};
+use crate::{Sample, Seccomp, SeccompData, seccomp, seccomp_expr};
 pub use libc::{SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO, SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_TRAP};
 
 // A policy's constants are its own, from libc. Two aren't in libc for x86_64:
@@ -159,5 +159,57 @@ pub mod readme {
             SYS_kill if d.args[0] == pid && d.args[1] >= 1 && d.args[1] <= 64 => SECCOMP_RET_ALLOW,
             _ => SECCOMP_RET_KILL_PROCESS,
         }
+    }
+}
+
+/// `compares`, as a value (`seccomp_expr!`): its proofs are items nested in this function.
+pub fn compares_expr() -> impl Seccomp<(u64, u64, bool, Level)> {
+    seccomp_expr!(|d: &SeccompData, lo: u64, hi: u64, strict: bool, level: Level| -> u32 {
+        if d.arch != AUDIT_ARCH_X86_64 {
+            return SECCOMP_RET_KILL_PROCESS;
+        }
+        let mid = lo / 2 + hi / 2;
+        if d.args[0] == lo && !(d.args[1] != hi) {
+            return SECCOMP_RET_ERRNO | (100 + 1);
+        }
+        if d.args[2] < lo || d.args[2] > hi {
+            return SECCOMP_RET_ERRNO | (100 + 2);
+        }
+        if (strict && d.args[3] >= mid) || (!strict && mid <= d.args[3]) {
+            return SECCOMP_RET_ERRNO | (100 + 3);
+        }
+        if level == Level::High && d.args[4] <= 7 {
+            return SECCOMP_RET_ERRNO | (100 + 4);
+        }
+        if d.nr > 1000 && d.args[5] != 0 {
+            return SECCOMP_RET_ERRNO | (100 + 5);
+        }
+        SECCOMP_RET_ALLOW
+    })
+}
+
+/// A value of the trait object, for a `static` (the type is unnameable: it is the block's own).
+pub static LO: &(dyn Seccomp<(u64,)> + Sync) = &seccomp_expr!(|d: &SeccompData, lo: u64| -> u32 {
+    if d.args[0] == lo { return SECCOMP_RET_ERRNO | 100; }
+    SECCOMP_RET_ALLOW
+});
+
+#[cfg(test)]
+mod expr_tests {
+    use super::*;
+
+    #[test]
+    fn compares_expr_sampled() {
+        compares_expr().check_sampled();
+    }
+
+    #[test]
+    fn compares_expr_is_compares() {
+        let p = compares_expr();
+        let key = |p: Vec<crate::SockFilter>| p.iter().map(|i| (i.code, i.jt, i.jf, i.k)).collect::<Vec<_>>();
+        assert_eq!(key(p.bpf((3, 90, true, Level::High))), key(compares_bpf(3, 90, true, Level::High)));
+        assert_eq!(LO.bpf((7,)).len(), 6);
+        let d = SeccompData { nr: 1, arch: AUDIT_ARCH_X86_64, instruction_pointer: 0, args: [3, 90, 0, 0, 0, 0] };
+        assert_eq!(p.run(&d, (3, 90, true, Level::High)), compares(&d, 3, 90, true, Level::High));
     }
 }

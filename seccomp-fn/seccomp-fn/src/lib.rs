@@ -8,7 +8,21 @@
 //! are not: the proof the macro emits (`<name>_is_its_bpf`, under `cfg(kani)`) checks what they
 //! built, for every `SeccompData` and every parameter.
 
-pub use seccomp_fn_macros::seccomp;
+pub use seccomp_fn_macros::{seccomp, seccomp_expr};
+
+/// What `seccomp_expr!` makes: a filter function `run` and its program `bpf`, for params `P`
+/// (a tuple of the closure's typed arguments after `d`).
+pub trait Seccomp<P> {
+    /// The function itself: its verdict on `d`.
+    fn run(&self, d: &SeccompData, params: P) -> u32;
+    /// The function as a classic-BPF program, for these params.
+    fn bpf(&self, params: P) -> Vec<SockFilter>;
+    /// Every comparison the program makes for these params: its field and value.
+    fn constants(&self, params: P) -> Vec<(Field, u64)>;
+    /// The proof's assertion, sampled, for every combination of the params' `Sample` values:
+    /// call it from a `#[test]` (a `#[test]` nested in the expression would never run).
+    fn check_sampled(&self);
+}
 
 // The macro's code names `::seccomp_fn`, here too.
 extern crate self as seccomp_fn;
