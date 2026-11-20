@@ -15,6 +15,8 @@
 //                         (EAI_NONAME); DENIED fails, not as a temporary failure
 //   listen PORT PEER      a listen on 0.0.0.0:PORT gets the host's connection from PEER, which
 //                         says "hello from the host"
+//   churn IP PORT N       N connections one after another, each a ping echoed and closed, then
+//                         a pause on stdin's EOF... (the host counts the sandbox's fds)
 //   serve PORT            a listen on 0.0.0.0:PORT: one connection, "ping" read, "pong" written
 //                         (the network plugin's --publish: crates/unsharek/tests/netplugin.rs)
 #include "unsharek_test.h"
@@ -256,6 +258,23 @@ static void do_listen(char **a)
 	printf("listen: accepted the host's connection from %s\n", p);
 }
 
+static void churn(char **a)
+{
+	int n = atoi(a[2]);
+	for (int i = 0; i < n; i++) {
+		int s = connect_to(addr(a[0], a[1]));
+		char buf[4];
+		CHECK(write(s, "ping", 4) == 4, "write %d", i);
+		read_all(s, buf, 4);
+		close(s);
+	}
+	printf("churn: %d connections\n", n);
+	// Held until the host has counted (it closes our stdin).
+	char c;
+	while (read(0, &c, 1) > 0)
+		;
+}
+
 static void serve(char **a)
 {
 	int l = socket(AF_INET, SOCK_STREAM, 0);
@@ -288,6 +307,8 @@ int main(int argc, char **argv)
 		names(a);
 	else if (!strcmp(c, "refused"))
 		fails(a, ECONNREFUSED);
+	else if (!strcmp(c, "churn"))
+		churn(a);
 	else if (!strcmp(c, "serve"))
 		serve(a);
 	else if (!strcmp(c, "denied"))

@@ -78,6 +78,7 @@ pub const NR_KILL: u32 = 62;
 pub const NR_EXIT_GROUP: u32 = 231;
 pub const NR_PPOLL: u32 = 271;
 pub const NR_RECVMSG: u32 = 47;
+pub const NR_CLOSE: u32 = 3;
 
 /// The one flag set a host thread is made with (include/uapi/linux/sched.h): `CLONE_VM |
 /// CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM | CLONE_CHILD_CLEARTID`.
@@ -163,6 +164,13 @@ pub fn read(fd: u32, buf: &mut [u8]) -> Result<usize, Errno> {
     check(unsafe {
         gate(NR_READ as usize, fd as usize, buf.as_mut_ptr() as usize, buf.len(), 0, 0, 0)
     })
+}
+
+/// `close(fd)`: a fd [`recv_fds`] brought (unsharek-tcb's `close` row allows only those: at or
+/// above the floor lockdown fixed).
+pub fn close(fd: u32) -> Result<usize, Errno> {
+    // SAFETY: closes an fd of this process; no memory is passed.
+    check(unsafe { gate(NR_CLOSE as usize, fd as usize, 0, 0, 0, 0, 0) })
 }
 
 /// The most fds one [`recv_fds`] takes from a message.

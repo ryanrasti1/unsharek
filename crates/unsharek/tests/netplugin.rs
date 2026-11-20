@@ -49,6 +49,10 @@ fn echo_server() -> u16 {
 }
 
 fn unsharek(mode: &str, flags: &[String], args: &[String]) -> Child {
+    unsharek_stdin(mode, flags, args, Stdio::null())
+}
+
+fn unsharek_stdin(mode: &str, flags: &[String], args: &[String], stdin: Stdio) -> Child {
     Command::new(env!("CARGO_BIN_EXE_unsharek"))
         .args(["--mode", mode, "--ro"])
         .arg(fx::bin_dir())
@@ -56,7 +60,7 @@ fn unsharek(mode: &str, flags: &[String], args: &[String]) -> Child {
         .arg("--")
         .arg(fx::bin("net"))
         .args(args)
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -143,5 +147,38 @@ fn publish_reaches_the_guests_listener() {
         let (code, out) = finish(child);
         assert!(read.is_ok() && &got == b"pong", "{mode}: read {read:?} {got:?}\n{out}");
         assert!(code == Some(0) && out.contains("NET_SERVE_OK"), "{mode}: {code:?}\n{out}");
+    }
+}
+
+/// 1000 connections, each closed: the sandbox's host fds don't grow with them (each received fd
+/// is closed when the guest closes its socket).
+#[test]
+fn no_fd_leak_over_1000_connections() {
+    let port = echo_server().to_string();
+    for mode in MODES {
+        let mut child = unsharek_stdin(mode, &s(&["--net", "all"]), &s(&["churn", &host_ip(), &port, "1000"]), Stdio::piped());
+        let pid = child.id();
+        // The fd table's size (/proc/PID/fd is closed to us: the sandbox isn't dumpable), which
+        // grows past 1000 if the connections' fds leak.
+        let count = || -> usize {
+            let st = std::fs::read_to_string(format!("/proc/{pid}/status")).expect("the sandbox's status");
+            st.lines().find_map(|l| l.strip_prefix("FDSize:")).expect("FDSize").trim().parse().unwrap()
+        };
+        // Wait for the churn's end (its line), then count.
+        let mut out = child.stdout.take().unwrap();
+        let mut line = Vec::new();
+        let mut b = [0u8; 1];
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !line.ends_with(b"connections\n") && Instant::now() < deadline {
+            if out.read(&mut b).unwrap_or(0) == 0 {
+                break;
+            }
+            line.push(b[0]);
+        }
+        let n = count();
+        drop(child.stdin.take());
+        let _ = child.wait();
+        assert!(line.ends_with(b"connections\n"), "{mode}: {}", String::from_utf8_lossy(&line));
+        assert!(n < 1000, "{mode}: an fd table of {n} after 1000 connections");
     }
 }

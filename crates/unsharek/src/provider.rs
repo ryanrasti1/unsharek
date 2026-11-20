@@ -170,6 +170,8 @@ impl Drop for Conn {
             let rt: Arc<dyn Runtime> = Arc::new(ExecutorRuntime);
             capnweb::runtime::enter(&rt, || drop(conn));
         }
+        // Our copy of the socket: a received fd, the one kind the filter lets us close.
+        let _ = unsharek_rt::trap::close(self.fd.as_raw_fd() as u32);
     }
 }
 
