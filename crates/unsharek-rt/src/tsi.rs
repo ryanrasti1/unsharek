@@ -32,7 +32,7 @@
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use core::ffi::{c_int, c_uint, c_ulong, c_void};
 use core::future::{Future, poll_fn};
 use core::net::{Ipv4Addr, SocketAddrV4};
@@ -191,11 +191,175 @@ fn with_obj<T>(ptr: usize, f: impl FnOnce(&mut Obj) -> T) -> Option<T> {
 
 /// Fork mode, in a fork's child process: the hooks, the registry and the executor are init's
 /// process's (this one has a stale copy of them, and running it would touch the shared scheduler
-/// from the wrong process). Until a child's ops reach init's executor (`net_fork`), a child's
-/// non-loopback connect is ENETUNREACH, its listen beyond loopback the guest's own, its name
-/// lookups unanswered, and a passed fd's readiness only what it is at the poll.
+/// from the wrong process). So a child's host ops are forwarded ([`FWD`]): queued in shared
+/// memory, init's executor woken, and served there as init's own. The kernel objects they name
+/// (socks, ends) are the shared kernel's, the same in every process; what can't cross is a host fd
+/// (each process has its own table), so a connection a forwarded op makes is served by init's
+/// process, its bytes copied between the guest's end and the host fd there ([`FdStream`]): no
+/// filter change (the received fds stay init's, on its control socket).
 fn elsewhere() -> bool {
     crate::par::forked()
+}
+
+/// What a forked process forwards to init's executor: its host op, with the arguments as the
+/// kernel gave them (socks and ends are the shared kernel's, valid in every process).
+#[derive(Clone, Copy)]
+enum Fwd {
+    None,
+    Connect { sock: usize, pid: i32, addr: SocketAddrV4 },
+    Listen { sock: usize, pid: i32, addr: SocketAddrV4 },
+    /// A resolver query: its bytes in [`FwdQueue::msgs`]`[slot]`.
+    Resolve { sock: usize, pid: i32, ns: SocketAddrV4, slot: u8, len: u16 },
+    Ready { obj: usize },
+    FdShutdown { fd: i32, how: i32 },
+    FdClose { fd: i32 },
+}
+
+const FWD_LEN: usize = 256;
+const FWD_MSGS: usize = 8;
+const FWD_MSG: usize = 512;
+
+/// The forwarded host ops, in order (a sock's connect before its readiness): a ring, and the
+/// queries' bytes. Shared (fork mode's processes), touched with the CPU token held. Full, a
+/// connect, listen or lookup fails at once (ENOBUFS); a readiness is kept once per object, and if
+/// even that overflows every waiter is woken (`all`).
+#[unsafe(link_section = "unsharek_shared")]
+static FWD: FwdQueue = FwdQueue {
+    ring: [const { Cell::new(Fwd::None) }; FWD_LEN],
+    head: Cell::new(0),
+    len: Cell::new(0),
+    all: Cell::new(false),
+    msgs: [const { Cell::new([0; FWD_MSG]) }; FWD_MSGS],
+    msg_used: [const { Cell::new(false) }; FWD_MSGS],
+};
+
+struct FwdQueue {
+    ring: [Cell<Fwd>; FWD_LEN],
+    head: Cell<usize>,
+    len: Cell<usize>,
+    all: Cell<bool>,
+    msgs: [Cell<[u8; FWD_MSG]>; FWD_MSGS],
+    msg_used: [Cell<bool>; FWD_MSGS],
+}
+
+// SAFETY: touched with the CPU token held (one host thread at a time, in any process).
+unsafe impl Sync for FwdQueue {}
+
+impl FwdQueue {
+    fn push(&self, f: Fwd) -> bool {
+        if self.len.get() == FWD_LEN {
+            return false;
+        }
+        self.ring[(self.head.get() + self.len.get()) % FWD_LEN].set(f);
+        self.len.set(self.len.get() + 1);
+        true
+    }
+    fn pop(&self) -> Option<Fwd> {
+        if self.len.get() == 0 {
+            return None;
+        }
+        let f = self.ring[self.head.get()].replace(Fwd::None);
+        self.head.set((self.head.get() + 1) % FWD_LEN);
+        self.len.set(self.len.get() - 1);
+        Some(f)
+    }
+    fn has_ready(&self, obj: usize) -> bool {
+        (0..self.len.get()).any(|i| matches!(self.ring[(self.head.get() + i) % FWD_LEN].get(), Fwd::Ready { obj: o } if o == obj))
+    }
+}
+
+/// From a forked process: `f` queued for init's executor, which is woken. False if full.
+fn forward(f: Fwd) -> bool {
+    let ok = FWD.push(f);
+    executor::wake_from_fork();
+    ok
+}
+
+/// Whether forked processes forwarded anything not yet taken (init's executor, before it blocks).
+pub fn forwarded_pending() -> bool {
+    FWD.len.get() > 0 || FWD.all.get()
+}
+
+/// init's executor, each turn: what forked processes forwarded, served as init's own host ops.
+pub fn take_forwarded() {
+    if FWD.all.replace(false) {
+        let wake: Vec<Waker> = R.objs.borrow_mut().iter_mut().flat_map(|o| [o.read.take(), o.write.take()]).flatten().collect();
+        for w in wake {
+            w.wake();
+        }
+    }
+    while let Some(f) = FWD.pop() {
+        match f {
+            Fwd::None => {}
+            Fwd::Connect { sock, pid, addr } => {
+                register(sock);
+                executor::spawn(connect_task(sock, pid, addr, true));
+            }
+            Fwd::Listen { sock, pid, addr } => {
+                register(sock);
+                executor::spawn(listen_task(sock, pid, addr, true));
+            }
+            Fwd::Resolve { sock, pid, ns, slot, len } => {
+                let msg = FWD.msgs[slot as usize].get()[..len as usize].to_vec();
+                FWD.msg_used[slot as usize].set(false);
+                executor::spawn(resolve_task(sock, pid, ns, msg));
+            }
+            Fwd::Ready { obj } => ready(obj),
+            // SAFETY: as the host ops themselves.
+            Fwd::FdShutdown { fd, how } => unsafe { net_fd_shutdown(fd as core::ffi::c_long, how) },
+            // SAFETY: as the host ops themselves.
+            Fwd::FdClose { fd } => unsafe { net_fd_close(fd as core::ffi::c_long) },
+        }
+    }
+}
+
+/// A host fd's connection served by init's process for a forked process's socket (which can't use
+/// init's fd): a byte stream over the fd, [`splice`]d with the guest's end. The [`FdConn`] is the
+/// connection's shutdown and close.
+struct FdStream {
+    fd: i32,
+    conn: Option<Box<dyn FdConn>>,
+}
+
+impl ByteStream for FdStream {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, Errno>> {
+        loop {
+            match crate::trap::read(self.fd as u32, buf) {
+                Err(Errno::AGAIN) => {
+                    if executor::poll_fd(self.fd, executor::POLLIN, cx).is_pending() {
+                        return Poll::Pending;
+                    }
+                }
+                r => return Poll::Ready(r),
+            }
+        }
+    }
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Errno>> {
+        loop {
+            match crate::trap::write(self.fd as u32, buf) {
+                Err(Errno::AGAIN) => {
+                    if executor::poll_fd(self.fd, executor::POLLOUT, cx).is_pending() {
+                        return Poll::Pending;
+                    }
+                }
+                r => return Poll::Ready(r),
+            }
+        }
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Errno>> {
+        if let Some(c) = self.conn.as_mut() {
+            c.shutdown(1); // SHUT_WR
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// A connection's stream for a forked process's socket: an fd connection served here.
+fn served(conn: Conn) -> Conn {
+    match conn {
+        Conn::Fd(fd, c) => Conn::Stream(Box::pin(FdStream { fd, conn: Some(c) })),
+        c => c,
+    }
 }
 
 fn addr_of(addr: *const l::lkl_sockaddr, len: c_int) -> Option<SocketAddrV4> {
@@ -232,16 +396,21 @@ fn done(sock: usize, err: c_int) -> *mut c_void {
 /// A host op: called by the kernel, with its pointers valid for the call.
 pub unsafe extern "C" fn net_connect(sock: *mut c_void, pid: c_int, addr: *const l::lkl_sockaddr, len: c_int) -> c_int {
     let Some(addr) = addr_of(addr, len) else { return neg(Errno::INVAL) };
-    if R.hooks.borrow().connect.is_none() || elsewhere() {
+    if R.hooks.borrow().connect.is_none() {
         return neg(Errno::NETUNREACH);
     }
     let sock = sock as usize;
+    if elsewhere() {
+        return if forward(Fwd::Connect { sock, pid, addr }) { 0 } else { neg(Errno::NOBUFS) };
+    }
     register(sock);
-    executor::spawn(connect_task(sock, pid, addr));
+    executor::spawn(connect_task(sock, pid, addr, false));
     0
 }
 
-async fn connect_task(sock: usize, pid: i32, addr: SocketAddrV4) {
+/// `forwarded`: a forked process's connect, whose socket can't use a host fd of init's: an fd
+/// connection is served here instead ([`served`]).
+async fn connect_task(sock: usize, pid: i32, addr: SocketAddrV4, forwarded: bool) {
     // The hook is called on the executor, not in the host op.
     let fut = {
         let mut h = R.hooks.borrow_mut();
@@ -252,6 +421,7 @@ async fn connect_task(sock: usize, pid: i32, addr: SocketAddrV4) {
     };
     let r = until_closed(sock, fut).await;
     unregister(sock);
+    let r = if forwarded { r.map(|r| r.map(served)) } else { r };
     match r {
         // The program closed its socket meanwhile: the attempt is dropped, the reference given back.
         None => {
@@ -312,16 +482,20 @@ fn closed(sock: usize, cx: &mut Context<'_>) -> bool {
 /// A host op: called by the kernel, with its pointers valid for the call.
 pub unsafe extern "C" fn net_listen(sock: *mut c_void, pid: c_int, addr: *const l::lkl_sockaddr, len: c_int) -> c_int {
     let Some(addr) = addr_of(addr, len) else { return neg(Errno::INVAL) };
-    if R.hooks.borrow().listen.is_none() || elsewhere() {
+    if R.hooks.borrow().listen.is_none() {
         return neg(Errno::OPNOTSUPP);
     }
     let sock = sock as usize;
+    if elsewhere() {
+        return if forward(Fwd::Listen { sock, pid, addr }) { 0 } else { neg(Errno::OPNOTSUPP) };
+    }
     register(sock);
-    executor::spawn(listen_task(sock, pid, addr));
+    executor::spawn(listen_task(sock, pid, addr, false));
     0
 }
 
-async fn listen_task(sock: usize, pid: i32, addr: SocketAddrV4) {
+/// `forwarded`: a forked process's listen: its connections, fd ones too, served here ([`served`]).
+async fn listen_task(sock: usize, pid: i32, addr: SocketAddrV4, forwarded: bool) {
     let fut = {
         let mut h = R.hooks.borrow_mut();
         match h.listen.as_mut() {
@@ -347,6 +521,7 @@ async fn listen_task(sock: usize, pid: i32, addr: SocketAddrV4) {
         })
         .await;
         let Some((peer, conn)) = next else { break };
+        let conn = if forwarded { served(conn) } else { conn };
         let a = sockaddr(peer);
         let stream = match conn {
             Conn::Fd(fd, c) => {
@@ -390,11 +565,30 @@ pub unsafe extern "C" fn net_sendto(
     size: c_ulong,
 ) -> c_int {
     let Some(to) = addr_of(addr, len) else { return neg(Errno::INVAL) };
-    if to.port() != 53 || R.hooks.borrow().resolve.is_none() || elsewhere() {
+    if to.port() != 53 || R.hooks.borrow().resolve.is_none() {
         return neg(Errno::NETUNREACH);
     }
     // SAFETY: the kernel's copy of the datagram, size bytes.
-    let msg = unsafe { core::slice::from_raw_parts(buf as *const u8, size as usize) }.to_vec();
+    let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, size as usize) };
+    if elsewhere() {
+        // Its bytes into a shared slot, for init's executor; none free or too long: no answer
+        // (the resolver asks again, as for a lost datagram).
+        let Some(slot) = FWD.msg_used.iter().position(|u| !u.get()) else { return neg(Errno::NOBUFS) };
+        if bytes.len() > FWD_MSG {
+            return neg(Errno::MSGSIZE);
+        }
+        let mut m = [0u8; FWD_MSG];
+        m[..bytes.len()].copy_from_slice(bytes);
+        FWD.msgs[slot].set(m);
+        FWD.msg_used[slot].set(true);
+        let f = Fwd::Resolve { sock: sock as usize, pid, ns: to, slot: slot as u8, len: bytes.len() as u16 };
+        if !forward(f) {
+            FWD.msg_used[slot].set(false);
+            return neg(Errno::NOBUFS);
+        }
+        return 0;
+    }
+    let msg = bytes.to_vec();
     executor::spawn(resolve_task(sock as usize, pid, to, msg));
     0
 }
@@ -436,6 +630,11 @@ async fn resolve_task(sock: usize, pid: i32, ns: SocketAddrV4, msg: Vec<u8>) {
 /// # Safety
 /// A host op: called by the kernel.
 pub unsafe extern "C" fn net_fd_shutdown(fd: core::ffi::c_long, how: c_int) {
+    // A socket init made before the fork, inherited: its connection is init's.
+    if elsewhere() {
+        forward(Fwd::FdShutdown { fd: fd as i32, how });
+        return;
+    }
     if let Some((_, c)) = R.fds.borrow_mut().iter_mut().find(|(f, _)| *f as core::ffi::c_long == fd) {
         c.shutdown(how);
     }
@@ -447,6 +646,13 @@ pub unsafe extern "C" fn net_fd_shutdown(fd: core::ffi::c_long, how: c_int) {
 /// # Safety
 /// A host op: called by the kernel.
 pub unsafe extern "C" fn net_fd_close(fd: core::ffi::c_long) {
+    // A socket init made before the fork, inherited, last closed here: the connection is init's
+    // to end; this process's copy of the fd (the fork's) closed (a received fd: the close row's).
+    if elsewhere() {
+        forward(Fwd::FdClose { fd: fd as i32 });
+        let _ = crate::trap::close(fd as u32);
+        return;
+    }
     let c = {
         let mut fds = R.fds.borrow_mut();
         fds.iter().position(|(f, _)| *f as core::ffi::c_long == fd).map(|i| fds.remove(i))
@@ -461,10 +667,20 @@ pub unsafe extern "C" fn net_fd_close(fd: core::ffi::c_long) {
 /// # Safety
 /// A host op: called by the kernel, with its pointers valid for the call.
 pub unsafe extern "C" fn net_ready(obj: *mut c_void) {
+    let obj = obj as usize;
     if elsewhere() {
+        // Its waiters are init's (every lent sock and end is init's executor's): forwarded,
+        // once per object; if even that overflows, init wakes every waiter.
+        if !FWD.has_ready(obj) && !forward(Fwd::Ready { obj }) {
+            FWD.all.set(true);
+        }
         return;
     }
-    let wake = with_obj(obj as usize, |o| {
+    ready(obj);
+}
+
+fn ready(obj: usize) {
+    let wake = with_obj(obj, |o| {
         // For a lent sock this is the program's close (`closed` is only read for socks: an
         // end's state is what its calls return).
         o.closed = true;

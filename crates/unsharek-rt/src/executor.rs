@@ -156,6 +156,31 @@ impl HostFds {
     }
 }
 
+/// The executor's coroutine (its `Tid`'s raw value; 0: none yet), shared: in fork mode a forked
+/// process's host ops forward to init's executor (`tsi`'s forwarding) and wake it by this id. Its
+/// coroutine is the shared scheduler's, bound to init's kernel thread, so it runs in init's
+/// process whoever wakes it.
+#[unsafe(link_section = "unsharek_shared")]
+static EXEC_TID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// From a forked process (fork mode): init's executor woken, to take what was forwarded to it.
+/// With the CPU token held.
+pub fn wake_from_fork() {
+    let t = EXEC_TID.load(Ordering::Relaxed);
+    if t != 0 && installed() {
+        sched().wake(Tid::from_raw(t));
+    }
+}
+
+/// Fork mode, in init's process before lockdown, once bound to init's kernel thread
+/// ([`set_home`]): the executor's coroutine made now, so that a forked process has one to forward
+/// to even if init's own hooks never ran a task.
+pub fn start_for_fork() {
+    if installed() {
+        spawn(async {});
+    }
+}
+
 /// Bind the executor's coroutine to host-thread slot `home` (fork mode: init's kernel thread).
 /// Before it starts.
 pub fn set_home(home: u16) {
@@ -239,6 +264,7 @@ fn start() {
                 s.bind(t, E.home.get());
             }
             E.tid.set(Some(t));
+            EXEC_TID.store(t.raw(), Ordering::Relaxed);
         }
     }
 }
@@ -323,12 +349,19 @@ fn run_ready() {
 fn run(_: usize) -> usize {
     let s = sched();
     loop {
+        // What forked processes forwarded (fork mode): their connects, listens, lookups and
+        // readiness, served as this process's own.
+        crate::tsi::take_forwarded();
         run_ready();
         let now = s.now();
         fire_timers(now);
         poll_watches();
         tell_hostfds();
-        if !E.ready.with(|q| q.is_empty()) {
+        // Something forwarded since this turn's `take_forwarded` (a task's call into the kernel
+        // let a forked process run, whose wake found this coroutine running, not blocked): taken
+        // before blocking, or it waits for the next wake. 2 in 30 runs of eight connections from a
+        // child hung so (`net_many_child::fork`).
+        if !E.ready.with(|q| q.is_empty()) || crate::tsi::forwarded_pending() {
             // The others get a turn between rounds: tasks that keep waking each other must not
             // keep the program from running.
             s.yield_now();
