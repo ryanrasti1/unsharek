@@ -1,8 +1,8 @@
 {
   description = "exobox: Linux (LKL) as a library, hosting unmodified programs behind a strict seccomp filter";
 
-  # capnix's revision, so the two share store paths.
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/5d2b81a7a3be3e2f832879028e4d60abbf58e9a0";
+  # The revision is flake.lock's.
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   # The kernel's source is the submodule lkl/linux (lkl/README.md: stock LKL plus exobox's series):
   # the flake sees it only with submodules on. A kernel change is the submodule's new commit plus
   # exobox's side of it, in one commit.

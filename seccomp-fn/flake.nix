@@ -1,8 +1,8 @@
 {
   description = "seccomp-fn: a seccomp filter as a plain Rust function, compiled to classic BPF and proven equal to it by Kani";
 
-  # exobox's pin (the repository this came from), so the two share store paths.
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/5d2b81a7a3be3e2f832879028e4d60abbf58e9a0";
+  # The revision is flake.lock's.
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
   outputs = { self, nixpkgs }:
     let
