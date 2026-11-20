@@ -166,7 +166,7 @@ fn bindings(manifest: &Path, include: &[PathBuf], out_dir: &Path) {
         .allowlist_function(
             // lkl_net_*: the host's calls for networking (tsi.c); lkl_hostfd_ready: a host fd's
             // readiness for its guest file's pollers (hostfd.c)
-            "lkl_(init|start_kernel|cleanup|is_running|syscall|sys_halt|printf|bug|net_.*|hostfd_ready)",
+            "lkl_(init|start_kernel|cleanup|is_running|syscall|sys_halt|printf|bug|net_.*|hostfd_ready|get_free_irq|trigger_irq)",
         )
         .allowlist_type("lkl_host_operations|lkl_jmp_buf|lkl_thread_t")
         .allowlist_var("__lkl__NR_.*")

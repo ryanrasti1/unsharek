@@ -5,3 +5,5 @@
  * (lkl_host_ops, the virtio and disk helpers), which unsharek doesn't link. */
 #include <lkl.h>
 #include <lkl/asm/host_ops.h>
+/* lkl_get_free_irq, lkl_trigger_irq: a host-backed device's interrupt (unsharek-fs). */
+#include <lkl/asm/irq.h>

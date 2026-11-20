@@ -16,6 +16,8 @@ clap.workspace = true
 unsharek-erofs = { path = "../unsharek-erofs" }
 # The in-sandbox runtime: boot, the gate, routing, exec; given the inventory's resources
 unsharek-rt = { path = "../unsharek-rt" }
+# Host directories through virtio-fs (src/hostfs.rs; spike)
+unsharek-fs = { path = "../unsharek-fs" }
 # Errno, the runtime's error type, in the hooks' adapters (src/net.rs)
 rustix.workspace = true
 # The global allocator after lockdown (src/alloc.rs): the hooks' and the executor's allocations,

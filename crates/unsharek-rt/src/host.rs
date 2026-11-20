@@ -1247,3 +1247,28 @@ mod tests {
         (us(ru.ru_utime) + us(ru.ru_stime)) * 1000
     }
 }
+
+/// A host-backed MMIO device's register accesses (LKL's `ioremap` and `iomem_access` host ops):
+/// set before the device is added (unsharek-fs's virtio-fs). LKL reads the table at each call.
+pub fn set_iomem(
+    ioremap: unsafe extern "C" fn(core::ffi::c_long, c_int) -> *mut c_void,
+    access: unsafe extern "C" fn(*const c_void, *mut c_void, c_int, c_int) -> c_int,
+) {
+    // SAFETY: the table's two fields, written on the boot thread, before any MMIO access.
+    unsafe {
+        (*HOST_OPS.0.get()).ioremap = Some(ioremap);
+        (*HOST_OPS.0.get()).iomem_access = Some(access);
+    }
+}
+
+/// An interrupt line for a host-backed device (`lkl_get_free_irq`).
+pub fn free_irq() -> i32 {
+    // SAFETY: a NUL-terminated name LKL keeps for the line's life (a static).
+    unsafe { lkl_sys::lkl_get_free_irq(c"virtio".as_ptr()) }
+}
+
+/// Raise a host-backed device's interrupt (`lkl_trigger_irq`).
+pub fn trigger_irq(irq: u32) {
+    // SAFETY: a line from free_irq.
+    unsafe { lkl_sys::lkl_trigger_irq(irq as c_int) };
+}
