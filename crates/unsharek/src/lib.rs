@@ -43,6 +43,7 @@ mod memory;
 pub mod hostfs;
 pub mod net;
 pub mod provider;
+pub mod pty;
 pub mod setup;
 pub mod store;
 
@@ -855,6 +856,9 @@ pub struct Config {
     /// Host directories served live, through virtio-fs ([`hostfs`]): each a server's socket (the
     /// CLI's `--ro` and `--rw`, `unsharek-fs-server`), mounted at its guest path.
     pub host_dirs: Vec<HostDir>,
+    /// Fork mode: the program on a terminal of the guest's own, of this size ([`pty`]), for a
+    /// caller whose stdin is a terminal; `None`: the host's stdio as it is.
+    pub tty: Option<pty::Size>,
 }
 
 /// A host directory served to the guest by a server on the other end of `fd` (a unix stream:
@@ -919,10 +923,18 @@ pub fn run_with(
     }
     prepare(&mut g)?;
     let dirs: Vec<PathBuf> = config.host_dirs.iter().map(|d| d.at.clone()).collect();
+    // Fork mode on a terminal: the program on a pty of the guest's, under its init (`pty`).
+    let tty = config.tty.filter(|_| config.mode == Mode::Fork);
+    if let Some(size) = tty {
+        argv = pty::argv(&argv, size);
+    }
     g.run(|| -> std::io::Result<()> {
         setup::mount_closure(&mounts)?;
         for (i, at) in dirs.iter().enumerate() {
             hostfs::mount(&format!("host{i}"), at)?;
+        }
+        if tty.is_some() {
+            pty::install()?;
         }
         Ok(())
     })??;

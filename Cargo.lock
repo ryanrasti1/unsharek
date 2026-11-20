@@ -1033,6 +1033,7 @@ name = "unsharek"
 version = "0.0.0"
 dependencies = [
  "capnweb-rs",
+ "cc",
  "clap",
  "futures-core",
  "futures-io",

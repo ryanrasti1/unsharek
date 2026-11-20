@@ -1,7 +1,7 @@
 # unsharek
 
 A sandboxing tool that runs unmodified Linux programs in a separate (unshared) kernel, secured by a
-strict seccomp filter: as few as 8 host syscalls, each argument pinned.
+extremely minimal and tight seccomp filter: as few as 6 host syscalls, each argument pinned.
 
 unsharek links [LKL](https://github.com/lkl/linux) (Linux as a library) into its own process. It then
 traps the program's syscalls and serves them in the guest kernel. It is secured by applying an
