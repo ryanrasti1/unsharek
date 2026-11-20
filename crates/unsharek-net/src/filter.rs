@@ -10,7 +10,7 @@ use libc::{seccomp_data, sock_filter};
 use libc::{
     SYS_accept4, SYS_bind, SYS_brk, SYS_close, SYS_connect, SYS_exit, SYS_exit_group, SYS_fcntl, SYS_futex, SYS_getrandom,
     SYS_getsockopt, SYS_ioctl, SYS_madvise, SYS_mmap, SYS_mprotect, SYS_mremap, SYS_munmap, SYS_poll, SYS_ppoll, SYS_read, SYS_recvfrom,
-    SYS_rt_sigprocmask, SYS_rt_sigreturn, SYS_sendmsg, SYS_sendto, SYS_setsockopt, SYS_sigaltstack, SYS_socket,
+    SYS_rt_sigprocmask, SYS_rt_sigreturn, SYS_sendmsg, SYS_sendto, SYS_setsockopt, SYS_shutdown, SYS_sigaltstack, SYS_socket,
     SYS_write,
 };
 pub use libc::{SECCOMP_RET_ALLOW, SECCOMP_RET_KILL_PROCESS};
@@ -40,6 +40,8 @@ pub fn policy(ctl: u64) -> impl Fn(&seccomp_data) -> u32 {
             SYS_ioctl if d.args[1] == libc::FIONBIO => SECCOMP_RET_ALLOW,
             // A published port's next connection (the listeners were bound before lockdown).
             SYS_accept4 if d.args[3] == libc::SOCK_CLOEXEC as u64 => SECCOMP_RET_ALLOW,
+            // The sandbox's half-close and close of a connection (its own fd can't).
+            SYS_shutdown => SECCOMP_RET_ALLOW,
             SYS_connect | SYS_bind | SYS_getsockopt | SYS_setsockopt | SYS_sendto | SYS_recvfrom => SECCOMP_RET_ALLOW,
             // A reply with a dialled socket in it: on the control socket only, no flags.
             SYS_sendmsg if d.args[0] == ctl && d.args[2] == 0 => SECCOMP_RET_ALLOW,

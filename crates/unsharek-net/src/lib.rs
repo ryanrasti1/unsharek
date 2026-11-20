@@ -35,14 +35,17 @@ use capnweb::{CapnwebError, CapnwebValue, Error, Result, RpcSession, RpcSessionO
 /// The wire: the object's methods and its rejections' names (the sandbox's side maps each to an
 /// errno).
 pub mod protocol {
-    /// `connect(ip: string, port: number) -> fd`.
+    /// `connect(ip: string, port: number) -> [fd, Conn]`.
     pub const CONNECT: &str = "connect";
     /// `resolve(name: string) -> string[]` (IPv4 addresses).
     pub const RESOLVE: &str = "resolve";
     /// `listen(port: number) -> Listener`: the port published for the guest's `port`.
     pub const LISTEN: &str = "listen";
-    /// `Listener.accept() -> [fd, peerIp: string, peerPort: number]`.
+    /// `Listener.accept() -> [fd, peerIp: string, peerPort: number, Conn]`.
     pub const ACCEPT: &str = "accept";
+    /// `Conn.shutdownWrite()`: the sandbox's half-close of the connection (it can't `shutdown` its
+    /// own fd). Releasing the `Conn` closes the connection both ways.
+    pub const SHUTDOWN_WRITE: &str = "shutdownWrite";
     /// The policy doesn't allow the address (EACCES).
     pub const DENIED: &str = "Denied";
     /// The destination refused (ECONNREFUSED).
@@ -64,6 +67,8 @@ pub enum Policy {
     Public,
     /// Any address the host can reach.
     All,
+    /// None: the provider only serves published ports (no `--net`).
+    Deny,
 }
 
 impl Policy {
@@ -72,6 +77,7 @@ impl Policy {
         match self {
             Policy::All => true,
             Policy::Public => is_public(ip),
+            Policy::Deny => false,
         }
     }
 }
@@ -159,6 +165,46 @@ pub struct Listener {
     reactor: Arc<Reactor>,
 }
 
+/// The provider's copy of a connection it passed in: the sandbox can't `shutdown` or `close` its
+/// own fd (no such row), so its half-close is [`Conn::shutdown_write`] and its close the release
+/// of this object, which shuts the socket down both ways (the peer sees the end although the
+/// sandbox's fd stays open).
+pub struct Conn {
+    fd: RawFd,
+}
+
+impl Conn {
+    /// The provider's copy of `fd`, kept; `fd` is to be sent (and then closed: [`HostCtl::send_fds`]).
+    fn of(fd: RawFd) -> Result<Conn> {
+        // SAFETY: a dup of a socket this process owns.
+        let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+        if copy < 0 {
+            return Err(rejection(protocol::UNREACHABLE, io::Error::last_os_error().to_string()));
+        }
+        Ok(Conn { fd: copy })
+    }
+}
+
+impl Drop for Conn {
+    fn drop(&mut self) {
+        // SAFETY: our copy; the shutdown is the socket's, the sandbox's fd included.
+        unsafe {
+            libc::shutdown(self.fd, libc::SHUT_RDWR);
+            libc::close(self.fd);
+        }
+    }
+}
+
+#[rpc_target]
+impl Conn {
+    /// `shutdownWrite()`: the half-close.
+    fn shutdown_write(&self) -> Result<()> {
+        // SAFETY: our copy of the socket.
+        unsafe { libc::shutdown(self.fd, libc::SHUT_WR) };
+        Ok(())
+    }
+}
+
 #[rpc_target]
 impl Listener {
     /// `accept() -> [fd, peerIp, peerPort]`.
@@ -167,10 +213,13 @@ impl Listener {
             match self.tcp.accept() {
                 Ok((tcp, peer)) => {
                     tcp.set_nonblocking(true).map_err(|e| rejection(protocol::UNREACHABLE, e.to_string()))?;
+                    let fd = tcp.into_raw_fd();
+                    let conn = Conn::of(fd)?;
                     return Ok(vec![
-                        CapnwebValue::custom(Fd(tcp.into_raw_fd())),
+                        CapnwebValue::custom(Fd(fd)),
                         CapnwebValue::String(peer.ip().to_string()),
                         CapnwebValue::Number(f64::from(peer.port())),
+                        CapnwebValue::Target(Arc::new(conn)),
                     ]);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -186,8 +235,9 @@ impl Listener {
 
 #[rpc_target]
 impl Provider {
-    /// `connect(ip, port)`: the connected socket, nonblocking, passed in; or a rejection.
-    async fn connect(&self, ip: String, port: f64) -> Result<CapnwebValue> {
+    /// `connect(ip, port)`: the connected socket, nonblocking, passed in, and its [`Conn`]; or a
+    /// rejection.
+    async fn connect(&self, ip: String, port: f64) -> Result<Vec<CapnwebValue>> {
         let ip: IpAddr = ip.parse().map_err(|_| Error::Type(format!("connect: {ip:?} is not an IP address")))?;
         if !(0.0..=65535.0).contains(&port) || port.fract() != 0.0 {
             return Err(Error::Type(format!("connect: port {port}")));
@@ -206,8 +256,10 @@ impl Provider {
         })?;
         tcp.set_nonblocking(true).map_err(|e| rejection(protocol::UNREACHABLE, e.to_string()))?;
         // Ours until sent; the transport closes nothing, so [`HostCtl::send_fds`] closes it once
-        // the sandbox has its copy.
-        Ok(CapnwebValue::custom(Fd(tcp.into_raw_fd())))
+        // the sandbox has its copy. The [`Conn`] keeps one for the sandbox's half-close and close.
+        let fd = tcp.into_raw_fd();
+        let conn = Conn::of(fd)?;
+        Ok(vec![CapnwebValue::custom(Fd(fd)), CapnwebValue::Target(Arc::new(conn))])
     }
 
     /// `listen(port)`: the listener of the port published for the guest's `port`; Denied if none

@@ -15,6 +15,8 @@
 //                         (EAI_NONAME); DENIED fails, not as a temporary failure
 //   listen PORT PEER      a listen on 0.0.0.0:PORT gets the host's connection from PEER, which
 //                         says "hello from the host"
+//   serve PORT            a listen on 0.0.0.0:PORT: one connection, "ping" read, "pong" written
+//                         (the network plugin's --publish: crates/unsharek/tests/netplugin.rs)
 #include "unsharek_test.h"
 #include <arpa/inet.h>
 #include <errno.h>
@@ -254,6 +256,22 @@ static void do_listen(char **a)
 	printf("listen: accepted the host's connection from %s\n", p);
 }
 
+static void serve(char **a)
+{
+	int l = socket(AF_INET, SOCK_STREAM, 0);
+	struct sockaddr_in at = { .sin_family = AF_INET, .sin_port = htons(atoi(a[0])) };
+	CHECK(bind(l, (struct sockaddr *)&at, sizeof(at)) == 0, "bind: %s", strerror(errno));
+	CHECK(listen(l, 4) == 0, "listen: %s", strerror(errno));
+	int c = accept(l, NULL, NULL);
+	CHECK(c >= 0, "accept: %s", strerror(errno));
+	char buf[8] = { 0 };
+	read_all(c, buf, 4);
+	CHECK(!memcmp(buf, "ping", 4), "read %.4s", buf);
+	CHECK(write(c, "pong", 4) == 4, "write: %s", strerror(errno));
+	close(c);
+	printf("serve: ping, pong\n");
+}
+
 int main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
@@ -270,6 +288,8 @@ int main(int argc, char **argv)
 		names(a);
 	else if (!strcmp(c, "refused"))
 		fails(a, ECONNREFUSED);
+	else if (!strcmp(c, "serve"))
+		serve(a);
 	else if (!strcmp(c, "denied"))
 		fails(a, EACCES);
 	else if (!strcmp(c, "reset"))

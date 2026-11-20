@@ -121,7 +121,7 @@ fn connects_under_all() {
     let server = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = server.local_addr().unwrap().port();
     let (ctl, pid) = provider(Policy::All);
-    let fd = with_client(ctl, |c| Box::pin(c.connect(IpAddr::V4(Ipv4Addr::LOCALHOST), port))).expect("connect");
+    let (fd, _conn) = with_client(ctl, |c| Box::pin(c.connect(IpAddr::V4(Ipv4Addr::LOCALHOST), port))).expect("connect");
     let (mut peer, _) = server.accept().unwrap();
     // SAFETY: the received socket, ours now.
     let mut s = unsafe { std::net::TcpStream::from_raw_fd(fd) };
@@ -148,7 +148,7 @@ fn public_denies_local_and_private() {
         })
     });
     for (ip, r) in ips.iter().zip(got) {
-        assert_eq!(r, Err(Some(protocol::DENIED)), "{ip}");
+        assert_eq!(r.map(|r| r.0), Err(Some(protocol::DENIED)), "{ip}");
     }
     end(ctl, pid);
 }

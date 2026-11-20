@@ -36,6 +36,9 @@ libc.workspace = true
 thiserror.workspace = true
 # The TCB: lockdown's checks and the filter (crates/unsharek-tcb/ at the repository's root)
 unsharek-tcb = { path = "../unsharek-tcb" }
+# Plugin (experimental): the network provider and its protocol (src/provider.rs)
+unsharek-net = { path = "../unsharek-net" }
+capnweb = { package = "capnweb-rs", path = "../../vendor/capnweb-rs", default-features = false, features = ["std"] }
 [features]
 tokio = ["dep:tokio"]
 # The runtime's measurement counters, printed at the sandbox's end (unsharek-rt's src/stats.rs).

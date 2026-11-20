@@ -42,6 +42,7 @@ mod image;
 mod memory;
 pub mod hostfs;
 pub mod net;
+pub mod provider;
 pub mod setup;
 pub mod store;
 

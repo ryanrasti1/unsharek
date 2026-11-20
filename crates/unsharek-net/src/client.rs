@@ -61,15 +61,17 @@ impl<S: PacketSocket> Client<S> {
         }
     }
 
-    /// `connect(ip, port)`: the connected socket's fd, received.
-    pub fn connect(self: &Arc<Self>, ip: IpAddr, port: u16) -> impl Future<Output = Result<RawFd, Rejection>> + Send + use<S> {
+    /// `connect(ip, port)`: the connected socket's fd, received, and its `Conn` (the half-close;
+    /// released, the close).
+    pub fn connect(self: &Arc<Self>, ip: IpAddr, port: u16) -> impl Future<Output = Result<(RawFd, RpcStub), Rejection>> + Send + use<S> {
         let this = Arc::clone(self);
         capnweb::runtime::scope(Arc::clone(&self.runtime), async move {
             let main = this.main()?;
             let args = vec![CapnwebValue::String(ip.to_string()), CapnwebValue::Number(f64::from(port))];
             let call = main.call(vec![protocol::CONNECT.to_owned()], RpcPayload::from_app_params(CapnwebValue::Array(args)));
-            let value = call.pull().await.map_err(|e| rejection(&e))?;
-            value.downcast_custom::<Fd>().map(|fd| fd.0).map_err(|_| None)
+            let CapnwebValue::Array(v) = call.pull().await.map_err(|e| rejection(&e))? else { return Err(None) };
+            let [fd, CapnwebValue::Stub(conn)] = &v[..] else { return Err(None) };
+            Ok((fd.downcast_custom::<Fd>().map_err(|_| None)?.0, conn.clone()))
         })
     }
 
@@ -91,15 +93,27 @@ impl<S: PacketSocket> Client<S> {
     }
 
     /// The listener's next connection: its fd, received, and its peer.
-    pub fn accept(&self, listener: &RpcStub) -> impl Future<Output = Result<(RawFd, std::net::SocketAddr), Rejection>> + Send + use<S> {
-        let call = listener.call(vec![protocol::ACCEPT.to_owned()], RpcPayload::from_app_params(CapnwebValue::Array(vec![])));
+    pub fn accept(&self, listener: &RpcStub) -> impl Future<Output = Result<(RawFd, std::net::SocketAddr, RpcStub), Rejection>> + Send + use<S> {
+        // The call made inside the scope: made outside, its session work would go to capnweb-rs's
+        // default runtime (a thread), not the caller's.
+        let listener = listener.clone();
         capnweb::runtime::scope(Arc::clone(&self.runtime), async move {
+            let call = listener.call(vec![protocol::ACCEPT.to_owned()], RpcPayload::from_app_params(CapnwebValue::Array(vec![])));
             let CapnwebValue::Array(v) = call.pull().await.map_err(|e| rejection(&e))? else { return Err(None) };
-            let [fd, ip, port] = &v[..] else { return Err(None) };
+            let [fd, ip, port, CapnwebValue::Stub(conn)] = &v[..] else { return Err(None) };
             let fd = fd.downcast_custom::<Fd>().map_err(|_| None)?.0;
             let (CapnwebValue::String(ip), CapnwebValue::Number(port)) = (ip, port) else { return Err(None) };
             let ip: IpAddr = ip.parse().map_err(|_| None)?;
-            Ok((fd, std::net::SocketAddr::new(ip, *port as u16)))
+            Ok((fd, std::net::SocketAddr::new(ip, *port as u16), conn.clone()))
+        })
+    }
+
+    /// `conn.shutdownWrite()`: the half-close of a connection the provider passed in.
+    pub fn shutdown_write(&self, conn: &RpcStub) -> impl Future<Output = ()> + Send + use<S> {
+        let conn = conn.clone();
+        capnweb::runtime::scope(Arc::clone(&self.runtime), async move {
+            let call = conn.call(vec![protocol::SHUTDOWN_WRITE.to_owned()], RpcPayload::from_app_params(CapnwebValue::Array(vec![])));
+            let _ = call.pull().await;
         })
     }
 
