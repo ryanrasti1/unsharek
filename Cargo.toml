@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["examples", "tcb", "native/build", "native/erofs", "native/exobox", "native/fixtures", "native/guest-tests", "native/lkl-sys", "native/rt"]
+members = ["examples", "crates/tcb", "crates/build", "crates/erofs", "crates/exobox", "crates/fixtures", "crates/guest-tests", "crates/lkl-sys", "crates/rt"]
 # its own workspace (its own repository to be): exobox-tcb depends on it by path
 exclude = ["seccomp-fn"]
 
@@ -16,7 +16,7 @@ clap = { version = "4", features = ["derive"] }
 rustix = { version = "1", default-features = false }
 syscalls = "0.6"
 thiserror = "2"
-# native/lkl-sys's build.rs: Rust declarations from the kernel's headers
+# crates/lkl-sys's build.rs: Rust declarations from the kernel's headers
 bindgen = { version = "0.73", default-features = false, features = ["runtime"] }
 # tests
 cc = "1"

@@ -1,7 +1,7 @@
 # exobox's Nix library, without flakes: `import ./nix/lib.nix { inherit pkgs; }` gives
 # `exoboxKernel` and `mkExobox`, the same functions the flake's `lib` has (flake.nix imports this).
-# The kernel's default source is the submodule lkl/linux: a checkout of exobox used this way needs
-# it checked out (`git submodule update --init lkl/linux`, or a recursive clone).
+# The kernel's default source is the submodule crates/lkl-sys/linux: a checkout of exobox used this way needs
+# it checked out (`git submodule update --init crates/lkl-sys/linux`, or a recursive clone).
 # `seccompFn` is seccomp-fn's flake's `lib` (Kani, kaniCheck); the flake passes its input's.
 { pkgs, seccompFn ? (builtins.getFlake (toString ../seccomp-fn)).lib }:
 let
@@ -10,17 +10,20 @@ let
   system = pkgs.stdenv.hostPlatform.system;
 
   # What cargo reads, for the package and the proof: a change to the docs (READMEs,
-  # native/DEPS.md) or the flake doesn't rebuild. In a git tree, only tracked files (not target/
+  # DEPS.md) or the flake doesn't rebuild. In a git tree, only tracked files (not target/
   # or .cache/).
   src = fs.toSource {
     root = ../.;
     fileset = fs.unions [
       ../Cargo.toml
       ../Cargo.lock
-      (fs.difference ../native (fs.fileFilter (f: f.hasExt "md") ../native))
-      # exobox-tcb, the TCB (its own repository to be)
-      # (its README too: a test checks its allowlist table against the filter)
-      ../tcb
+      # the crates, without their docs or the kernel's source (the kernel is its own derivation)
+      (fs.difference ../crates (fs.unions [
+        (fs.fileFilter (f: f.hasExt "md") ../crates)
+        (fs.maybeMissing ../crates/lkl-sys/linux)
+      ]))
+      # exobox-tcb's README: a test checks its allowlist table against the filter
+      ../crates/tcb/README.md
       # seccomp-fn, the filter's compiler and proof (its own repository to be)
       (fs.difference ../seccomp-fn (fs.maybeMissing ../seccomp-fn/target))
       # A workspace member: cargo loads every member's manifest, built or not (the
@@ -44,12 +47,12 @@ let
     runs = [ [ "-p" "exobox-tcb" "-j" "--output-format=terse" ] ];
   };
 
-  # The kernel, built once by lkl/Makefile as its own derivation, in the layout lkl-sys's
-  # build.rs takes as EXOBOX_LKL_PREBUILT (lkl/Makefile's `install`): liblkl-kernel.a, lkl.o,
+  # The kernel, built once by crates/lkl-sys/Makefile as its own derivation, in the layout lkl-sys's
+  # build.rs takes as EXOBOX_LKL_PREBUILT (crates/lkl-sys/Makefile's `install`): liblkl-kernel.a, lkl.o,
   # liblkl-posix.a (lkl-sys's boot test, run in mkExobox's checkPhase), include/, and the
-  # expanded .config. `config` is a fragment of kernel config lines over lkl/defconfig (later
+  # expanded .config. `config` is a fragment of kernel config lines over crates/lkl-sys/defconfig (later
   # lines win: "CONFIG_SYSVIPC=y\n", or "# CONFIG_X is not set\n").
-  exoboxKernel = { src ? ../lkl/linux, config ? "" }:
+  exoboxKernel = { src ? ../crates/lkl-sys/linux, config ? "" }:
     pkgs.stdenv.mkDerivation {
       pname = "exobox-kernel";
       version = src.shortRev or "0";
@@ -57,8 +60,8 @@ let
       # Only the Makefile and the defconfig: an edit elsewhere in the repository doesn't rebuild
       # the kernel.
       lkl = fs.toSource {
-        root = ../lkl;
-        fileset = fs.unions [ ../lkl/Makefile ../lkl/defconfig ];
+        root = ../crates/lkl-sys;
+        fileset = fs.unions [ ../crates/lkl-sys/Makefile ../crates/lkl-sys/defconfig ];
       };
       # A file, as in a dev build's EXOBOX_LKL_CONFIG (empty: the defconfig alone).
       fragment = pkgs.writeText "exobox-kernel-fragment.config" config;
@@ -87,7 +90,7 @@ let
         chmod -R u+w scripts arch/lkl/scripts tools/lkl
         patchShebangs scripts arch/lkl/scripts tools/lkl
       '';
-      # lkl/Makefile passes the outer make's jobserver on to kbuild.
+      # crates/lkl-sys/Makefile passes the outer make's jobserver on to kbuild.
       buildPhase = ''
         runHook preBuild
         make -C $lkl -j$NIX_BUILD_CORES EXOBOX_LKL_SRC=$PWD KOUT=$NIX_BUILD_TOP/kout \

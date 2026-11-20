@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Build incrementally and run every test: the unit tests, the in-guest tests (native/guest-tests:
-# a sandbox per test) and the host-side suite (native/exobox/tests/suite.rs), natively and in each
+# Build incrementally and run every test: the unit tests, the in-guest tests (crates/guest-tests:
+# a sandbox per test) and the host-side suite (crates/exobox/tests/suite.rs), natively and in each
 # mode. Seconds, warm. Arguments go to cargo-nextest, e.g.:
 #   ./test -E 'test(/::fork$/)'      one mode of the suite
 #   ./test -E 'binary(guest_fork)'   the in-guest tests in fork mode
 #   ./test -E 'test(/^escape/)'      the filter's cases
 #   ./test --no-fail-fast            (the default stops at the first failure)
 #   ./test --perf                    the performance budgets instead (tests/perf.rs; tens of seconds)
-#   ./test --vs-native               each mode against native on build workloads (native/bench/quick.py)
+#   ./test --vs-native               each mode against native on build workloads (bench/quick.py)
 #   ./test --prove                   Kani's proofs: each #[seccomp] function equal to its program
 #                                    (seccomp-fn's examples, exobox-tcb's policy); minutes
 set -euo pipefail
@@ -23,9 +23,9 @@ if [[ "${1:-}" == --prove ]]; then
 fi
 if [[ "${1:-}" == --vs-native ]]; then
   # Where each mode stands against native on the workloads that matter, in seconds
-  # (native/bench/quick.py); not a correctness test.
+  # (bench/quick.py); not a correctness test.
   shift
-  exec "$root/native/bench/quick" "$@"
+  exec "$root/bench/quick" "$@"
 fi
 profile=default
 build=()

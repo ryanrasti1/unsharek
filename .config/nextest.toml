@@ -1,7 +1,7 @@
 # Wrapper scripts (experimental in nextest 0.9): the guest tests' run-wrappers, below.
 experimental = ["wrapper-scripts"]
 
-# Each trial bounds itself (native/exobox/tests/suite.rs: per-case timeouts of seconds); this is the
+# Each trial bounds itself (crates/exobox/tests/suite.rs: per-case timeouts of seconds); this is the
 # backstop for anything that doesn't, and for the unit tests.
 [profile.default]
 default-filter = "not binary(perf)"
@@ -10,7 +10,7 @@ failure-output = "immediate-final"
 status-level = "fail"
 final-status-level = "fail"
 
-# ./test --perf: the budgets (native/exobox/tests/perf.rs), one at a time so they don't load each
+# ./test --perf: the budgets (crates/exobox/tests/perf.rs), one at a time so they don't load each
 # other, each printing its measurements.
 [profile.perf]
 default-filter = "binary(perf)"
@@ -18,17 +18,17 @@ test-threads = 1
 slow-timeout = { period = "30s", terminate-after = 4 }
 success-output = "immediate"
 
-# The guest tests (native/guest-tests): one source, four test binaries. guest_native runs as is
+# The guest tests (crates/guest-tests): one source, four test binaries. guest_native runs as is
 # (which checks the tests themselves); each of the others runs every test in a sandbox of its own,
 # in its mode. Listing (--list) runs natively: no list-wrapper.
 [scripts.wrapper.guest-coroutine]
-command = { command-line = "native/guest-tests/run-in-guest coroutine", relative-to = "workspace-root" }
+command = { command-line = "crates/guest-tests/run-in-guest coroutine", relative-to = "workspace-root" }
 
 [scripts.wrapper.guest-threaded]
-command = { command-line = "native/guest-tests/run-in-guest threaded", relative-to = "workspace-root" }
+command = { command-line = "crates/guest-tests/run-in-guest threaded", relative-to = "workspace-root" }
 
 [scripts.wrapper.guest-fork]
-command = { command-line = "native/guest-tests/run-in-guest fork", relative-to = "workspace-root" }
+command = { command-line = "crates/guest-tests/run-in-guest fork", relative-to = "workspace-root" }
 
 [[profile.default.scripts]]
 filter = "binary(guest_coroutine)"

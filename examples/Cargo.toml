@@ -8,11 +8,11 @@ license.workspace = true
 publish = false
 
 [dependencies]
-exobox = { path = "../native/exobox" }
+exobox = { path = "../crates/exobox" }
 # setup: an image built from a directory
-exobox-erofs = { path = "../native/erofs" }
+exobox-erofs = { path = "../crates/erofs" }
 # threads: par_compute, a small C guest
-exobox-fixtures = { path = "../native/fixtures" }
+exobox-fixtures = { path = "../crates/fixtures" }
 # the parents' side: fds into children, wait4 for the sandbox's rusage
 libc.workspace = true
 # net-policy: the provider's streams
@@ -21,4 +21,4 @@ tempfile.workspace = true
 
 # the binaries' fixed-address link
 [build-dependencies]
-exobox-build = { path = "../native/build" }
+exobox-build = { path = "../crates/build" }

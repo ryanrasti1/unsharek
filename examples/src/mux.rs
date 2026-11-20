@@ -1,7 +1,7 @@
 //! A tiny multiplexing protocol for `net-policy`: every connect and lookup of a sandbox over ONE
 //! host fd (a socketpair end the sandbox holds as "net", `Guest::hold_fd_as`, which the hooks
 //! find with `cx.held`), to a proxy process at its other end. After
-//! `native/exobox/tests/net.rs`'s test provider.
+//! `crates/exobox/tests/net.rs`'s test provider.
 //!
 //! A frame is `id: u32 LE, op: u8, len: u32 LE, payload`. A connect or lookup is a request with a
 //! fresh id, answered by one reply; a connected stream's bytes and closes then go both ways under

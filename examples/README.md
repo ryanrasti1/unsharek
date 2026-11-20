@@ -47,7 +47,7 @@ wall time 19.8ms; peak PSS 22880 KB (sampled), max RSS 28016 KB
 
 Most of that PSS is Python's own. These binaries are linked as the `exobox` CLI is, at a fixed
 address, which saves a few hundred KB a sandbox: their `build.rs` calls
-`exobox_build::link_fixed_address()` (`native/build`), as any embedder's can.
+`exobox_build::link_fixed_address()` (`crates/build`), as any embedder's can.
 
 ## setup: composing the guest in setup closures
 

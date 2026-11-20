@@ -1,4 +1,4 @@
 [submodule "lkl/linux"]
-	path = lkl/linux
+	path = crates/lkl-sys/linux
 	url = git@github.com:ryanrasti/linux.git
 	branch = exobox-native

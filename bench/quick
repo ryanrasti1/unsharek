@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# The vs-native suite (bench/quick.py): enters the devshell, builds exobox and the fixtures
+# release (and the counters' build for `--variant stats`), runs. `./test --vs-native` comes here.
+# Arguments go to quick.py.
+set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=../devshell.sh
+source "$root/devshell.sh"
+cd "$root"
+# shellcheck source=build_exobox.sh
+source "$root/native/bench/build_exobox.sh"
+build_exobox "$@"
+cargo build --release -q -p exobox-fixtures
+exec python3 "$root/native/bench/quick.py" "$@"

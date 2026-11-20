@@ -113,8 +113,8 @@ locked.exec(&argv, &env)                               // the program; never ret
   provider's own process, never in a hook. Anything a hook decides, a compromised program can
   skip. The network's only part of the TCB is the held fds: which ones, and the filter pinning
   `read` and `write` to exactly them.
-- **Where isolation is.** In `exobox-tcb` (`tcb/`, its own crate: seccomp-fn and libc, nothing
-  of exobox's), about 620 lines with comments (its tests apart) ([tcb/README.md](tcb/README.md): the guarantee, what
+- **Where isolation is.** In `exobox-tcb` (`crates/tcb/`, its own crate: seccomp-fn and libc, nothing
+  of exobox's), about 620 lines with comments (its tests apart) ([crates/tcb/README.md](crates/tcb/README.md): the guarantee, what
   isn't guaranteed, the design and a review checklist). `Sandbox::configure_and_lockdown` takes
   the caller's grants and a `Confined` guest (its own fds, its mode, its gate's address) and, in
   order: checks there is exactly one thread; checks the guest's fds are eventfds (and in fork mode
@@ -128,16 +128,16 @@ locked.exec(&argv, &env)                               // the program; never ret
   pinned, KILL for the rest. Nothing else protects the host: the runtime, the guest kernel, the hooks, the store and
   exobox's API run in the process after lockdown (or decide only what the guest sees, before it),
   and a bug in them breaks the guest, never the host.
-- **Layers.** `exobox` (`native/exobox`: the API, the CLI and the batteries `setup`, `store`,
+- **Layers.** `exobox` (`crates/exobox`: the API, the CLI and the batteries `setup`, `store`,
   `net`, `alloc`) over `exobox-tcb`, and three internal crates, none of them trusted: `exobox-rt`
-  (`native/rt`, the runtime: boot, the gate, syscall user dispatch, the dispatcher, scheduler,
+  (`crates/rt`, the runtime: boot, the gate, syscall user dispatch, the dispatcher, scheduler,
   arena and loader; it knows nothing of the filter), `lkl-sys` (the kernel, the runtime's alone)
   and `exobox-erofs` (images). The CLI's `exobox run` is `exobox::run(Config)`: `Guest::boot`, the
   closure's images mapped, `mount_closure` in a `run` closure, `lockdown` with stdio granted,
   `exec`.
 - **Embedding.** exobox sets the process's global allocator (the hooks allocate after lockdown,
   from a region reserved at build). A binary that embeds it links at a fixed address as the CLI
-  does with one call in its `build.rs`, `exobox_build::link_fixed_address()` (`native/build`): a
+  does with one call in its `build.rs`, `exobox_build::link_fixed_address()` (`crates/build`): a
   PIE's relocations would cost each sandbox ~400 KB.
 
 Anything setup needs beyond that is code: in a `run` closure, or in the guest itself (a first program that
@@ -169,7 +169,7 @@ against threaded mode (`threads`), and the host filter refusing a hostile progra
 - **Lockdown.** Before anything the program brings runs (its exec, its interpreter, a `run`
   closure, the hooks' first task), exobox-tcb checks there is one thread, the guest's fds and
   every mapping, closes every fd not granted (`close_range`), turns core dumps off, drops
-  capabilities, sets `no_new_privs` and installs the filter (tcb/README.md). The runtime's host
+  capabilities, sets `no_new_privs` and installs the filter (crates/tcb/README.md). The runtime's host
   threads (threaded mode's kernel idler, then one per program thread) start after it, through the
   filter's one `clone`.
 - **The trap.** The SIGSYS frame is moved off the program's stack (Go makes syscalls with ~128
@@ -226,7 +226,7 @@ against threaded mode (`threads`), and the host filter refusing a hostile progra
   the host's monotonic one), makes `/proc`, `/dev` (its nodes 0666, devpts), `/tmp` and
   `/dev/shm`, seeds its RNG from the host, brings loopback up and makes fds 0-2 the host's stdio.
   With a network hook, `/etc/resolv.conf` and `/etc/hosts` are written when it is set, before setup.
-- **The kernel.** Stock LKL plus a short series (`lkl/README.md`): idle that waits instead of
+- **The kernel.** Stock LKL plus a short series (`crates/lkl-sys/README.md`): idle that waits instead of
   spinning, the program as PID 1, threads that join their process, a block device over host memory,
   host fds as guest files, fork and exec's kernel halves, socket impersonation, and the rest of what
   a cooperative in-process host needs.
@@ -270,8 +270,8 @@ Not yet, or known limits:
 | `rustc`, 16 codegen units (fork) | 1.57 s | 2.82x |
 | `make -j4`, 32 C files (fork) | 1.21 s | 3.19x |
 
-The goal is parallel builds within 5% of native. Where the time goes (`native/PERF.md`, measured
-with the counters in `native/bench`): the sandbox reports one CPU, so rustc compiles serially;
+The goal is parallel builds within 5% of native. Where the time goes (`bench/PERF.md`, measured
+with the counters in `bench`): the sandbox reports one CPU, so rustc compiles serially;
 the guest's one CPU token is taken for work that needs no kernel (futexes, `mprotect`), and handed
 to threads that are still asleep; and exec copies every program and library into the process's
 memory in threaded and fork mode, under the token. The kernel's own work is a small share (~0.3 s
@@ -280,7 +280,7 @@ what remains.
 
 ## Next
 
-1. The performance fixes above, in `native/PERF.md`'s order, remeasured after each.
+1. The performance fixes above, in `bench/PERF.md`'s order, remeasured after each.
 2. Fork mode's network: a forked process's hook calls forwarded to init's executor.
 3. Images from extents: `map_image` over an ordered list of {metadata | a range of a host file |
    zeros} (the kernel side and `exobox_erofs::synthesize` exist), so a closure's files are shown
@@ -296,15 +296,15 @@ what remains.
 ```sh
 ./test            # everything, incremental, seconds warm (cargo-nextest)
 ./test --perf     # the performance budgets against native
-native/bench/run --work rustc,make --modes native,fork   # build workloads, with counters
+bench/run --work rustc,make --modes native,fork   # build workloads, with counters
 ```
 
 `./test` enters the devshell (`flake.nix`, cached by `devshell.sh`) and builds the kernel out of
-tree on first use (about 20 s). The kernel's source is the submodule `lkl/linux` (stock LKL plus
-exobox's series, `lkl/README.md`), the same one `nix build` links: clone with
-`git clone --recurse-submodules`, or `git submodule update --init lkl/linux`. `EXOBOX_LKL_SRC`
+tree on first use (about 20 s). The kernel's source is the submodule `crates/lkl-sys/linux` (stock LKL plus
+exobox's series, `crates/lkl-sys/README.md`), the same one `nix build` links: clone with
+`git clone --recurse-submodules`, or `git submodule update --init crates/lkl-sys/linux`. `EXOBOX_LKL_SRC`
 names another checkout (a worktree's, whose own submodule isn't checked out). `EXOBOX_LKL_CONFIG`
-names a fragment of kernel config lines merged over `lkl/defconfig` (later lines win; a path
+names a fragment of kernel config lines merged over `crates/lkl-sys/defconfig` (later lines win; a path
 relative to the repository's root, or absolute). A change to any of them rebuilds what it touches:
 
 ```sh
@@ -318,7 +318,7 @@ one commit: the submodule's new commit, and whatever exobox needs for it (the ho
 table, when the host interface moved), until `./test` passes. See `AGENTS.md` for how to work on it.
 
 The distributed binary is one `nix build`. The kernel is its own derivation, built once (by
-`lkl/Makefile`, from the submodule) and linked by the Rust build (`EXOBOX_LKL_PREBUILT`):
+`crates/lkl-sys/Makefile`, from the submodule) and linked by the Rust build (`EXOBOX_LKL_PREBUILT`):
 
 ```sh
 nix build                # exobox and exobox-erofs, in ./result/bin
@@ -343,7 +343,7 @@ exobox.lib.mkExobox {
     config = ''
       CONFIG_SYSVIPC=y
     '';
-    # src = ./my-linux;  # default: the submodule lkl/linux
+    # src = ./my-linux;  # default: the submodule crates/lkl-sys/linux
   };
 }
 ```
