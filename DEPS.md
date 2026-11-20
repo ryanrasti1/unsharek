@@ -300,3 +300,14 @@ crate): stripped 9.30 MB.
 | fuse-backend-rs 0.14 (`fusedev`): vmm-sys-util, caps, bitflags, log, nix | virtiofsd's passthrough file system, as a library over byte buffers | the server process (plugin) | ~165 KB, plus ~105 KB of its generic code in unsharek-fs-server; caps ~11 KB |
 | landlock 0.4: enumflags2, thiserror | the server's confinement to its directory | the server process (plugin) | ~10 KB |
 | kernel: VIRTIO_MMIO, FUSE_FS, VIRTIO_FS | the guest's driver | lkl-sys's defconfig | ~180 KB |
+## The network plugin (2026-11-19): capnweb-rs, vendored (experimental)
+`--net public|all` and `--publish` (crates/unsharek/src/provider.rs, crates/unsharek-net): a
+provider process makes the connections, under its policy, and passes them in over a control
+socket, in Cap'n Web. capnweb-rs is a vendored copy (`vendor/capnweb-rs`, its patches in
+PATCHES.md: a packet transport an embedder's executor drives), without default features (no
+tokio, no stack growth) in the sandbox and with `local-runtime` in the provider.
+
+| Crate | For | Where | Cost noted |
+|---|---|---|---|
+| capnweb-rs (vendored path), with num-bigint, serde_json, hashbrown, spin, async-trait, futures | the control socket's protocol | unsharek (in the sandbox), unsharek-net (the provider) | +987 KB stripped release binary (8,834,600 B to 9,821,744 B, x86_64-unknown-linux-gnu, against the measurement above); `.text` by crate: capnweb 456 KiB, unsharek_net 71 KiB, num_bigint 61 KiB, serde_json 35 KiB |
+| unsharek-net (path) | the provider, its filter, the client | unsharek | in the line above |
