@@ -3,3 +3,4 @@
 /result*
 /.claude/
 __pycache__/
+/.direnv/

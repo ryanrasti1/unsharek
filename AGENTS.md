@@ -15,8 +15,12 @@
 
 ## Builds
 - During development every build is incremental: cargo for Rust and the test programs (build.rs),
-  make for the kernel. No `nix build` or `nix develop` in the loop: `./test` sources
-  `devshell.sh`, which caches the devshell's environment keyed on flake.nix and flake.lock.
+  make for the kernel. No `nix build` in the loop. The devshell is entered once: direnv with
+  nix-direnv (`.envrc`: cached, re-evaluated only when flake.nix or flake.lock change, and a GC
+  root). Without direnv, as an agent is: `nix develop -c cargo xtask test` (about 5 s to enter,
+  warm). In a worktree without the kernel submodule the flake can't be evaluated (it includes
+  the submodule): enter the main checkout's, `nix develop /path/to/checkout -c …`, and build
+  with `UNSHAREK_LKL_SRC` (below).
 - One `nix build` makes the distributed binary at the end. It is not part of the loop.
 - The kernel is the submodule `crates/lkl-sys/linux`. Kernel work happens there, on a branch of the kernel's
   repository; it lands in unsharek as the submodule's new commit plus unsharek's side of it, in one

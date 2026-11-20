@@ -68,7 +68,7 @@ Measured on stock LKL (`d0f76a77e`, Linux 6.12) with `crates/lkl-sys/defconfig`,
 | bindgen 0.73 (runtime only: no logging, no prettyplease) | Rust declarations from lkl.h: the host-operations table, the entry points, `__lkl__NR_*` | lkl-sys's build.rs | none at run time. Build: ~4.5 s of its dependency chain (syn, clang-sys, regex, nom, cexpr) on a cold build, in parallel with the rest; ~0.3 s to generate the bindings each time build.rs runs. Needs libclang at build time (devshell: `rustPlatform.bindgenHook`) |
 
 Tools in the devshell (not linked): libclang via `rustPlatform.bindgenHook` (sets `LIBCLANG_PATH` and
-`BINDGEN_EXTRA_CLANG_ARGS`; changing flake.nix refreshes devshell.sh's cached environment by
+`BINDGEN_EXTRA_CLANG_ARGS`; changing flake.nix refreshes direnv's cached environment by
 itself); objdump (binutils, already in the stdenv) for the `addr32 call` check.
 
 ## unsharek-rt arena tests (2026-11-18): property tests of the arena (crates/unsharek-rt/src/arena)

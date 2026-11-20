@@ -4,7 +4,7 @@ Small programs that use unsharek's library the way an application would. Each is
 `src/bin/`, runnable from the devshell:
 
 ```sh
-source devshell.sh                     # the toolchain, and $UNSHAREK_TEST_PYTHON & co.
+direnv allow   # or `nix develop`: the toolchain, and $UNSHAREK_TEST_PYTHON & co.
 cargo run -p unsharek-examples --release --bin nix-program
 ```
 

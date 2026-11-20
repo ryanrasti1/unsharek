@@ -49,7 +49,7 @@ pub fn nix_program(var: &str) -> PathBuf {
     match std::env::var_os(var) {
         Some(p) => p.into(),
         None => {
-            println!("skipped: ${var} is unset (run inside the devshell: `source devshell.sh`)");
+            println!("skipped: ${var} is unset (run inside the devshell: direnv, or `nix develop`)");
             std::process::exit(0)
         }
     }

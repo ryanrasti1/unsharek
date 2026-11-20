@@ -66,10 +66,10 @@
           erofs-utils
           # bindgen's libclang for crates/lkl-sys: sets LIBCLANG_PATH, and BINDGEN_EXTRA_CLANG_ARGS
           # to the C compiler's include paths (a bare libclang finds neither glibc's headers nor
-          # its own stddef.h). Its setup hook runs when the shell is entered, so devshell.sh's
-          # cached environment has both.
+          # its own stddef.h). Its setup hook runs when the shell is entered (direnv, or
+          # nix develop), so the environment has both.
           rustPlatform.bindgenHook
-          # ./test --prove: cargo kani
+          # cargo xtask prove: cargo kani
           kani
         ];
 
@@ -79,7 +79,7 @@
         UNSHAREK_TEST_PYTHON = "${pkgs.python3}/bin/python3";
         # a C++ program for the pipeline case (suite: pipeline_cpp)
         UNSHAREK_TEST_PATCHELF = "${pkgs.patchelf}/bin/patchelf";
-        # ./test --perf (crates/unsharek/tests/perf.rs): parallel work and a C build
+        # cargo xtask perf (crates/unsharek/tests/perf.rs): parallel work and a C build
         UNSHAREK_TEST_XZ = "${pkgs.xz}/bin/xz";
         UNSHAREK_TEST_MAKE = "${pkgs.gnumake}/bin/make";
         UNSHAREK_TEST_GCC = "${pkgs.gcc}/bin/gcc";
@@ -93,8 +93,6 @@
         UNSHAREK_TEST_HTTPBIN = "${tp.httpbin}/bin/go-httpbin";
         UNSHAREK_TEST_BUSYBOX = "${tp.busybox}/bin/busybox";
         UNSHAREK_GLIBC_STATIC = "${pkgs.glibc.static}/lib";
-        # Marks this shell, so ./test runs inside it directly.
-        UNSHAREK_DEVSHELL = "1";
       };
     };
 }

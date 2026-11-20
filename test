@@ -13,8 +13,6 @@
 #                                    filter, a harness per mode); minutes
 set -euo pipefail
 root="$(cd "$(dirname "$0")" && pwd)"
-# shellcheck source=devshell.sh
-source "$root/devshell.sh"
 cd "$root"
 if [[ "${1:-}" == --prove ]]; then
   shift
