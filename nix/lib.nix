@@ -26,6 +26,8 @@ let
       ../crates/unsharek-tcb/README.md
       # seccomp-fn, the filter's compiler and proof (its own repository to be)
       (fs.difference ../seccomp-fn (fs.maybeMissing ../seccomp-fn/target))
+      # capnweb-rs, vendored with the network plugin's transport (vendor/capnweb-rs/PATCHES.md)
+      ../vendor
       # A workspace member: cargo loads every member's manifest, built or not (the
       # package failed to build without it).
       (fs.difference ../examples (fs.fileFilter (f: f.hasExt "md") ../examples))
@@ -94,6 +96,12 @@ let
           while IFS= read -r -d "" f; do cp --remove-destination "$(readlink "$f")" "$f"; done
         chmod -R u+w scripts arch/lkl/scripts tools/lkl
         patchShebangs scripts arch/lkl/scripts tools/lkl
+        # The network plugin's host-fd connections, until they land on the kernel branch
+        # (crates/lkl-sys/tsi-hostfd.patch): its files real copies, then patched.
+        for f in $(grep '^+++ b/' ${../crates/lkl-sys/tsi-hostfd.patch} | cut -f1 | sed 's#^+++ b/##'); do
+          cp --remove-destination "$(readlink "$f")" "$f"; chmod u+w "$f"
+        done
+        patch -p1 < ${../crates/lkl-sys/tsi-hostfd.patch}
       '';
       # crates/lkl-sys/Makefile passes the outer make's jobserver on to kbuild.
       buildPhase = ''
