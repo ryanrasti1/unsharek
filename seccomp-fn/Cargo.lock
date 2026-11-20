@@ -31,16 +31,18 @@ name = "seccomp-fn"
 version = "0.0.0"
 dependencies = [
  "libc",
- "seccomp-fn-macros",
+ "proc-macro2",
+ "quote",
+ "seccomp-fn-verify",
+ "syn",
 ]
 
 [[package]]
-name = "seccomp-fn-macros"
+name = "seccomp-fn-verify"
 version = "0.0.0"
 dependencies = [
- "proc-macro2",
- "quote",
- "syn",
+ "libc",
+ "seccomp-fn",
 ]
 
 [[package]]

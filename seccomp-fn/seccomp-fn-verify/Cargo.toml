@@ -1,0 +1,17 @@
+[package]
+name = "seccomp-fn-verify"
+description = "The proof that a seccomp policy's program is the policy: classic BPF as the kernel runs it, and the Kani harness (the only part of seccomp-fn to review)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# seccomp_data, sock_filter, the opcodes
+libc = "0.2"
+
+[dev-dependencies]
+seccomp-fn = { path = "../seccomp-fn" }
+
+[lints]
+workspace = true

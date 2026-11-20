@@ -71,7 +71,7 @@
           meta.description = "Kani ${version}, its bundle and toolchain";
         };
 
-      # A derivation that runs `cargo kani` on a crate's `#[seccomp]` harnesses (each function
+      # A derivation that runs `cargo kani` on a crate's `policy!` harnesses (each policy function
       # equal to its program, for every input and every param) and fails if any proof fails.
       # `src` is a Cargo workspace, `cargoLock` its lock file (its dependencies are vendored from
       # it: no network); each of `runs` is one `cargo kani` invocation's arguments, from `src`'s
@@ -107,7 +107,7 @@
       src = pkgs.lib.fileset.toSource {
         root = ./.;
         # not target/ (a build outside a git tree sees it)
-        fileset = pkgs.lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./seccomp-fn ./seccomp-fn-macros ];
+        fileset = pkgs.lib.fileset.unions [ ./Cargo.toml ./Cargo.lock ./seccomp-fn ./seccomp-fn-verify ./examples ];
       };
 
       # seccomp-fn's own examples, proven.
@@ -115,7 +115,7 @@
         name = "seccomp-fn-proof";
         inherit src;
         cargoLock = ./Cargo.lock;
-        runs = [ [ "-p" "seccomp-fn" "-j" "--output-format=terse" ] ];
+        runs = [ [ "-p" "seccomp-fn" "--tests" "-j" "--output-format=terse" ] ];
       };
     in
     {

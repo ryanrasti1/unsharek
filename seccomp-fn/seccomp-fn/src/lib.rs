@@ -1,343 +1,612 @@
-//! A seccomp filter written as a plain Rust function, compiled to classic BPF by `#[seccomp]`,
-//! and proven by Kani to give the function's verdict on every input.
+//! `compile!(policy(args…))`: the seccomp policy `policy`, a plain Rust function of this file
 //!
-//! See README.md: the claim, the subset, the review checklist.
+//! ```ignore
+//! pub fn policy(pid: u64, strict: bool) -> impl Fn(&libc::seccomp_data) -> u32 {
+//!     move |d| { /* the subset */ }
+//! }
+//! pub fn filter(pid: u64, strict: bool) -> Vec<libc::sock_filter> {
+//!     seccomp_fn::compile!(policy(pid, strict))
+//! }
+//! ```
 //!
-//! What is trusted: [`run_bpf`] (classic BPF as the kernel runs it, short enough to read, and
-//! checked against the kernel by `tests/kernel.rs`), Kani, and rustc. The macro and [`Builder`]
-//! are not: the proof the macro emits (`<name>_is_its_bpf`, under `cfg(kani)`) checks what they
-//! built, for every `SeccompData` and every parameter.
+//! compiled to classic BPF: the macro reads its call's own file (`Span::local_file`), finds
+//! `fn policy` there (at the top level or in an inline `mod`), and compiles the closure it
+//! returns, its params bound to the call's arguments. No macro touches `policy`: rustc compiles
+//! it as written.
+//!
+//! **Not trusted.** Nothing here is part of the claim: `seccomp-fn-verify` proves (Kani) that
+//! the program gives the function's verdict on every input. This crate is only the compiler.
+//!
+//! The output: each condition without `d` (`if threads`, a guard's `fork && …`) is decided when
+//! the program is built, so the program has one shape per combination of their values; each
+//! shape is a function returning a fixed-length array of instructions whose `k` fields are the
+//! params' values (patched in: computed from the arguments as the array is built), made a `Vec`
+//! at the end. No runtime library: the types are
+//! libc's (`libc::sock_filter`), so the calling crate depends on `libc`.
+//!
+//! The subset (anything else is a compile error naming it): `if`/`else`, `return`, `match` on
+//! `d.nr` (or `d.nr as i64`; literal or const patterns, `|`, `_`, guards), `let` of an
+//! expression without `d`; conditions are `&&`, `||`, `!`, parentheses, comparisons of a field
+//! of `d` (`d.nr` and `d.nr as u32`, `d.arch`, `d.instruction_pointer`, `d.args[i]`) with an
+//! expression without `d`, and expressions without `d`. Values returned are expressions
+//! without `d`.
 
-pub use seccomp_fn_macros::seccomp;
+use proc_macro::TokenStream;
+use proc_macro2::{Span, TokenStream as Ts, TokenTree};
+use quote::{format_ident, quote};
+use syn::spanned::Spanned;
+use syn::{BinOp, Block, Expr, FnArg, Ident, ItemFn, Lit, Pat, Stmt, UnOp};
 
-// The macro's code names `::seccomp_fn`, here too.
-extern crate self as seccomp_fn;
+type R<T> = syn::Result<T>;
 
-pub mod examples;
-
-/// Outside the subset: each a compile error naming the construct.
-///
-/// A call on `d`:
-/// ```compile_fail
-/// # use seccomp_fn::*;
-/// #[seccomp]
-/// fn f(d: &SeccompData) -> u32 { if [0u64, 1].contains(&d.args[0]) { return 1; } 0 }
-/// ```
-/// A call on `d` in a match guard:
-/// ```compile_fail
-/// # use seccomp_fn::*;
-/// #[seccomp]
-/// fn f(d: &SeccompData) -> u32 { match d.nr { 1 if d.args.iter().any(|&a| a == 0) => 1, _ => 0 } }
-/// ```
-/// A signed param (BPF compares unsigned):
-/// ```compile_fail
-/// # use seccomp_fn::*;
-/// #[seccomp]
-/// fn f(d: &SeccompData, x: i64) -> u32 { if d.args[0] == x as u64 { return 1; } 0 }
-/// ```
-/// A signed value compared with a field:
-/// ```compile_fail
-/// # use seccomp_fn::*;
-/// const X: i64 = 5;
-/// #[seccomp]
-/// fn f(d: &SeccompData) -> u32 { if d.args[0] == X as u64 && d.args[1] == X { return 1; } 0 }
-/// ```
-/// A loop:
-/// ```compile_fail
-/// # use seccomp_fn::*;
-/// #[seccomp]
-/// fn f(d: &SeccompData) -> u32 { for i in 0..6 { if d.args[i] == 0 { return 1; } } 0 }
-/// ```
-/// And the same function within the subset compiles:
-/// ```
-/// # use seccomp_fn::*;
-/// #[seccomp]
-/// fn f(d: &SeccompData, x: u64) -> u32 { match d.nr { 1 if d.args[0] == x => 1, _ => 0 } }
-/// ```
-pub mod subset {}
-
-/// One classic-BPF instruction: libc's `struct sock_filter` (include/uapi/linux/filter.h).
-pub type SockFilter = libc::sock_filter;
-
-mod bpf;
-pub use bpf::{MAX_INSNS, SeccompData, run_bpf};
-use bpf::*;
-
-/// A field of [`SeccompData`] a program compares.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Field {
-    Nr,
-    Arch,
-    InstructionPointer,
-    Arg(usize),
+fn err<T>(s: impl Spanned, what: &str) -> R<T> {
+    Err(syn::Error::new(s.span(), format!("seccomp_fn::compile!: {what} is outside the subset")))
 }
 
-impl Field {
-    /// Its words' offsets in `seccomp_data`, libc's: (low, high); a 32-bit field's are the same.
-    fn offsets(self) -> (u32, u32) {
-        match self {
-            Field::Nr => (OFF_NR, OFF_NR),
-            Field::Arch => (OFF_ARCH, OFF_ARCH),
-            Field::InstructionPointer => OFF_IP,
-            Field::Arg(i) => off_arg(i),
-        }
+#[proc_macro]
+pub fn compile(input: TokenStream) -> TokenStream {
+    let call = syn::parse_macro_input!(input as syn::ExprCall);
+    match expand(&call) {
+        Ok(t) => t.into(),
+        Err(e) => e.to_compile_error().into(),
     }
+}
 
-    pub fn wide(self) -> bool {
-        matches!(self, Field::InstructionPointer | Field::Arg(_))
-    }
-
-    pub fn set(self, d: &mut SeccompData, v: u64) {
-        match self {
-            Field::Nr => d.nr = v as u32,
-            Field::Arch => d.arch = v as u32,
-            Field::InstructionPointer => d.instruction_pointer = v,
-            Field::Arg(i) => d.args[i] = v,
+/// Every `fn name` in `items` and the inline `mod`s among them, at any depth.
+fn find_all<'a>(items: &'a [syn::Item], name: &Ident, out: &mut Vec<&'a ItemFn>) {
+    for i in items {
+        match i {
+            syn::Item::Fn(f) if f.sig.ident == *name => out.push(f),
+            syn::Item::Mod(m) => {
+                if let Some((_, inner)) = &m.content {
+                    find_all(inner, name, out);
+                }
+            }
+            _ => {}
         }
     }
 }
 
-/// A comparison of a field with a value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Cmp {
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
+/// The `fn` the call names in the file: by its path from the file's root through inline `mod`s
+/// (`compile!(table::policy(…))`: `mod table`'s `fn policy`), or, a bare name, the one `fn` of
+/// that name anywhere in the file (two are an error: the call must name its module). A proc
+/// macro can't see where it is called from, so the path, not the call's place, says.
+fn find<'a>(items: &'a [syn::Item], path: &syn::Path) -> R<&'a ItemFn> {
+    let segs: Vec<&Ident> = path.segments.iter().map(|s| &s.ident).filter(|i| *i != "self" && *i != "crate").collect();
+    let (name, mods) = segs.split_last().expect("a path has a name");
+    let mut items = items;
+    for m in mods {
+        items = items
+            .iter()
+            .find_map(|i| match i {
+                syn::Item::Mod(x) if x.ident == **m => x.content.as_ref().map(|(_, inner)| &inner[..]),
+                _ => None,
+            })
+            .ok_or_else(|| syn::Error::new(m.span(), format!("seccomp_fn::compile!: no inline `mod {m}` in the file on the call's path")))?;
+    }
+    if !mods.is_empty() {
+        return items
+            .iter()
+            .find_map(|i| match i {
+                syn::Item::Fn(f) if f.sig.ident == **name => Some(f),
+                _ => None,
+            })
+            .ok_or_else(|| syn::Error::new(name.span(), format!("seccomp_fn::compile!: no `fn {name}` at the call's path in the file")));
+    }
+    let mut all = vec![];
+    find_all(items, name, &mut all);
+    match all.as_slice() {
+        [f] => Ok(f),
+        [] => Err(syn::Error::new(name.span(), format!("seccomp_fn::compile!: no `fn {name}` in the call's file (a plain fn of that file)"))),
+        _ => Err(syn::Error::new(
+            name.span(),
+            format!("seccomp_fn::compile!: {} `fn {name}`s in the call's file: name its module from the file's root (`compile!(m::{name}(…))`)", all.len()),
+        )),
+    }
+}
+
+fn expand(call: &syn::ExprCall) -> R<Ts> {
+    let Expr::Path(p) = &*call.func else { return err(&call.func, "a call of anything but a function by name") };
+    let name = p.path.segments.last().map(|s| s.ident.clone()).expect("a path has a name");
+    let file = Span::call_site().unwrap().local_file().ok_or_else(|| {
+        syn::Error::new(Span::call_site(), "seccomp_fn::compile!: the call's file isn't known (macro expanded from no file)")
+    })?;
+    let src = std::fs::read_to_string(&file)
+        .map_err(|e| syn::Error::new(Span::call_site(), format!("seccomp_fn::compile!: reading {}: {e}", file.display())))?;
+    let ast = syn::parse_file(&src).map_err(|e| syn::Error::new(Span::call_site(), format!("seccomp_fn::compile!: parsing {}: {e}", file.display())))?;
+    let f = find(&ast.items, &p.path)?;
+    // the params, bound to the call's arguments
+    let (mut binds, mut params, mut typed) = (vec![], vec![], vec![]);
+    if f.sig.inputs.len() != call.args.len() {
+        return err(&call.args, &format!("a call with {} arguments of `{name}`, which takes {}", call.args.len(), f.sig.inputs.len()));
+    }
+    for (a, v) in f.sig.inputs.iter().zip(&call.args) {
+        let FnArg::Typed(t) = a else { return err(a, "a receiver") };
+        let Pat::Ident(i) = &*t.pat else { return err(&t.pat, "a parameter pattern") };
+        let (n, ty) = (&i.ident, &t.ty);
+        binds.push(quote!(let #n: #ty = #v;));
+        params.push(n.clone());
+        typed.push(quote!(#n: #ty));
+    }
+    // the closure it returns: its block's only expression
+    let closure = match f.block.stmts.as_slice() {
+        [Stmt::Expr(Expr::Closure(c), None)] => c,
+        _ => return err(&f.block, &format!("`fn {name}` whose body isn't a closure (`move |d| {{ … }}`)")),
+    };
+    let d = match closure.inputs.first() {
+        Some(Pat::Ident(i)) => i.ident.clone(),
+        Some(Pat::Type(t)) => match &*t.pat {
+            Pat::Ident(i) => i.ident.clone(),
+            p => return err(p, "a closure parameter other than `d`"),
+        },
+        _ => return err(closure, "a closure without its one parameter `d`"),
+    };
+    if closure.inputs.len() != 1 {
+        return err(&closure.inputs, "a closure of more than `d`");
+    }
+    let body: Block = match &*closure.body {
+        Expr::Block(b) => b.block.clone(),
+        e => syn::parse_quote!({ #e }),
+    };
+    // First pass: the lets (hoisted: each is an expression without `d`) and the switches (each
+    // distinct condition without `d`, by its text).
+    let mut cx = Cx { d, switches: vec![], values: None, lets: vec![], asm: Asm::default() };
+    cx.block(&body, &Pos::Tail)?;
+    let switches = cx.switches.clone();
+    if switches.len() > 6 {
+        return err(&body, "more than 6 conditions without `d`");
+    }
+    let lets = std::mem::take(&mut cx.lets);
+    // A function per shape returning its program as an array (its length fixed: what the proof
+    // runs is a constant-length program, its `k` fields the params'), the Vec made at the end.
+    let (mut arms, mut shapes) = (vec![], vec![]);
+    for bits in 0..(1u32 << switches.len()) {
+        let values: Vec<bool> = (0..switches.len()).map(|i| bits >> i & 1 == 1).collect();
+        cx.values = Some(values.clone());
+        cx.asm = Asm::default();
+        cx.block(&body, &Pos::Tail)?;
+        let n = cx.asm.insns.len();
+        let insns = cx.asm.insns.iter().rev().map(|i| {
+            let (code, jt, jf, k) = (i.code, i.jt, i.jf, &i.k);
+            quote!(::libc::sock_filter { code: #code, jt: #jt, jf: #jf, k: #k })
+        });
+        let shape = format_ident!("__shape{}", bits);
+        shapes.push(quote! {
+            #[allow(unused_variables, unused_parens, non_snake_case, clippy::all)]
+            fn #shape(#(#typed),*) -> [::libc::sock_filter; #n] {
+                #(#lets)*
+                [#(#insns),*]
+            }
+        });
+        arms.push(quote!((#(#values,)*) => #shape(#(#params),*).to_vec(),));
+    }
+    let names: Vec<Ident> = (0..switches.len()).map(|i| format_ident!("__switch{}", i)).collect();
+    let conds: Vec<&Expr> = switches.iter().map(|(_, e)| e).collect();
+    Ok(quote! {{
+        #(#shapes)*
+        #[allow(unused_variables, unused_parens, non_snake_case, clippy::all)]
+        let __prog: ::std::vec::Vec<::libc::sock_filter> = {
+            #(#binds)*
+            #(#lets)*
+            #(let #names: bool = #conds;)*
+            match (#(#names,)*) {
+                #(#arms)*
+            }
+        };
+        __prog
+    }})
+}
+
+/// An instruction, its `k` an expression of the params (a u32).
+struct Insn {
+    code: u16,
+    jt: u8,
+    jf: u8,
+    k: Ts,
 }
 
 /// Where a jump goes: an instruction already emitted, counted from the program's end.
-pub type Label = usize;
+type Label = usize;
 
-/// The macro's code generator. A program is emitted backwards, from its last instruction: every
-/// jump is forward, so its targets are already emitted and its offsets known as it is written.
-/// One fixed template per construct, no optimisation. Not trusted: the proof checks its output.
-///
-/// The instructions go into an array of the macro's bound, `N`, from its end: the program is the
-/// array's last `len`, first instruction first. (Not a `Vec`: through a heap allocation Kani
-/// loses track of which opcode each instruction is, and its proof grows tenfold.)
-pub struct Builder<const N: usize> {
-    insns: [SockFilter; N],
-    len: usize,
-    /// Every comparison's field and value, for the sampled check ([`samples`]); not kept under
-    /// Kani, which needn't them.
-    pub constants: Vec<(Field, u64)>,
+/// The program, emitted backwards from its last instruction: every jump is forward, so its
+/// targets are already there and its offsets known as it is written. One fixed template per
+/// construct.
+#[derive(Default)]
+struct Asm {
+    insns: Vec<Insn>,
 }
 
-impl<const N: usize> Default for Builder<N> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// libc's offsets in seccomp_data, little-endian halves (x86-64; checked by the proof anyway)
+const OFF_NR: u32 = 0;
+const OFF_ARCH: u32 = 4;
+const OFF_IP: u32 = 8;
+const OFF_ARGS: u32 = 16;
+const LD_W_ABS: u16 = 0x20;
+const JEQ_K: u16 = 0x15;
+const JGT_K: u16 = 0x25;
+const JGE_K: u16 = 0x35;
+const RET_K: u16 = 0x06;
+const JA: u16 = 0x05;
 
-impl<const N: usize> Builder<N> {
-    /// A builder for a program of at most `N` instructions (the macro's bound).
-    pub fn new() -> Self {
-        Builder { insns: [SockFilter { code: 0, jt: 0, jf: 0, k: 0 }; N], len: 0, constants: Vec::new() }
+impl Asm {
+    fn push(&mut self, code: u16, jt: usize, jf: usize, k: Ts) -> R<Label> {
+        assert!(jt <= 255 && jf <= 255, "a jump over 255 instructions not through a JA");
+        self.insns.push(Insn { code, jt: jt as u8, jf: jf as u8, k });
+        Ok(self.insns.len())
     }
-
-    fn push(&mut self, code: u16, jt: u8, jf: u8, k: u32) -> Label {
-        assert!(self.len < N, "#[seccomp]: more instructions than the macro's bound, {N}");
-        self.insns[N - 1 - self.len] = SockFilter { code, jt, jf, k };
-        self.len += 1;
-        self.len
+    fn dist(&self, to: Label) -> usize {
+        self.insns.len() - to
     }
-
-    /// `return k`.
-    pub fn ret(&mut self, k: u32) -> Label {
+    fn ret(&mut self, k: Ts) -> R<Label> {
         self.push(RET_K, 0, 0, k)
     }
-
-    /// The offset of a jump written next to `to`.
-    fn dist(&self, to: Label) -> usize {
-        self.len - to
+    /// A conditional jump: a target over 255 instructions away is reached through a JA.
+    fn jump(&mut self, code: u16, k: Ts, t: Label, f: Label) -> R<Label> {
+        let t = if self.dist(t) > 255 { self.far(t)? } else { t };
+        let f = if self.dist(f) > 255 { self.far(f)? } else { f };
+        let (jt, jf) = (self.dist(t), self.dist(f));
+        self.push(code, jt, jf, k)
     }
-
-    /// A conditional jump on A: a target over 255 instructions away is reached through a JA.
-    fn jump(&mut self, op: u32, k: u32, t: Label, f: Label) -> Label {
-        let t = if self.dist(t) > 255 { self.push(JA, 0, 0, self.dist(t) as u32) } else { t };
-        let f = if self.dist(f) > 255 { self.push(JA, 0, 0, self.dist(f) as u32) } else { f };
-        self.push(jmp(op, BPF_K), self.dist(t) as u8, self.dist(f) as u8, k)
+    fn far(&mut self, to: Label) -> R<Label> {
+        let k = self.dist(to) as u32;
+        self.push(JA, 0, 0, quote!(#k))
     }
-
-    fn load(&mut self, off: u32) -> Label {
-        self.push(LD_W_ABS, 0, 0, off)
-    }
-
-    /// `field <cmp> v`: to `t` if it holds, else `f`. A 64-bit field compares its high half,
-    /// then its low half.
-    pub fn cmp(&mut self, field: Field, cmp: Cmp, v: u64, t: Label, f: Label) -> Label {
-        #[cfg(not(kani))]
-        self.constants.push((field, v));
-        // Ne, Lt and Le are Eq, Ge and Gt with the targets swapped.
-        let (op, t, f) = match cmp {
-            Cmp::Eq => (BPF_JEQ, t, f),
-            Cmp::Ne => (BPF_JEQ, f, t),
-            Cmp::Gt => (BPF_JGT, t, f),
-            Cmp::Le => (BPF_JGT, f, t),
-            Cmp::Ge => (BPF_JGE, t, f),
-            Cmp::Lt => (BPF_JGE, f, t),
-        };
-        let (off_lo, off_hi) = field.offsets();
-        if !field.wide() {
-            self.jump(op, v as u32, t, f);
-            return self.load(off_lo);
-        }
-        let (hi, lo) = ((v >> 32) as u32, v as u32);
-        self.jump(op, lo, t, f);
-        let low = self.load(off_lo);
-        if op == BPF_JEQ {
-            // the high halves differ: not equal
-            self.jump(BPF_JEQ, hi, low, f);
-        } else {
-            // high above: holds; high below: doesn't; equal: the low halves decide
-            let eq = self.jump(BPF_JEQ, hi, low, f);
-            self.jump(BPF_JGT, hi, t, eq);
-        }
-        self.load(off_hi)
-    }
-
-    /// `nr` one of `nrs`: one load, then a JEQ per number, in order; to `t` on the first that
-    /// matches, else `f`.
-    /// A number outside u32's range matches no call: it has no test.
-    pub fn nr_in(&mut self, nrs: &[i128], t: Label, f: Label) -> Label {
-        let mut next = f;
-        for nr in nrs.iter().rev().filter_map(|&n| u32::try_from(n).ok()) {
-            #[cfg(not(kani))]
-            self.constants.push((Field::Nr, nr as u64));
-            next = self.jump(BPF_JEQ, nr, t, next);
-        }
-        let _ = next;
-        self.load(OFF_NR)
-    }
-
-    /// The program, first instruction first.
-    pub fn finish(self) -> Vec<SockFilter> {
-        self.program().to_vec()
-    }
-
-    /// The program, in place: what the proof runs.
-    pub fn program(&self) -> &[SockFilter] {
-        &self.insns[N - self.len..]
+    fn load(&mut self, off: u32) -> R<Label> {
+        self.push(LD_W_ABS, 0, 0, quote!(#off))
     }
 }
 
-/// Values around each constant a field is compared with: the constant, one either side, and,
-/// for a 64-bit field, the constant with its high half changed or its halves swapped; and each
-/// field's extremes.
-pub fn samples(constants: &[(Field, u64)]) -> Vec<(Field, Vec<u64>, Vec<u64>)> {
-    let mut fields = vec![Field::Nr, Field::Arch, Field::InstructionPointer];
-    fields.extend((0..6).map(Field::Arg));
-    fields
-        .into_iter()
-        .map(|f| {
-            let exact: Vec<u64> = constants.iter().filter(|c| c.0 == f).map(|c| c.1).collect();
-            let mut near = vec![0, u64::MAX, 1 << 32, 1 << 63, u32::MAX as u64];
-            for &c in &exact {
-                near.extend([c, c.wrapping_add(1), c.wrapping_sub(1)]);
-                if f.wide() {
-                    near.extend([c ^ (1 << 32), c ^ (1 << 63), c.rotate_left(32), c | 0xffff_ffff_0000_0000]);
+#[derive(Clone, Copy)]
+enum Field {
+    /// `d.nr` (libc's: an i32, compared as its bits), or `d.nr as u32`
+    Nr { signed: bool },
+    Arch,
+    Ip,
+    Arg(u32),
+}
+
+impl Field {
+    fn wide(self) -> bool {
+        matches!(self, Field::Ip | Field::Arg(_))
+    }
+    /// (low half, high half)
+    fn offsets(self) -> (u32, u32) {
+        match self {
+            Field::Nr { .. } => (OFF_NR, OFF_NR),
+            Field::Arch => (OFF_ARCH, OFF_ARCH),
+            Field::Ip => (OFF_IP, OFF_IP + 4),
+            Field::Arg(i) => (OFF_ARGS + 8 * i, OFF_ARGS + 8 * i + 4),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum Pos {
+    Tail,
+    Next(Label),
+}
+
+struct Cx {
+    d: Ident,
+    /// conditions without `d`, by their text, in the order first met
+    switches: Vec<(String, Expr)>,
+    /// this pass's value of each (None: the first pass, which only collects them)
+    values: Option<Vec<bool>>,
+    lets: Vec<Ts>,
+    asm: Asm,
+}
+
+impl Cx {
+    fn mentions(&self, t: &Ts) -> bool {
+        t.clone().into_iter().any(|tt| match tt {
+            TokenTree::Ident(i) => i == self.d,
+            TokenTree::Group(g) => self.mentions(&g.stream()),
+            _ => false,
+        })
+    }
+
+    fn pure(&self, e: &Expr) -> bool {
+        !self.mentions(&quote!(#e))
+    }
+
+    /// A condition without `d`: its value in this pass (true in the first, which only collects).
+    fn switch(&mut self, e: &Expr) -> bool {
+        let key = quote!(#e).to_string();
+        let i = match self.switches.iter().position(|(k, _)| *k == key) {
+            Some(i) => i,
+            None => {
+                self.switches.push((key, e.clone()));
+                self.switches.len() - 1
+            }
+        };
+        self.values.as_ref().is_none_or(|v| v[i])
+    }
+
+    fn block(&mut self, b: &Block, pos: &Pos) -> R<Label> {
+        self.stmts(&b.stmts, pos)
+    }
+
+    fn stmts(&mut self, stmts: &[Stmt], pos: &Pos) -> R<Label> {
+        let Some((s, rest)) = stmts.split_first() else {
+            return match pos {
+                Pos::Next(n) => Ok(*n),
+                Pos::Tail => Err(syn::Error::new(Span::call_site(), "seccomp_fn::compile!: a block without a value")),
+            };
+        };
+        match s {
+            Stmt::Local(l) => {
+                let Some(init) = &l.init else { return err(l, "`let` without a value") };
+                if init.diverge.is_some() || !self.pure(&init.expr) {
+                    return err(l, "`let` of an expression of `d`");
+                }
+                if self.values.is_none() {
+                    self.lets.push(quote!(#l));
+                }
+                self.stmts(rest, pos)
+            }
+            Stmt::Expr(e, _) if rest.is_empty() => self.expr(e, pos),
+            Stmt::Expr(e, _) => {
+                let next = self.stmts(rest, pos)?;
+                self.expr(e, &Pos::Next(next))
+            }
+            Stmt::Item(i) => err(i, "an item"),
+            Stmt::Macro(m) => err(m, "a macro"),
+        }
+    }
+
+    fn ret(&mut self, v: &Expr) -> R<Label> {
+        if !self.pure(v) {
+            return err(v, "a verdict computed from `d`");
+        }
+        self.asm.ret(quote!({ let __v: u32 = #v; __v }))
+    }
+
+    fn expr(&mut self, e: &Expr, pos: &Pos) -> R<Label> {
+        match e {
+            Expr::Paren(p) => self.expr(&p.expr, pos),
+            Expr::Group(g) => self.expr(&g.expr, pos),
+            Expr::Return(r) => match &r.expr {
+                Some(v) => self.ret(v),
+                None => err(r, "`return` without a value"),
+            },
+            Expr::Block(b) if b.label.is_none() => self.block(&b.block, pos),
+            Expr::If(i) => {
+                let c = &*i.cond;
+                if self.pure(c) {
+                    // decided when the program is built: only the branch taken is emitted (the
+                    // first pass, which collects the switches, walks both)
+                    if self.values.is_none() {
+                        if let Some((_, e)) = &i.else_branch {
+                            self.expr(e, pos)?;
+                        }
+                    }
+                    return if self.switch(c) {
+                        self.block(&i.then_branch, pos)
+                    } else {
+                        match (&i.else_branch, pos) {
+                            (Some((_, e)), _) => self.expr(e, pos),
+                            (None, Pos::Next(n)) => Ok(*n),
+                            (None, Pos::Tail) => err(i, "`if` without `else` as the value"),
+                        }
+                    };
+                }
+                let f = match (&i.else_branch, pos) {
+                    (Some((_, e)), _) => self.expr(e, pos)?,
+                    (None, Pos::Next(n)) => *n,
+                    (None, Pos::Tail) => return err(i, "`if` without `else` as the value"),
+                };
+                let t = self.block(&i.then_branch, pos)?;
+                self.cond(c, t, f)
+            }
+            Expr::Match(m) => self.matches(m, pos),
+            _ if matches!(pos, Pos::Tail) => self.ret(e),
+            _ => err(e, &format!("the statement `{}`", quote!(#e))),
+        }
+    }
+
+    /// `match d.nr`: arms in order; each its own test (a load of `nr`, a JEQ per pattern), so a
+    /// guard may load what it likes. A guard's leading conjuncts without `d` are decided when
+    /// the program is built.
+    fn matches(&mut self, m: &syn::ExprMatch, pos: &Pos) -> R<Label> {
+        let scrutinee = match &*m.expr {
+            Expr::Cast(c) if matches!(&*c.ty, syn::Type::Path(p) if p.path.get_ident().is_some_and(|i| ["i64", "i128"].iter().any(|s| i == s))) => &*c.expr,
+            e => e,
+        };
+        match self.field(scrutinee)? {
+            Some(Field::Nr { signed: true }) => {}
+            _ => return err(&m.expr, "`match` on anything but `d.nr` (or `d.nr as i64`)"),
+        }
+        let mut arms = vec![];
+        let mut default = None;
+        for arm in &m.arms {
+            let (pat, guard) = match &arm.pat {
+                Pat::Guard(g) => (&*g.pat, Some(&*g.guard)),
+                p => (p, None),
+            };
+            let pats: Vec<&Pat> = match pat {
+                Pat::Or(o) => o.cases.iter().collect(),
+                p => vec![p],
+            };
+            let wild = pats.iter().any(|p| matches!(p, Pat::Wild(_)));
+            for p in &pats {
+                match p {
+                    Pat::Wild(_) | Pat::Lit(_) | Pat::Path(_) => {}
+                    Pat::Ident(i) if i.by_ref.is_none() && i.mutability.is_none() && i.subpat.is_none() => {}
+                    p => return err(p, "a pattern other than a literal, a const or `_`"),
                 }
             }
-            let narrow = |v: &mut Vec<u64>| {
-                if !f.wide() {
-                    v.iter_mut().for_each(|x| *x &= 0xffff_ffff);
-                }
-                v.sort_unstable();
-                v.dedup();
-            };
-            let mut exact = exact;
-            narrow(&mut exact);
-            narrow(&mut near);
-            (f, exact, near)
-        })
-        .collect()
-}
-
-/// What a value compared with a field of `d` may be: BPF compares unsigned, so an unsigned
-/// integer, widened to 64 bits.
-#[diagnostic::on_unimplemented(message = "BPF compares unsigned: `{Self}` can't be compared with a field of `d`")]
-pub trait Unsigned {
-    fn widen(self) -> u64;
-}
-
-impl Unsigned for u64 {
-    fn widen(self) -> u64 {
-        self
-    }
-}
-
-impl Unsigned for u32 {
-    fn widen(self) -> u64 {
-        self as u64
-    }
-}
-
-impl Unsigned for u16 {
-    fn widen(self) -> u64 {
-        self as u64
-    }
-}
-
-impl Unsigned for u8 {
-    fn widen(self) -> u64 {
-        self as u64
-    }
-}
-
-/// The values of a param the macro's sampled test (`<name>_matches_its_bpf_sampled`) builds the
-/// program for: each bool both ways, each variant of an enum (which implements this, listing
-/// them), and integers at 0, 1, their extremes and (u64) 2^32.
-pub trait Sample: Sized + Copy {
-    fn samples() -> Vec<Self>;
-}
-
-impl Sample for bool {
-    fn samples() -> Vec<Self> {
-        vec![false, true]
-    }
-}
-
-impl Sample for u64 {
-    fn samples() -> Vec<Self> {
-        vec![0, 1, 1 << 32, u64::MAX]
-    }
-}
-
-impl Sample for u32 {
-    fn samples() -> Vec<Self> {
-        vec![0, 1, u32::MAX]
-    }
-}
-
-/// The sampled test's inputs per program: about 300,000 calls in all (a second or two, debug), at
-/// least 100 each.
-pub fn sampled_budget(programs: usize) -> usize {
-    (300_000 / programs.max(1)).clamp(100, 20_000)
-}
-
-/// The fast check, the proof's assertion over `n` inputs instead of all of them: each field
-/// drawn from [`samples`] of `constants` (half the time one of the field's exact constants, so
-/// that deep paths are reached). Panics on the first input where `prog` and `f` differ.
-pub fn check_sampled(prog: &[SockFilter], constants: &[(Field, u64)], n: usize, f: impl Fn(&SeccompData) -> u32) {
-    check(prog);
-    let s = samples(constants);
-    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
-    let mut rand = move || {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        seed
-    };
-    for _ in 0..n {
-        let mut d = SeccompData::default();
-        for (field, exact, near) in &s {
-            let r = rand();
-            let pool = if r & 1 == 0 && !exact.is_empty() { exact } else { near };
-            field.set(&mut d, pool[(r >> 1) as usize % pool.len()]);
+            if wild && guard.is_none() {
+                default = Some(arm);
+                break;
+            }
+            arms.push((pats, wild, guard, arm));
         }
-        assert_eq!(run(prog, &d), f(&d), "{d:x?}");
+        let mut next = match (default, pos) {
+            (Some(arm), _) => self.expr(&arm.body, pos)?,
+            (None, Pos::Next(l)) => *l,
+            (None, Pos::Tail) => return err(m, "a `match` without `_` as the value"),
+        };
+        for (pats, wild, guard, arm) in arms.into_iter().rev() {
+            let mut parts = vec![];
+            if let Some(g) = guard {
+                conjuncts(g, &mut parts);
+            }
+            let n_pure = parts.iter().take_while(|c| self.pure(c)).count();
+            let mut taken = true;
+            for c in &parts[..n_pure] {
+                // (each collected, even after one is false: every pass sees the same switches)
+                taken &= self.switch(c);
+            }
+            if !taken && self.values.is_some() {
+                continue;
+            }
+            let body = self.expr(&arm.body, pos)?;
+            let rest = &parts[n_pure..];
+            let entry = if rest.is_empty() {
+                body
+            } else {
+                let g: Expr = syn::parse_quote!(#(#rest)&&*);
+                self.cond(&g, body, next)?
+            };
+            next = if wild {
+                entry
+            } else {
+                let mut miss = next;
+                for p in pats.iter().rev() {
+                    miss = self.asm.jump(JEQ_K, quote!({ (#p) as u32 }), entry, miss)?;
+                }
+                self.asm.load(OFF_NR)?
+            };
+        }
+        Ok(next)
+    }
+
+    fn field(&self, e: &Expr) -> R<Option<Field>> {
+        let mut e = e;
+        while let Expr::Paren(p) = e {
+            e = &p.expr;
+        }
+        let (e, cast) = match e {
+            Expr::Cast(c) => (&*c.expr, Some(&c.ty)),
+            e => (e, None),
+        };
+        let on_d = |b: &Expr| matches!(b, Expr::Path(p) if p.path.is_ident(&self.d));
+        let f = match e {
+            Expr::Field(f) if on_d(&f.base) => {
+                let name = match &f.member {
+                    syn::Member::Named(n) => n.to_string(),
+                    _ => return err(f, "a field of `d` by number"),
+                };
+                match name.as_str() {
+                    "nr" => Field::Nr { signed: true },
+                    "arch" => Field::Arch,
+                    "instruction_pointer" => Field::Ip,
+                    _ => return err(f, &format!("the field `d.{name}` alone")),
+                }
+            }
+            Expr::Index(i) => {
+                let Expr::Field(f) = &*i.expr else { return err(i, "an index of anything but `d.args`") };
+                if !on_d(&f.base) || !matches!(&f.member, syn::Member::Named(n) if n == "args") {
+                    return err(i, "an index of anything but `d.args`");
+                }
+                match &*i.index {
+                    Expr::Lit(syn::ExprLit { lit: Lit::Int(n), .. }) if n.base10_parse::<u32>().is_ok_and(|n| n < 6) => Field::Arg(n.base10_parse()?),
+                    x => return err(x, "an index into `d.args` other than a literal below 6"),
+                }
+            }
+            _ => return Ok(None),
+        };
+        match (f, cast) {
+            (f, None) => Ok(Some(f)),
+            (Field::Nr { .. }, Some(t)) if quote!(#t).to_string() == "u32" => Ok(Some(Field::Nr { signed: false })),
+            (Field::Nr { .. }, Some(t)) if ["i64", "i128"].contains(&quote!(#t).to_string().as_str()) => Ok(Some(Field::Nr { signed: true })),
+            (_, Some(t)) => err(t, "a cast of a field of `d` (but `d.nr as u32` and `as i64`)"),
+        }
+    }
+
+    /// A condition: code going to `t` if it holds, else `f`.
+    fn cond(&mut self, c: &Expr, t: Label, f: Label) -> R<Label> {
+        if self.pure(c) {
+            return Ok(if self.switch(c) { t } else { f });
+        }
+        match c {
+            Expr::Paren(p) => self.cond(&p.expr, t, f),
+            Expr::Group(g) => self.cond(&g.expr, t, f),
+            Expr::Unary(u) if matches!(u.op, UnOp::Not(_)) => self.cond(&u.expr, f, t),
+            Expr::Binary(b) if matches!(b.op, BinOp::And(_)) => {
+                let m = self.cond(&b.right, t, f)?;
+                self.cond(&b.left, m, f)
+            }
+            Expr::Binary(b) if matches!(b.op, BinOp::Or(_)) => {
+                let m = self.cond(&b.right, t, f)?;
+                self.cond(&b.left, t, m)
+            }
+            Expr::Binary(b) => {
+                // (op, the op with the sides swapped): Eq Ne Lt Le Gt Ge
+                let (op, flipped) = match b.op {
+                    BinOp::Eq(_) => (0, 0),
+                    BinOp::Ne(_) => (1, 1),
+                    BinOp::Lt(_) => (2, 4),
+                    BinOp::Le(_) => (3, 5),
+                    BinOp::Gt(_) => (4, 2),
+                    BinOp::Ge(_) => (5, 3),
+                    _ => return err(b, "an operator other than a comparison on `d`"),
+                };
+                let (field, v, op) = match (self.field(&b.left)?, self.field(&b.right)?) {
+                    (Some(fl), None) if self.pure(&b.right) => (fl, &*b.right, op),
+                    (None, Some(fl)) if self.pure(&b.left) => (fl, &*b.left, flipped),
+                    _ => return err(b, "a comparison other than a field of `d` with a value without `d`"),
+                };
+                if matches!(field, Field::Nr { signed: true }) && op > 1 {
+                    return err(b, "an ordering of `d.nr`, which is signed (write `d.nr as u32`)");
+                }
+                // Ne, Lt, Le: Eq, Ge, Gt with the targets swapped
+                let (code, t, f) = match op {
+                    0 => (JEQ_K, t, f),
+                    1 => (JEQ_K, f, t),
+                    2 => (JGE_K, f, t),
+                    3 => (JGT_K, f, t),
+                    4 => (JGT_K, t, f),
+                    _ => (JGE_K, t, f),
+                };
+                let (lo_off, hi_off) = field.offsets();
+                let lit = matches!(v, Expr::Lit(_));
+                if !field.wide() {
+                    let k = match (field, lit) {
+                        (Field::Nr { signed: true }, _) => quote!({ let __v: i32 = #v; __v as u32 }),
+                        (_, true) => quote!({ let __v: u32 = #v; __v }),
+                        _ => quote!(u32::from(#v)),
+                    };
+                    self.asm.jump(code, k, t, f)?;
+                    return self.asm.load(lo_off);
+                }
+                let v64 = if lit { quote!({ let __v: u64 = #v; __v }) } else { quote!(u64::from(#v)) };
+                let (lo, hi) = (quote!({ (#v64) as u32 }), quote!({ ((#v64) >> 32) as u32 }));
+                self.asm.jump(code, lo, t, f)?;
+                let low = self.asm.load(lo_off)?;
+                if code == JEQ_K {
+                    self.asm.jump(JEQ_K, hi, low, f)?;
+                } else {
+                    // high above: holds; below: doesn't; equal: the low halves decide
+                    let eq = self.asm.jump(JEQ_K, hi.clone(), low, f)?;
+                    self.asm.jump(JGT_K, hi, t, eq)?;
+                }
+                self.asm.load(hi_off)
+            }
+            Expr::MethodCall(m) => err(m, &format!("the call `.{}()`", m.method)),
+            Expr::Call(m) => err(m, "a call"),
+            c => err(c, &format!("the condition `{}`", quote!(#c))),
+        }
+    }
+}
+
+/// `e`'s conjuncts, left to right.
+fn conjuncts<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+    match e {
+        Expr::Binary(b) if matches!(b.op, BinOp::And(_)) => {
+            conjuncts(&b.left, out);
+            conjuncts(&b.right, out);
+        }
+        e => out.push(e),
     }
 }

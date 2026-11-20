@@ -2,7 +2,7 @@
 # it; exobox-tcb depends on it by path).
 [workspace]
 resolver = "3"
-members = ["seccomp-fn", "seccomp-fn-macros"]
+members = ["seccomp-fn", "seccomp-fn-verify"]
 
 [workspace.package]
 version = "0.0.0"
