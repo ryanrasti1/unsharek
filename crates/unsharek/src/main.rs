@@ -35,7 +35,13 @@ struct Cli {
     /// Pass this process's variable NAME to the program, if set. Repeatable.
     #[arg(long = "keep-env", value_name = "NAME")]
     keep_env: Vec<OsString>,
-    /// The program and its arguments.
+    /// For trying things out: the host's system directories, read-only and live (`/nix/store`,
+    /// `/run/current-system`, `/etc`, `/bin`, `/usr`, `/lib`, `/lib64`, `/opt`, `/sbin`, those that
+    /// exist; never home or /tmp), and the host's PATH, TERM and LANG. Anything world-readable
+    /// there, `/etc` included, is the program's to read.
+    #[arg(long)]
+    system: bool,
+    /// The program and its arguments: a bare name is looked up on this process's PATH.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     argv: Vec<OsString>,
 }
@@ -48,9 +54,22 @@ enum Mode {
 }
 
 fn main() -> ExitCode {
-    let Cli { mode, ro, rw, images, max_procs, setenv, keep_env, argv } = Cli::parse();
+    let Cli { mode, mut ro, rw, images, max_procs, setenv, mut keep_env, system, mut argv } = Cli::parse();
+    if system {
+        ro.extend(fs::SYSTEM.iter().filter(|d| std::path::Path::new(d).is_dir()).map(|d| fs::Arg { host: d.into(), at: None, live: true }));
+        keep_env.extend(["PATH", "TERM", "LANG"].map(OsString::from));
+    }
+    // The program as the host resolves it: a bare name on PATH, then any symlinks (a profile's
+    // bin/ into the store), so its closure is found and its path exists in the guest.
+    match fs::resolve(&argv[0]) {
+        Ok(p) => argv[0] = p.into_os_string(),
+        Err(e) => {
+            eprintln!("unsharek: {}: {e}", argv[0].to_string_lossy());
+            return ExitCode::from(127);
+        }
+    }
     // Plugin: host directories, live (cli/fs.rs).
-    let (live, images_ro): (Vec<fs::Arg>, Vec<fs::Arg>) = ro.into_iter().partition(|a| fs::live(&a.host));
+    let (live, images_ro): (Vec<fs::Arg>, Vec<fs::Arg>) = ro.into_iter().partition(|a| a.live || fs::live(&a.host));
     let host_dirs = match fs::spawn(&live, &rw) {
         Ok(d) => d,
         Err(e) => {

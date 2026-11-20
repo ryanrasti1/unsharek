@@ -14,6 +14,26 @@ use std::path::{Path, PathBuf};
 pub struct Arg {
     pub host: PathBuf,
     pub at: Option<PathBuf>,
+    /// Served live even if it is the store (`--system`'s `/nix/store`).
+    pub live: bool,
+}
+
+/// `--system`'s directories (those of them that exist): the host's system, read-only.
+pub const SYSTEM: &[&str] = &["/nix/store", "/run/current-system", "/etc", "/bin", "/usr", "/lib", "/lib64", "/opt", "/sbin"];
+
+/// `prog` as the host finds it: a bare name looked up on PATH, then canonical (symlinks, such as a
+/// profile's `bin/` into the store, resolved).
+pub fn resolve(prog: &std::ffi::OsStr) -> std::io::Result<PathBuf> {
+    let p = Path::new(prog);
+    if p.components().count() > 1 || p.is_absolute() {
+        return std::fs::canonicalize(p);
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .map(|d| d.join(p))
+        .find(|c| c.is_file())
+        .map(std::fs::canonicalize)
+        .unwrap_or_else(|| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "not found on PATH")))
 }
 
 impl std::str::FromStr for Arg {
@@ -27,7 +47,7 @@ impl std::str::FromStr for Arg {
         if host.is_empty() {
             return Err("an empty path".into());
         }
-        Ok(Arg { host: host.into(), at })
+        Ok(Arg { host: host.into(), at, live: false })
     }
 }
 
@@ -42,7 +62,10 @@ pub fn spawn(ro: &[Arg], rw: &[Arg]) -> std::io::Result<Vec<unsharek::HostDir>> 
     let mut out = vec![];
     for (a, writable) in ro.iter().map(|a| (a, false)).chain(rw.iter().map(|a| (a, true))) {
         let host = std::path::absolute(&a.host)?;
-        let fd = unsharek_fs_server::spawn(&unsharek_fs_server::Dir { host: host.clone(), writable, ..Default::default() })?;
+        // The server's root is the directory itself, not a symlink to it (`/run/current-system`):
+        // it opens its root without following one. Mounted at the path as given.
+        let real = std::fs::canonicalize(&host)?;
+        let fd = unsharek_fs_server::spawn(&unsharek_fs_server::Dir { host: real, writable, ..Default::default() })?;
         // Open for the sandbox's life: the process ends with the program.
         out.push(unsharek::HostDir { fd: std::os::fd::IntoRawFd::into_raw_fd(fd), at: a.at.clone().unwrap_or(host) });
     }
