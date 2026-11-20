@@ -13,8 +13,11 @@ if [[ -z "${EXOBOX_DEVSHELL:-}" ]]; then
     nix print-dev-env "$_exobox_root" >"$_exobox_env.tmp"
     mv "$_exobox_env.tmp" "$_exobox_env"
   fi
-  # print-dev-env's script sets the shell's options and traps; keep the caller's.
+  # print-dev-env's script sets the shell's options and traps; keep the caller's. ($(set +o)
+  # runs in a subshell, where bash turns errexit off, so it is kept from $- instead: without it
+  # ./test went on past a failed build and exited with the last command's status.)
   _exobox_opts="$(set +o)"
+  [[ $- == *e* ]] && _exobox_opts+=$'\nset -e'
   # shellcheck disable=SC1090
   source "$_exobox_env"
   eval "$_exobox_opts"
