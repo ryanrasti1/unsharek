@@ -60,8 +60,8 @@
   is given grants, never produces values the filter trusts, and knows nothing of the filter. A
   network hook is never a policy point.
 - Comments live in the code, next to what they explain: why it is so, what broke before. The
-  top-level README describes the project and its modes; `crates/unsharek-tcb/README.md` how to review isolation;
-  there is no other docs tree yet.
+  top-level README describes the project and its modes, and points to each crate's short README;
+  `crates/unsharek-tcb/README.md` is how to review isolation. There is no other docs tree.
 - Library first: the CLI (`crates/unsharek/src/main.rs`) only turns arguments into a `Config`.
 - Proven, current crates by default. Record each dependency's cost (binary size, build time) in
   `DEPS.md` when adding it.

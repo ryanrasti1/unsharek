@@ -114,18 +114,26 @@ command line, from unsharek's `GuestConfig::kernel_memory` (32 MB by default, 16
   lockdown and per fork; no kernel change.
 
 ## Building
-Built out of tree by `make` (`crates/lkl-sys/Makefile`, into `target/lkl`; incremental, the cold build ~20 s
-on 24 cores) from the submodule `crates/lkl-sys/linux`, in development and in `nix build` alike (`nix build`
-sees it through the flake's `inputs.self.submodules`). `UNSHAREK_LKL_SRC` names another checkout
-(a worktree has no submodule checked out), `UNSHAREK_LKL_CONFIG` adds a config fragment over
-`crates/lkl-sys/defconfig`. For `nix build` the kernel is its own derivation (`lib.unsharekKernel`), linked
-through lkl-sys's `UNSHAREK_LKL_PREBUILT`.
+Built out of tree by `make` (`crates/lkl-sys/Makefile`, into `target/lkl`; incremental, the cold
+build ~20 s on 24 cores) from the submodule `crates/lkl-sys/linux`, in development and in `nix
+build` alike (the flake's `inputs.self.submodules`). `UNSHAREK_LKL_SRC` names another checkout (a
+worktree has no submodule checked out), `UNSHAREK_LKL_CONFIG` a fragment of config lines merged over
+`defconfig` (later lines win), e.g. `echo CONFIG_SYSVIPC=y > sysv.config; UNSHAREK_LKL_CONFIG=sysv.config
+cargo xtask test`. lkl-sys's build.rs runs the make and links the kernel object alone
+(`liblkl-kernel.a`): unsharek provides the host ops itself; the stock posix host is linked only by
+lkl-sys's smoke test.
 
-The series is the branch `exobox-native` of `github.com/ryanrasti/linux`, the submodule's URL
-(`git@github.com:ryanrasti/linux.git`, `.gitmodules`' branch). Work on it happens in a checkout
-of that repository; a commit of it reaches unsharek as the submodule's new commit together with
-unsharek's side of the change (the host-operations table in `crates/unsharek-rt`, when the host interface
-moved), in one unsharek commit. `crates/lkl-sys` runs the make from its build.rs and links the
-kernel object alone (`liblkl-kernel.a`, tools/lkl's `lib/lkl.o`), not `tools/lkl/lib`: unsharek
-provides the host ops itself. The stock posix host (`liblkl-posix.a`) is linked only by lkl-sys's
-smoke test.
+For `nix build` the kernel is its own derivation, linked through `UNSHAREK_LKL_PREBUILT`. A custom
+kernel (more drivers or filesystems: LKL has no loadable modules) is a source and a fragment, from
+the flake's `lib`:
+
+```nix
+unsharek.lib.mkUnsharek {
+  kernel = unsharek.lib.unsharekKernel { config = "CONFIG_SYSVIPC=y\n"; /* src = ./my-linux; */ };
+}
+```
+
+Work on the series happens on branch `exobox-native` of `github.com/ryanrasti/linux` (the
+submodule's URL and `.gitmodules`' branch). A commit of it reaches unsharek as the submodule's new
+commit with unsharek's side of the change (the host-operations table in `crates/unsharek-rt`), in
+one commit.
