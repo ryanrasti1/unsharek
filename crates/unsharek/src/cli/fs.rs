@@ -90,7 +90,7 @@ pub fn spawn(ro: &[Arg], rw: &[Arg]) -> std::io::Result<Vec<unsharek::HostDir>> 
 }
 
 /// Lockdown's part: each directory's socket granted.
-pub fn grant(dirs: &[unsharek::HostDir], s: &mut unsharek::tcb::Config) {
+pub fn grant(dirs: &[unsharek::HostDir], s: &mut unsharek::SandboxConfig) {
     for d in dirs {
         s.grant(d.fd);
     }

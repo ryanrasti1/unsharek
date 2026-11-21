@@ -152,7 +152,7 @@ fn main() -> ExitCode {
         }
         Ok(())
     };
-    let grants = |s: &mut unsharek::tcb::Config| {
+    let grants = |s: &mut unsharek::SandboxConfig| {
         fs::grant(&host_dirs, s);
         if let Some(n) = &net {
             n.grant(s);

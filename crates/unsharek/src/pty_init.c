@@ -4,7 +4,7 @@
 // fds 0 and 1 (the host's stdio) until the program's side closes; then the program's status, a
 // signal's death as 128 + n (init can't die of its own signal).
 //
-// A program of its own, exec'd as init, rather than Rust in a `Locked::run` closure: a fork from
+// A program of its own, exec'd as init, rather than Rust in a `Guest::run` closure after lockdown: a fork from
 // such a closure resumes on a stack fork mode shares among the processes (init's thread's), where
 // init's own trap frames still are. No libc (it runs in a guest that may have none, and any
 // glibc's version would be the program's choice): raw syscalls, nothing that needs relocating

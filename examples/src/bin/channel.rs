@@ -14,7 +14,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 
-use unsharek::{Guest, GuestConfig, setup};
+use unsharek::{Guest, GuestConfig};
 use unsharek_examples as ex;
 
 /// The program: a line-oriented server on fd 1000, until EOF.
@@ -32,10 +32,12 @@ fn main() -> Result<(), unsharek::Error> {
 
     let mut g = Guest::boot(GuestConfig::default())?;
     g.pass_fd(theirs.into(), 1000)?;
-    let store = g.map_closure(&python, &[])?;
-    g.run(|| setup::mount_closure(&store))??;
+    g.mount_closure(&[&python])?;
     let argv = ex::os(&[python.to_str().unwrap(), "-c", SQUARES]);
-    let child = g.spawn(move |g| g.lockdown(unsharek::stdio)?.exec(&argv, &[]))?;
+    let child = g.spawn(move |mut g| {
+        unsharek::lockdown(unsharek::stdio())?;
+        Err(g.run(move || unsharek::execve(&argv, &[]))?)
+    })?;
 
     let mut answers = BufReader::new(ours.try_clone()?);
     let mut tx = ours;

@@ -99,10 +99,10 @@ pub struct Closure {
 /// Paths that don't exist are errors, as is a store path that Nix doesn't know. Relative paths
 /// are from the current directory. Needs `nix-store` on `PATH` (one query for all roots).
 pub fn closure(program: &Path, allow_paths: &[PathBuf]) -> Result<Closure> {
-    closure_in(program, allow_paths, &[], None)
+    closure_in(Some(program), allow_paths, &[], None)
 }
 
-fn closure_in(program: &Path, allow_paths: &[PathBuf], live: &[PathBuf], cache: Option<&Cache>) -> Result<Closure> {
+fn closure_in(program: Option<&Path>, allow_paths: &[PathBuf], live: &[PathBuf], cache: Option<&Cache>) -> Result<Closure> {
     let mut roots = BTreeSet::new();
     let mut host = BTreeSet::new();
     for path in allow_paths {
@@ -126,11 +126,12 @@ fn closure_in(program: &Path, allow_paths: &[PathBuf], live: &[PathBuf], cache: 
     // program built against the store). Others aren't: a big tree's walk at every run, for
     // nothing the program needs.
     let mut scan: Vec<PathBuf> = outer.iter().cloned().collect();
-    match locate(program)? {
-        Place::Store(p) => {
+    match program.map(locate).transpose()? {
+        None => {}
+        Some(Place::Store(p)) => {
             roots.insert(p);
         }
-        Place::Host(p) => {
+        Some(Place::Host(p)) => {
             if !outer.iter().any(|d| p.starts_with(d)) {
                 let canon: Vec<PathBuf> = live.iter().filter_map(|d| fs::canonicalize(d).ok()).collect();
                 match canon.into_iter().find(|d| p.starts_with(d)) {
@@ -394,10 +395,16 @@ impl Cache {
         self.store_live(program, allow_paths, &[])
     }
 
+    /// The closures of `paths` alone (store paths, or paths inside them, or host directories as
+    /// [`closure`] takes them), as images: no program's.
+    pub fn closures(&self, paths: &[PathBuf]) -> Result<Store> {
+        self.images(&closure_in(None, paths, &[], Some(self))?)
+    }
+
     /// [`Cache::store`], with host directories served live (`live`: not imaged) besides: the
     /// program may be in one.
     pub fn store_live(&self, program: &Path, allow_paths: &[PathBuf], live: &[PathBuf]) -> Result<Store> {
-        self.images(&closure_in(program, allow_paths, live, Some(self))?)
+        self.images(&closure_in(Some(program), allow_paths, live, Some(self))?)
     }
 
     /// How many images this `Cache` has built (rather than found).
@@ -410,7 +417,7 @@ impl Cache {
     /// references (keyed by its tree, as its image; resolved again on every call, since a store
     /// path it mentions may have appeared since).
     pub fn closure(&self, program: &Path, allow_paths: &[PathBuf]) -> Result<Closure> {
-        closure_in(program, allow_paths, &[], Some(self))
+        closure_in(Some(program), allow_paths, &[], Some(self))
     }
 
     fn requisites(&self, roots: &BTreeSet<PathBuf>) -> Result<BTreeSet<PathBuf>> {

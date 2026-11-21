@@ -1,4 +1,4 @@
-//! The host filter at work: a closure run as the sandbox's program (`Locked::run`) tries to
+//! The host filter at work: a closure run as the sandbox's program (`g.run` after lockdown) tries to
 //! reach the host, as a compromised program would, one attempt per sandbox. Each starts with an
 //! ordinary syscall (trapped: the guest kernel's answer), then makes one forbidden host call,
 //! which kills the sandbox (SIGSYS):
@@ -91,15 +91,17 @@ const ATTEMPTS: [&str; 3] = ["getppid", "openat", "socket"];
 
 fn sandbox(attempt: &str) -> ! {
     let run = || -> Result<std::convert::Infallible, unsharek::Error> {
-        let g = Guest::boot(GuestConfig::default())?;
+        let mut g = Guest::boot(GuestConfig::default())?;
         // A host file opened before lockdown (here, this program's own binary), its fd number
         // kept for the closure: what a program might have inherited.
         let secret = std::fs::File::open(std::env::current_exe()?)?;
         let fd = secret.as_raw_fd();
         std::mem::forget(secret);
-        let locked = g.lockdown(unsharek::stdio)?;
+        unsharek::lockdown(unsharek::stdio())?;
         let attempt = attempt.to_owned();
-        locked.run(move || hostile(&attempt, fd))
+        // After lockdown the closure is the program: its return value its status.
+        g.run(move || hostile(&attempt, fd))?;
+        unreachable!("the program's run returns only on failure")
     };
     let Err(e) = run();
     ex::fail(e)

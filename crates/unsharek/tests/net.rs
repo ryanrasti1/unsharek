@@ -408,9 +408,11 @@ fn child(kind: &str) -> ! {
         "passfd" => g.pass_fd(fd3, 1000).unwrap(),
         _ => drop(fd3),
     }
-    let mounts = g.map_closure(Path::new(&argv[0]), &[fx::bin_dir()]).unwrap();
+    // The fixtures' directory, and the program's store path if it is one (python).
+    let mut roots = vec![fx::bin_dir()];
+    roots.extend(Path::new(&argv[0]).starts_with("/nix/store").then(|| PathBuf::from(&argv[0])));
+    g.mount_closure(&roots).unwrap();
     g.run(|| {
-        unsharek::setup::mount_closure(&mounts).unwrap();
         if kind == "provider_user" {
             // SAFETY: the guest's init dropping to uid/gid 1000 (a build user, as capnix's).
             unsafe { assert!(libc::setresgid(1000, 1000, 1000) == 0 && libc::setresuid(1000, 1000, 1000) == 0) };
@@ -418,13 +420,10 @@ fn child(kind: &str) -> ! {
     })
     .unwrap();
     let env: Vec<OsString> = vec![if fork { "UNSHAREK_TEST_MODE=fork" } else { "UNSHAREK_TEST_MODE=coroutine" }.into()];
-    let locked = g
-        .lockdown(|s| {
-            s.grant(0).grant(1).grant(2);
-            Ok(())
-        })
-        .unwrap();
-    let e = locked.exec(&argv, &env).unwrap_err();
+    unsharek::lockdown(unsharek::stdio()).unwrap();
+    let e = match g.run(move || unsharek::execve(&argv, &env)) {
+        Ok(e) | Err(e) => e,
+    };
     eprintln!("unsharek: {e}");
     std::process::exit(125)
 }

@@ -23,7 +23,7 @@ fn sandbox(argv: Vec<OsString>) -> ! {
     // 1. Host work, before anything is locked down. The closure (every store path the program
     //    references, transitively, from `nix-store`) and an erofs image per store path, both
     //    cached: only the first run of a program builds anything.
-    //    (`Guest::map_closure` is these steps and the next in one call.)
+    //    (`Guest::mount_closure` is these steps and the next two in one call.)
     let cache = store::Cache::open_default().unwrap_or_else(|e| ex::fail(e.into()));
     let images = cache.store(Path::new(&argv[0]), &[]).unwrap_or_else(|e| ex::fail(e.into()));
     let closure_t = t.elapsed();
@@ -43,10 +43,15 @@ fn sandbox(argv: Vec<OsString>) -> ! {
     //    happen inside.
     g.run(|| setup::mount_closure(&mounts)).unwrap_or_else(|e| ex::fail(e)).unwrap_or_else(|e| ex::fail(e.into()));
     // 5. Lockdown (the program's stdio granted), then the program exec'd from the guest's files,
-    //    behind the mode's filter. `exec` returns only if the program couldn't be started.
+    //    behind the mode's filter: after lockdown, `run`'s closure is the program, and this
+    //    returns only if it couldn't be started.
     let env = ex::os(&["PATH=/bin", "LANG=C.UTF-8"]);
-    let Err(e) = g.lockdown(unsharek::stdio).and_then(|l| l.exec(&argv, &env));
-    ex::fail(e)
+    if let Err(e) = unsharek::lockdown(unsharek::stdio()) {
+        ex::fail(e.into())
+    }
+    match g.run(move || unsharek::execve(&argv, &env)) {
+        Ok(e) | Err(e) => ex::fail(e),
+    }
 }
 
 fn main() {

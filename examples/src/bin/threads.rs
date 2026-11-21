@@ -12,7 +12,7 @@
 use std::process::Stdio;
 use std::time::Instant;
 
-use unsharek::{Guest, GuestConfig, Mode, setup};
+use unsharek::{Guest, GuestConfig, Mode};
 use unsharek_examples as ex;
 use unsharek_fixtures as fx;
 
@@ -28,9 +28,10 @@ fn sandbox(mode: Mode) -> ! {
         let mut g = Guest::boot(GuestConfig { mode, ..Default::default() })?;
         // The fixtures live outside the store: their directory is allowed as is, and brings the
         // closure of whatever its files reference (glibc).
-        let store = g.map_closure(&prog, &[fx::bin_dir()])?;
-        g.run(|| setup::mount_closure(&store))??;
-        g.lockdown(unsharek::stdio)?.exec(&ex::os(&[prog.to_str().unwrap(), THREADS, iterations()]), &[])
+        g.mount_closure(&[fx::bin_dir()])?;
+        unsharek::lockdown(unsharek::stdio())?;
+        let argv = ex::os(&[prog.to_str().unwrap(), THREADS, iterations()]);
+        Err(g.run(move || unsharek::execve(&argv, &[]))?)
     };
     let Err(e) = run();
     ex::fail(e)

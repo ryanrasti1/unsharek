@@ -35,10 +35,9 @@ fn main() -> Result<(), unsharek::Error> {
     unsharek_erofs::build(&app, &image_path)?;
 
     let mut g = Guest::boot(GuestConfig::default())?;
-    let store = g.map_closure(&python, &[])?;
+    g.mount_closure(&[&python])?;
     g.run(|| -> std::io::Result<()> {
         // In here, every syscall of this thread is the guest's.
-        setup::mount_closure(&store)?;
         // Output works as anywhere: the guest's fds 0-2 are the host's.
         println!("[setup] the closure mounted");
         Ok(())
@@ -59,6 +58,10 @@ fn main() -> Result<(), unsharek::Error> {
     })??;
     let argv = ex::os(&[python.to_str().unwrap(), "/app/main.py"]);
     let env = ex::os(&[&format!("HOST_DIR={host_dir}")]);
-    let Err(e) = g.lockdown(unsharek::stdio).and_then(|l| l.exec(&argv, &env));
-    ex::fail(e)
+    if let Err(e) = unsharek::lockdown(unsharek::stdio()) {
+        ex::fail(e.into())
+    }
+    match g.run(move || unsharek::execve(&argv, &env)) {
+        Ok(e) | Err(e) => ex::fail(e),
+    }
 }

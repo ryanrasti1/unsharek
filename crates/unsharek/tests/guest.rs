@@ -63,35 +63,33 @@ fn boot(m: Mode) -> Guest {
     Guest::boot(GuestConfig { mode: m, ..Default::default() }).unwrap()
 }
 
-/// The program's stdio granted: fds 0-2.
-fn stdio(s: &mut unsharek::tcb::Config) -> unsharek::tcb::Result<()> {
-    s.grant(0).grant(1).grant(2);
-    Ok(())
+/// Lockdown with the program's stdio granted, then `argv` exec'd: after lockdown `run`'s closure
+/// is the program, so this returns only its failure.
+fn exec(g: &mut Guest, argv: &[OsString], env: &[OsString]) -> unsharek::Error {
+    if let Err(e) = unsharek::lockdown(unsharek::stdio()) {
+        return e.into();
+    }
+    match g.run(|| unsharek::execve(argv, env)) {
+        Ok(e) | Err(e) => e,
+    }
 }
 
 /// The child: `layer` set up, then fixture `name` run.
 fn child(layer: &str, name: &str) -> ! {
     let (m, _) = mode();
-    let program = fx::bin(name);
     let allow = [fx::bin_dir()];
     let e = match layer {
         "guest" => {
             let mut g = boot(Mode::Coroutine);
-            let mounts = g.map_closure(&program, &allow).unwrap();
-            g.run(|| unsharek::setup::mount_closure(&mounts)).unwrap().unwrap();
+            g.mount_closure(&allow).unwrap();
             let (argv, env) = (argv(name), env());
-            g.lockdown(stdio).unwrap().exec(&argv, &env).unwrap_err()
+            exec(&mut g, &argv, &env)
         }
         "exec_before" => {
             // The loader refuses before lockdown, in a setup closure as anywhere.
             let mut g = boot(m);
-            let mounts = g.map_closure(&program, &allow).unwrap();
-            let e = g
-                .run(|| {
-                    unsharek::setup::mount_closure(&mounts).unwrap();
-                    unsharek::execve(&argv(name), &env())
-                })
-                .unwrap();
+            g.mount_closure(&allow).unwrap();
+            let e = g.run(|| unsharek::execve(&argv(name), &env())).unwrap();
             let refused = matches!(&e, unsharek::Error::Exec { errno, .. } if errno.raw_os_error() == Some(libc::EPERM));
             println!("EXEC_BEFORE_LOCKDOWN {}", if refused { "refused" } else { "ran" });
             std::process::exit(0)
@@ -101,6 +99,17 @@ fn child(layer: &str, name: &str) -> ! {
         "template" => template(m),
         "hostdir_live" => hostdir_live(m),
         "run_fn" => run_fn(m, name),
+        "run_after_failed" => {
+            // A lockdown that fails (a grant of an fd that isn't open) leaves the guest half
+            // prepared: a run after it is an error, never a setup closure or the program.
+            let mut g = boot(m);
+            let mut c = unsharek::stdio();
+            c.grant(900);
+            let refused = matches!(unsharek::lockdown(c), Err(unsharek::tcb::Error::NotOpen(900)));
+            let after = matches!(g.run(|| 0), Err(unsharek::Error::LockdownFailed));
+            println!("RUN_AFTER_FAILED {refused} {after}");
+            std::process::exit(0)
+        }
         _ => {
             let mut g = boot(m);
             if layer == "passfd" {
@@ -108,13 +117,11 @@ fn child(layer: &str, name: &str) -> ! {
                 // SAFETY: fd 3 is this process's, from the parent, and nothing else owns it.
                 g.pass_fd(unsafe { std::os::fd::OwnedFd::from_raw_fd(3) }, 1000).unwrap();
             }
-            let mounts = g.map_closure(&program, &allow).unwrap();
-            g.run(|| unsharek::setup::mount_closure(&mounts)).unwrap().unwrap();
+            g.mount_closure(&allow).unwrap();
             // The program's argv and env before lockdown: after it, `getppid` (env's target) is
             // the guest's.
             let (argv, env) = (argv(name), env());
-            let locked = g.lockdown(stdio).unwrap();
-            locked.exec(&argv, &env).unwrap_err()
+            exec(&mut g, &argv, &env)
         }
     };
     eprintln!("unsharek: {e}");
@@ -154,7 +161,7 @@ fn hostdir_live(m: Mode) -> unsharek::Error {
 fn setup_closures(m: Mode, name: &str) -> unsharek::Error {
     let host_file = std::env::var("UNSHAREK_GUEST_TEST_FILE").unwrap();
     let mut g = boot(m);
-    let mounts = g.map_closure(&fx::bin(name), &[fx::bin_dir()]).unwrap();
+    g.mount_closure(&[fx::bin_dir()]).unwrap();
     let pid = std::process::id();
     // SAFETY: getpid.
     let getpid = || unsafe { libc::getpid() } as u32;
@@ -163,7 +170,6 @@ fn setup_closures(m: Mode, name: &str) -> unsharek::Error {
     g.run(|| {
         check("setup 1: getpid is init's", getpid() == 1);
         check("setup 1: the host's file isn't there", !std::path::Path::new(&hf).exists());
-        unsharek::setup::mount_closure(&mounts).unwrap();
         std::fs::write("/unsharek-guard-test", "made in setup 1").unwrap();
     })
     .unwrap();
@@ -243,7 +249,7 @@ fn setup_closures(m: Mode, name: &str) -> unsharek::Error {
     .unwrap();
     check("after 2: getpid is the host's", getpid() == pid);
     let (argv, env) = (argv(name), env());
-    g.lockdown(stdio).unwrap().exec(&argv, &env).unwrap_err()
+    exec(&mut g, &argv, &env)
 }
 
 /// Store-like paths (`ENTRIES`, in a temporary directory: the suite can't count on a store path
@@ -261,34 +267,33 @@ fn entries(m: Mode) -> unsharek::Error {
         m.guest = std::path::Path::new("/nix/store").join(m.guest.file_name().unwrap());
     }
     let mut g = boot(m);
-    let mut mounts = g.map_store(&store).unwrap();
-    mounts.extend(g.map_closure(&fx::bin("paths"), &[fx::bin_dir()]).unwrap());
+    let mounts = g.map_store(&store).unwrap();
+    g.mount_closure(&[fx::bin_dir()]).unwrap();
     g.run(|| unsharek::setup::mount_closure(&mounts)).unwrap().unwrap();
     let mut argv = argv("paths");
     argv.extend(ENTRIES.iter().map(|n| format!("/nix/store/{n}").into()));
     let env = env();
-    g.lockdown(stdio).unwrap().exec(&argv, &env).unwrap_err()
+    exec(&mut g, &argv, &env)
 }
 
 /// A template: one setup, then four children in turn, each with setup of its own and its own
 /// fixture. Prints each one's status; their output is theirs (stdout, in turn).
-/// `Locked::run`: a closure run as the program, after lockdown. `ok`: its calls are the
+/// `Guest::run` after lockdown: a closure run as the program. `ok`: its calls are the
 /// guest's (init's pid, the guest's files, no host path), a host fd from before lockdown is
 /// closed, and its return value is the status (42). `kill`: a host call from the gate the filter
 /// refuses kills the sandbox (`run_fn_gate_kills`).
 fn run_fn(m: Mode, what: &str) -> unsharek::Error {
-    let g = boot(m);
+    let mut g = boot(m);
     // A host fd opened now, before lockdown: the closure finds it closed.
     let before = std::fs::File::open(env!("CARGO_MANIFEST_DIR")).unwrap();
     let before_fd = before.as_raw_fd();
     std::mem::forget(before);
     let host_path = env!("CARGO_MANIFEST_DIR");
     let what = what.to_owned();
-    let locked = match g.lockdown(stdio) {
-        Ok(l) => l,
-        Err(e) => return e,
-    };
-    let Err(e) = locked.run(move || {
+    if let Err(e) = unsharek::lockdown(unsharek::stdio()) {
+        return e.into();
+    }
+    let r = g.run(move || {
         // SAFETY: getpid; fcntl on a number.
         check("run_fn: getpid is init's", unsafe { libc::getpid() } == 1);
         check("run_fn: the guest's files", std::fs::write("/tmp/run_fn", "x").is_ok() && std::fs::read("/tmp/run_fn").is_ok_and(|b| b == b"x"));
@@ -311,7 +316,10 @@ fn run_fn(m: Mode, what: &str) -> unsharek::Error {
         }
         42
     });
-    e
+    match r {
+        Ok(_) => unreachable!("the program's run returns only on failure"),
+        Err(e) => e,
+    }
 }
 
 /// The gate's `syscall` instruction, found in the binary's code: `mov r9, [rsp + 8]; syscall;
@@ -344,9 +352,8 @@ fn gate_call4(gate: usize, nr: i64, a: [usize; 4]) -> isize {
 
 fn template(m: Mode) -> unsharek::Error {
     let mut g = boot(m);
-    let mounts = g.map_closure(&fx::bin("hello"), &[fx::bin_dir()]).unwrap();
+    g.mount_closure(&[fx::bin_dir()]).unwrap();
     g.run(|| {
-        unsharek::setup::mount_closure(&mounts).unwrap();
         std::fs::create_dir_all("/etc").unwrap();
         std::fs::write("/etc/template", "shared").unwrap();
     })
@@ -368,7 +375,7 @@ fn template(m: Mode) -> unsharek::Error {
                 let mut argv: Vec<OsString> = vec![fx::bin(fixture).into()];
                 argv.extend(args.iter().map(OsString::from));
                 let env = env();
-                g.lockdown(stdio)?.exec(&argv, &env)
+                Ok(exec(&mut g, &argv, &env)).and_then(Err)
             })
             .unwrap();
         let st = child.wait().unwrap();
@@ -459,6 +466,13 @@ fn main() {
             let (st, out, err) = run("exec_before", "hello", "coroutine", &[])?;
             if st.code() != Some(0) || out.trim() != "EXEC_BEFORE_LOCKDOWN refused" {
                 return fail(st, &out, &err, "wanted the exec refused");
+            }
+            Ok(())
+        }),
+        Trial::test("run_after_failed_lockdown", || {
+            let (st, out, err) = run("run_after_failed", "hello", "coroutine", &[])?;
+            if st.code() != Some(0) || out.trim() != "RUN_AFTER_FAILED true true" {
+                return fail(st, &out, &err, "wanted the lockdown refused, then the run");
             }
             Ok(())
         }),

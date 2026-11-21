@@ -13,8 +13,8 @@ An example whose nixpkgs program isn't in the environment prints `skipped: ...` 
 
 Two things hold in all of them:
 
-- **A sandbox takes its process over.** Lockdown is for good, and `Locked::exec` never returns
-  on success: the process becomes the program, and exits with its status. An example that wants
+- **A sandbox takes its process over.** Lockdown is for good, and the program's run
+  (`g.run(|| execve(..))` after it) never returns on success: the process becomes the program, and exits with its status. An example that wants
   to watch or talk to its sandbox forks it off before lockdown (`Guest::spawn`: the process is
   then a template, its child the sandbox)
   and stays the parent. One that needs sandboxes of different configurations (one guest per
@@ -23,15 +23,15 @@ Two things hold in all of them:
 - **Host work and setup interleave until lockdown.** Booting, mapping images, holding and
   passing fds are host work; inside a setup closure (`g.run(|| ...)`) the thread's syscalls are
   the guest's (mounts, files); between closures the process is an ordinary one again (threads,
-  host programs: none may be left at lockdown). `g.lockdown(unsharek::stdio)` grants the program's
-  stdio (none is by default) and locks down: after it the host has only the mode's short
+  host programs: none may be left at lockdown). `unsharek::lockdown(unsharek::stdio())` grants
+  the program's stdio (none is by default) and locks down: after it the host has only the mode's short
   allowlist.
 
 ## nix-program: a Nix program and its closure
 
 `unsharek` spelled out with the library: the program's closure from the image cache
-(`store::Cache::open_default`, `store`), `Guest::boot`, each image mapped (`map_store`;
-`map_closure` is both steps), `setup::mount_closure` in a setup closure, then lockdown and exec. The parent
+(`store::Cache::open_default`, `store`), `Guest::boot`, each image mapped (`map_store`),
+`setup::mount_closure` in a setup closure (`mount_closure` is all of it), then lockdown and exec. The parent
 measures the sandbox from outside. Arguments are the program to run (default:
 `$UNSHAREK_TEST_PYTHON -c 'print(6*7)'`).
 
@@ -127,7 +127,7 @@ coroutine: compute  1396.6 ms, whole run  1471.7 ms  (3.7x native)
 
 ## escape: the host filter
 
-A hostile program, a closure run as the sandbox's program (`Locked::run`), calls host
+A hostile program, a closure run as the sandbox's program (`g.run` after lockdown), calls host
 syscalls through the runtime's own syscall instruction, the "gate", which it finds by scanning
 the binary's code (it shares the address space: nothing in it is hidden), with a few lines of
 `asm!`. It also tries an fd the process had open before lockdown, which lockdown closed. As a

@@ -27,7 +27,7 @@ use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
-use unsharek::{Guest, GuestConfig, NetError, setup};
+use unsharek::{Guest, GuestConfig, NetError};
 use unsharek_examples::{self as ex, mux};
 
 const CLIENT: &str = r#"
@@ -91,13 +91,15 @@ fn sandbox(sock: UnixStream, urls: Vec<String>) -> Result<unsharek::Child, unsha
     g.on_resolve(on_resolve)?;
     g.on_start(mux::start);
     g.hold_fd_as("net", sock.into())?;
-    let store = g.map_closure(&python, &[])?;
-    g.run(|| setup::mount_closure(&store))??;
+    g.mount_closure(&[&python])?;
     let mut argv = vec![python.display().to_string(), "-c".into(), CLIENT.into()];
     argv.extend(urls);
     let argv: Vec<_> = argv.into_iter().map(Into::into).collect();
     let env = ex::os(&["PYTHONUNBUFFERED=1"]); // its lines in order with the proxy's
-    g.spawn(move |g| g.lockdown(unsharek::stdio)?.exec(&argv, &env))
+    g.spawn(move |mut g| {
+        unsharek::lockdown(unsharek::stdio())?;
+        Err(g.run(move || unsharek::execve(&argv, &env))?)
+    })
 }
 
 fn main() {

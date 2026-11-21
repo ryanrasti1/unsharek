@@ -262,8 +262,7 @@ fn template_process(mode: &str) -> ! {
     let m = if mode == "threaded" { unsharek::Mode::Threaded } else { unsharek::Mode::Coroutine };
     let prog = fx::bin("ready_idle");
     let mut g = unsharek::Guest::boot(unsharek::GuestConfig { mode: m, ..Default::default() }).unwrap();
-    let mounts = g.map_closure(&prog, &[fx::bin_dir()]).unwrap();
-    g.run(|| unsharek::setup::mount_closure(&mounts)).unwrap().unwrap();
+    g.mount_closure(&[fx::bin_dir()]).unwrap();
     let argv = [OsString::from(&prog)];
     let mut kids = vec![];
     // SAFETY: fd 3 is the control pipe the parent gave this process.
@@ -272,12 +271,9 @@ fn template_process(mode: &str) -> ! {
     while ctl.read_line(&mut line).is_ok_and(|n| n > 0) {
         line.clear();
         let child = g
-            .spawn(|g| {
-                g.lockdown(|s| {
-                    s.grant(0).grant(1).grant(2);
-                    Ok(())
-                })?
-                .exec(&argv, &[])
+            .spawn(|mut g| {
+                unsharek::lockdown(unsharek::stdio())?;
+                Err(g.run(|| unsharek::execve(&argv, &[]))?)
             })
             .unwrap();
         println!("PID {}", child.pid());
