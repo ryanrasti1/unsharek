@@ -11,10 +11,11 @@ dispatch, switched by a selector byte). `mount_closure(&[paths])` shows store pa
 only, each at its own path (mapped from the image cache, mounted in the guest: the program's code
 maps in place from them); `map_image` maps an image as the read-only block device
 `/dev/unsharek/<name>`. `pass_fd(fd, n)` gives the guest a host fd as its fd `n`, `hold_fd` keeps
-one for the hooks; both are granted at lockdown. `unsharek::lockdown(config)` is unsharek-tcb's
-lockdown, re-exported as it is: the booted guest registered itself with it, so it runs the guest's
-preparation first and keeps the guest's own fds; `config` (`SandboxConfig`) has the caller's
-grants (`c.grant(fd)`; `unsharek::stdio()` grants 0-2, as the CLI does): nothing else stays open.
+one for the hooks; both are granted at lockdown. The sandbox's config (`SandboxConfig`) is plain
+data: the caller's grants (`.grant([0, 1, 2])`, as the CLI does: none is by default), then
+`g.configure_sandbox(c)`, setup's last step, which makes the guest's own fds and adds them, the
+gate, the mode and the passed and held fds. `unsharek::lockdown(c)` is unsharek-tcb's lockdown,
+re-exported as it is: it uses the config and nothing else, and nothing not in it stays open.
 After it, `g.run(closure)` is the program: `g.run(|| unsharek::execve(&argv, &env))` the guest's
 exec of one, or Rust run as the program (its `i32` the status: tests, programs written against
 unsharek).

@@ -158,10 +158,11 @@ fn main() -> ExitCode {
         }
         Ok(())
     };
-    let grants = |s: &mut unsharek::SandboxConfig| {
-        fs::grant(&host_dirs, s);
-        if let Some(n) = &net {
-            n.grant(s);
+    let grants = |c: unsharek::SandboxConfig| {
+        let c = fs::grant(&host_dirs, c);
+        match &net {
+            Some(n) => n.grant(c),
+            None => c,
         }
     };
     let Err(e) = unsharek::run_with(config, prepare, grants);

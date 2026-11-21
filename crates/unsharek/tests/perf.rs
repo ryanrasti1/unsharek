@@ -272,7 +272,7 @@ fn template_process(mode: &str) -> ! {
         line.clear();
         let child = g
             .spawn(|mut g| {
-                unsharek::lockdown(unsharek::stdio())?;
+                unsharek::lockdown(unsharek::SandboxConfig::new().grant([0, 1, 2]).pipe(|c| g.configure_sandbox(c))?)?;
                 Err(g.run(|| unsharek::execve(&argv, &[]))?)
             })
             .unwrap();

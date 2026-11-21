@@ -66,7 +66,7 @@ fn boot(m: Mode) -> Guest {
 /// Lockdown with the program's stdio granted, then `argv` exec'd: after lockdown `run`'s closure
 /// is the program, so this returns only its failure.
 fn exec(g: &mut Guest, argv: &[OsString], env: &[OsString]) -> unsharek::Error {
-    if let Err(e) = unsharek::lockdown(unsharek::stdio()) {
+    if let Err(e) = g.configure_sandbox(unsharek::SandboxConfig::new().grant([0, 1, 2])).and_then(|c| unsharek::lockdown(c).map_err(Into::into)) {
         return e.into();
     }
     match g.run(|| unsharek::execve(argv, env)) {
@@ -103,10 +103,9 @@ fn child(layer: &str, name: &str) -> ! {
             // A lockdown that fails (a grant of an fd that isn't open) leaves the guest half
             // prepared: a run after it is an error, never a setup closure or the program.
             let mut g = boot(m);
-            let mut c = unsharek::stdio();
-            c.grant(900);
+            let c = g.configure_sandbox(unsharek::SandboxConfig::new().grant([0, 1, 2, 900])).unwrap();
             let refused = matches!(unsharek::lockdown(c), Err(unsharek::tcb::Error::NotOpen(900)));
-            let after = matches!(g.run(|| 0), Err(unsharek::Error::LockdownFailed));
+            let after = matches!(g.run(|| 0), Err(unsharek::Error::NotLockedDown));
             println!("RUN_AFTER_FAILED {refused} {after}");
             std::process::exit(0)
         }
@@ -290,7 +289,7 @@ fn run_fn(m: Mode, what: &str) -> unsharek::Error {
     std::mem::forget(before);
     let host_path = env!("CARGO_MANIFEST_DIR");
     let what = what.to_owned();
-    if let Err(e) = unsharek::lockdown(unsharek::stdio()) {
+    if let Err(e) = g.configure_sandbox(unsharek::SandboxConfig::new().grant([0, 1, 2])).and_then(|c| unsharek::lockdown(c).map_err(Into::into)) {
         return e.into();
     }
     let r = g.run(move || {

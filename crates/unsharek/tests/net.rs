@@ -420,7 +420,7 @@ fn child(kind: &str) -> ! {
     })
     .unwrap();
     let env: Vec<OsString> = vec![if fork { "UNSHAREK_TEST_MODE=fork" } else { "UNSHAREK_TEST_MODE=coroutine" }.into()];
-    unsharek::lockdown(unsharek::stdio()).unwrap();
+    g.configure_sandbox(unsharek::SandboxConfig::new().grant([0, 1, 2])).and_then(|c| unsharek::lockdown(c).map_err(Into::into)).unwrap();
     let e = match g.run(move || unsharek::execve(&argv, &env)) {
         Ok(e) | Err(e) => e,
     };

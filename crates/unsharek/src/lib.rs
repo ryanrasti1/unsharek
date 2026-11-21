@@ -8,8 +8,9 @@
 //! let mut g = Guest::boot(GuestConfig { mode: Mode::Coroutine, ..Default::default() })?; // the kernel
 //! g.mount_closure(&closure)?;                          // store paths: mapped, and mounted in the guest
 //! g.run(|| std::fs::write("/etc/motd", "hi\n"))??;    // this thread's syscalls are the guest's, as init
-//! let mut c = unsharek::SandboxConfig::default();      // the grants: none but these is kept
-//! c.grant(0).grant(1).grant(2);
+//! let c = unsharek::SandboxConfig::new()
+//!     .grant([0, 1, 2])                                // kept: none but these, and the guest's
+//!     .pipe(|c| g.configure_sandbox(c))?;              // the guest's part, setup's last step
 //! unsharek::lockdown(c)?;                              // unsharek-tcb's lockdown, as it is
 //! let e = g.run(|| unsharek::execve(&argv, &env))?; // the program; the process ends with it
 //! # Err(e) }
@@ -44,8 +45,8 @@ pub mod setup;
 pub mod store;
 
 pub use unsharek_tcb as tcb;
-/// Lockdown, unsharek-tcb's own: re-exported, not wrapped. The booted guest registers itself with
-/// it ([`tcb::register`]), so it runs the guest's preparation first.
+/// Lockdown, unsharek-tcb's own: re-exported, not wrapped. It uses its config and nothing else; the
+/// guest's part of it is [`Guest::configure_sandbox`]'s.
 pub use unsharek_tcb::{Config as SandboxConfig, lockdown};
 pub use image::Image;
 pub use net::{Cx, GuestSocket, HeldFd, NetError, OnConnect, OnListen, OnResolve};
@@ -98,10 +99,10 @@ pub enum Error {
     Threads(String),
     #[error("not implemented yet: {0}")]
     NotImplemented(&'static str),
-    /// A [`Guest::run`] after a lockdown that failed: the guest was half prepared (its routing
-    /// off), and can't set up or run anything.
-    #[error("the sandbox's lockdown failed: nothing can run")]
-    LockdownFailed,
+    /// A [`Guest::run`] after [`Guest::configure_sandbox`] but without a lockdown (not yet made,
+    /// or failed): setup is over (the routing is off), and the program runs only once locked down.
+    #[error("setup is over (configure_sandbox ran) but the process isn't locked down: lock down, then run the program")]
+    NotLockedDown,
 }
 
 impl Error {
@@ -159,7 +160,7 @@ pub struct Guest {
     zone: (usize, usize),
     /// Fork mode's kernel memory is mapped shared (no template may fork it).
     shared: bool,
-    /// What lockdown asks of the guest, registered with the TCB at boot.
+    /// The guest's state for lockdown and after it.
     link: &'static Link,
     _thread: PhantomData<*const ()>,
 }
@@ -171,8 +172,8 @@ impl std::fmt::Debug for Guest {
     }
 }
 
-/// The guest as lockdown sees it ([`tcb::Confined`]): one per process, made at boot, leaked (it
-/// lives as long as the process) and registered with the TCB, which calls it from [`lockdown`].
+/// The guest's state around lockdown: one per process, made at boot, leaked (it lives as long as
+/// the process: the program's run reads it after lockdown).
 struct Link {
     mode: Mode,
     max_procs: u32,
@@ -185,34 +186,15 @@ struct LinkState {
     passed: Vec<RawFd>,
     held: Vec<RawFd>,
     /// The guest's own host fds, made at lockdown (the CPU tokens' eventfds, init's pidfd), for
-    /// the TCB to check and keep ([`tcb::Confined::host_fds`]).
+    /// the TCB to check and keep ([`tcb::Config::guest_fds`]).
     host_fds: Vec<RawFd>,
     hooks: net::Hooks,
     /// The hooks' first task, spawned when the program starts.
     on_start: Option<net::StartFn>,
-    /// [`tcb::Confined::before_lockdown`] ran: setup is over, whether lockdown then succeeded or not.
+    /// [`Guest::configure_sandbox`] ran: setup is over, whether lockdown then succeeded or not.
     prepared: bool,
     /// The post-lockdown steps ran ([`Link::start`]).
     started: bool,
-}
-
-impl tcb::Confined for Link {
-    fn host_fds(&self) -> Vec<RawFd> {
-        self.st.borrow().host_fds.clone()
-    }
-    fn gate_ip(&self) -> u64 {
-        unsharek_rt::trap::gate_ip()
-    }
-    fn mode(&self) -> Mode {
-        self.mode
-    }
-    fn grants(&self) -> Vec<RawFd> {
-        let st = self.st.borrow();
-        st.passed.iter().chain(&st.held).copied().collect()
-    }
-    fn before_lockdown(&self) -> tcb::Result<()> {
-        self.prepare().map_err(tcb::Error::guest)
-    }
 }
 
 impl Link {
@@ -428,7 +410,6 @@ impl Guest {
         });
         let link: &'static Link =
             Box::leak(Box::new(Link { mode: config.mode, max_procs: config.max_procs, st: Default::default() }));
-        tcb::register(link);
         Ok(Guest { zone: (arena + memory, arena + memory + zone), shared, link, _thread: PhantomData })
     }
 
@@ -683,19 +664,39 @@ impl Guest {
     /// allocations come from the region reserved at boot (the global allocator after lockdown); a
     /// panic in it is the runtime's (the sandbox dies of SIGABRT); its host fds are the granted
     /// ones (any other was closed at lockdown: a `File` captured from before is a closed or a
-    /// guest fd now). After a lockdown that failed: [`Error::LockdownFailed`].
+    /// guest fd now). After [`Guest::configure_sandbox`] without a lockdown: [`Error::NotLockedDown`].
     pub fn run<R: 'static>(&mut self, f: impl FnOnce() -> R) -> Result<R, Error> {
+        // After `configure_sandbox` (setup's last step) a setup run would hang on the routing it
+        // turned off: an error instead, below.
         if tcb::locked_down() {
             self.link.start()?;
             guest::run_fn(move || status(f()));
         }
         if self.link.st.borrow().prepared {
-            return Err(Error::LockdownFailed);
+            return Err(Error::NotLockedDown);
         }
         self.own()?;
         guest::setup_begin()?;
         let _end = SetupEnd;
         Ok(f())
+    }
+
+    /// The guest's part of the sandbox's config, and setup's last step: the guest's own host fds
+    /// made (threaded and fork mode: the CPU tokens' eventfds; fork mode: init's pidfd), the
+    /// network hooks installed, the allocator and the runtime switched to the sandbox's (no host
+    /// memory calls, the trap instead of syscall user dispatch); then `c` given the mode, those
+    /// fds ([`tcb::Config::guest_fds`]), the gate ([`tcb::Config::gate`]) and the passed and held
+    /// fds as grants. Untrusted code before lockdown, as all of this crate is: lockdown checks what
+    /// it leaves behind. After it no setup [`Guest::run`] works ([`Error::NotLockedDown`]): call
+    /// [`lockdown`] next.
+    pub fn configure_sandbox(&mut self, c: SandboxConfig) -> Result<SandboxConfig, Error> {
+        self.own()?;
+        self.link.prepare()?;
+        let st = self.link.st.borrow();
+        Ok(c.mode(self.link.mode)
+            .guest_fds(st.host_fds.iter().copied())
+            .gate(unsharek_rt::trap::gate_ip())
+            .grant(st.passed.iter().chain(&st.held).copied()))
     }
 
     /// A host fork of the guest's process, before lockdown: a template's instance. The child is a
@@ -868,29 +869,21 @@ pub fn store(config: &Config) -> Result<store::Store, Error> {
     Ok(cache.store_refs(&config.closures)?)
 }
 
-/// A [`SandboxConfig`] granting the program's stdio, as the CLI does ([`run`]): fds 0-2, and
-/// nothing else yet (`unsharek::lockdown(unsharek::stdio())`).
-pub fn stdio() -> SandboxConfig {
-    let mut c = SandboxConfig::default();
-    c.grant(0).grant(1).grant(2);
-    c
-}
-
 /// Become the sandbox: [`Guest::boot`] for the mode, the closures' images mapped and mounted in a
 /// [`Guest::run`] closure, [`lockdown`] with the program's stdio granted
 /// (fds 0-2), the program [`execve`]d in [`Guest::run`]. Returns only on failure before the
 /// program starts; the process ends with the program's status.
 pub fn run(config: Config) -> Result<Infallible, Error> {
-    run_with(config, |_| Ok(()), |_| {})
+    run_with(config, |_| Ok(()), |c| c)
 }
 
 /// [`run`], with the caller's two additions: `prepare`, on the booted guest before setup (hooks,
-/// held fds: a plugin's), and `grants`, inside lockdown's, after stdio's (the fds `config`'s
+/// held fds: a plugin's), and `grants`, on the sandbox's config after stdio's (the fds `config`'s
 /// host directories use, a plugin's control socket). Nothing here knows a plugin.
 pub fn run_with(
     config: Config,
     prepare: impl FnOnce(&mut Guest) -> Result<(), Error>,
-    grants: impl FnOnce(&mut SandboxConfig),
+    grants: impl FnOnce(SandboxConfig) -> SandboxConfig,
 ) -> Result<Infallible, Error> {
     let store = store(&config)?;
     let mut g = Guest::boot(GuestConfig { mode: config.mode, max_procs: config.max_procs.unwrap_or(0), ..Default::default() })?;
@@ -924,8 +917,7 @@ pub fn run_with(
         }
         Ok(())
     })??;
-    let mut c = stdio();
-    grants(&mut c);
+    let c = grants(SandboxConfig::new().grant([0, 1, 2])).pipe(|c| g.configure_sandbox(c))?;
     lockdown(c)?;
     let env = config.env;
     // After lockdown the closure is the program: this returns only if the run itself failed.

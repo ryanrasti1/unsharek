@@ -35,7 +35,7 @@ fn main() -> Result<(), unsharek::Error> {
     g.mount_closure(&[&python])?;
     let argv = ex::os(&[python.to_str().unwrap(), "-c", SQUARES]);
     let child = g.spawn(move |mut g| {
-        unsharek::lockdown(unsharek::stdio())?;
+        unsharek::lockdown(unsharek::SandboxConfig::new().grant([0, 1, 2]).pipe(|c| g.configure_sandbox(c))?)?;
         Err(g.run(move || unsharek::execve(&argv, &[]))?)
     })?;
 

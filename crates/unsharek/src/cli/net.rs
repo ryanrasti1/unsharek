@@ -46,8 +46,7 @@ impl Net {
     }
 
     /// Lockdown's part: the control socket, `recvmsg`'s one fd.
-    pub fn grant(&self, s: &mut unsharek::SandboxConfig) {
-        s.grant(self.fd);
-        s.recv_fds = Some(self.fd);
+    pub fn grant(&self, c: unsharek::SandboxConfig) -> unsharek::SandboxConfig {
+        c.grant([self.fd]).recv_fds(self.fd)
     }
 }

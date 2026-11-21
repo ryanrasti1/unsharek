@@ -46,7 +46,7 @@ fn sandbox(argv: Vec<OsString>) -> ! {
     //    behind the mode's filter: after lockdown, `run`'s closure is the program, and this
     //    returns only if it couldn't be started.
     let env = ex::os(&["PATH=/bin", "LANG=C.UTF-8"]);
-    if let Err(e) = unsharek::lockdown(unsharek::stdio()) {
+    if let Err(e) = g.configure_sandbox(unsharek::SandboxConfig::new().grant([0, 1, 2])).and_then(|c| unsharek::lockdown(c).map_err(Into::into)) {
         ex::fail(e.into())
     }
     match g.run(move || unsharek::execve(&argv, &env)) {

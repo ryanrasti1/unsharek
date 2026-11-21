@@ -97,7 +97,7 @@ fn sandbox(attempt: &str) -> ! {
         let secret = std::fs::File::open(std::env::current_exe()?)?;
         let fd = secret.as_raw_fd();
         std::mem::forget(secret);
-        unsharek::lockdown(unsharek::stdio())?;
+        unsharek::lockdown(unsharek::SandboxConfig::new().grant([0, 1, 2]).pipe(|c| g.configure_sandbox(c))?)?;
         let attempt = attempt.to_owned();
         // After lockdown the closure is the program: its return value its status.
         g.run(move || hostile(&attempt, fd))?;

@@ -97,7 +97,7 @@ fn sandbox(sock: UnixStream, urls: Vec<String>) -> Result<unsharek::Child, unsha
     let argv: Vec<_> = argv.into_iter().map(Into::into).collect();
     let env = ex::os(&["PYTHONUNBUFFERED=1"]); // its lines in order with the proxy's
     g.spawn(move |mut g| {
-        unsharek::lockdown(unsharek::stdio())?;
+        unsharek::lockdown(unsharek::SandboxConfig::new().grant([0, 1, 2]).pipe(|c| g.configure_sandbox(c))?)?;
         Err(g.run(move || unsharek::execve(&argv, &env))?)
     })
 }

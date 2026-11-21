@@ -29,7 +29,7 @@ fn sandbox(mode: Mode) -> ! {
         // The fixtures live outside the store: their directory is allowed as is, and brings the
         // closure of whatever its files reference (glibc).
         g.mount_closure(&[fx::bin_dir()])?;
-        unsharek::lockdown(unsharek::stdio())?;
+        unsharek::lockdown(unsharek::SandboxConfig::new().grant([0, 1, 2]).pipe(|c| g.configure_sandbox(c))?)?;
         let argv = ex::os(&[prog.to_str().unwrap(), THREADS, iterations()]);
         Err(g.run(move || unsharek::execve(&argv, &[]))?)
     };

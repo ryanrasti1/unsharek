@@ -58,7 +58,7 @@ fn main() -> Result<(), unsharek::Error> {
     })??;
     let argv = ex::os(&[python.to_str().unwrap(), "/app/main.py"]);
     let env = ex::os(&[&format!("HOST_DIR={host_dir}")]);
-    if let Err(e) = unsharek::lockdown(unsharek::stdio()) {
+    if let Err(e) = g.configure_sandbox(unsharek::SandboxConfig::new().grant([0, 1, 2])).and_then(|c| unsharek::lockdown(c).map_err(Into::into)) {
         ex::fail(e.into())
     }
     match g.run(move || unsharek::execve(&argv, &env)) {

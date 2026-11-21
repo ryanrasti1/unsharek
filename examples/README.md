@@ -23,8 +23,9 @@ Two things hold in all of them:
 - **Host work and setup interleave until lockdown.** Booting, mapping images, holding and
   passing fds are host work; inside a setup closure (`g.run(|| ...)`) the thread's syscalls are
   the guest's (mounts, files); between closures the process is an ordinary one again (threads,
-  host programs: none may be left at lockdown). `unsharek::lockdown(unsharek::stdio())` grants
-  the program's stdio (none is by default) and locks down: after it the host has only the mode's short
+  host programs: none may be left at lockdown). `SandboxConfig::new().grant([0, 1, 2])` grants
+  the program's stdio (none is by default), `g.configure_sandbox(c)` adds the guest's part, and
+  `unsharek::lockdown(c)` locks down: after it the host has only the mode's short
   allowlist.
 
 ## nix-program: a Nix program and its closure
