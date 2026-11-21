@@ -1,29 +1,33 @@
 # unsharek
+A sandboxing tool that runs unmodified Linux programs in a separate (unshared) kernel, secured by an
+extremely minimal and tight seccomp filter: as few as 6 host syscalls.
 
-A sandboxing tool that runs unmodified Linux programs in a separate (unshared) kernel, secured by a
-extremely minimal and tight seccomp filter: as few as 6 host syscalls, each argument pinned.
+A cold sandbox **runs bash in ~14ms with just 4.6MB PSS** (including bash itself)
+A warm sandbox (forked from a template) **boots in just 3ms and costs an incremental 1.9MB PSS**
 
-unsharek links [LKL](https://github.com/lkl/linux) (Linux as a library) into its own process. It then
-traps the program's syscalls and serves them in the guest kernel. It is secured by applying an
-extremely minimal seccomp profile.
-
-See [crates/unsharek-tcb/README.md](crates/unsharek-tcb/README.md) for the TCB and the security
-guarantees: about 600 lines, and the filter is proven equal to its policy.
-
-An idle bash costs 4.6 MB (PSS), a sandbox forked from a template 1.9 MB and 3 ms; a syscall the
-guest serves ~2.7 µs; single-threaded CPU work runs within 5% of native, `rustc` with 16 codegen
-units within 9%, `make -j4` at 2x. [bench/STATS.md](bench/STATS.md) has the table,
-`cargo xtask stats` re-measures it.
 
 ## Using it
 
 ```sh
-unsharek -- /nix/store/…-hello/bin/hello                # a Nix program: its closure is mounted read-only
-unsharek --mode threaded -- $(which python3) -c 'print(6 * 7)'
-unsharek --mode fork -- $(which bash) -c 'ls / | wc -l'  # anything that forks: fork mode
-unsharek --ro ./data --setenv LANG=C.UTF-8 -- $(which sort) ./data/words   # a host directory, live
-unsharek --mode fork --rw $PWD/out -- $(which bash) -c "echo built > $PWD/out/result"  # read-write
-unsharek --image app=./app.erofs:/app -- /app/bin/server
+unsharek --closure /nix/store/…-hello -- /nix/store/…-hello/bin/hello   # a store path and its closure
+unsharek --system -- python3 -c 'print(6 * 7)'      # the host's system read-only: the easy way
+unsharek --system --mode fork -- bash               # an interactive shell (anything that forks: fork mode)
+```
+
+**Host directories** (experimental): `--ro` serves one live and read-only, `--rw` read-write, each
+through a confined server process of its own ([Filesystem](#filesystem)):
+
+```sh
+unsharek --system --mode fork --ro ./src:/src --rw ./out:/out -- bash -c 'cp -r /src/. /out/ && ls /out'
+```
+
+**Network** (experimental): `--net public` (public addresses only) or `--net all`, and `--publish`
+for inbound ([Network](#network-experimental)):
+
+```sh
+unsharek --system --mode fork --net public -- curl -sI https://example.com    # connect
+unsharek --system --mode fork --net all --publish 8080:8000 -- python3 -m http.server 8000
+curl localhost:8080                                                         # listen, from the host
 ```
 
 The program sees a Linux machine of its own: `/proc`, `/dev`, a writable `/tmp` (in the guest's
@@ -37,13 +41,13 @@ The CLI is a thin layer over a Rust library:
 
 ```rust
 let mut g = unsharek::Guest::boot(GuestConfig { mode: Mode::Coroutine, ..Default::default() })?;
-let mounts = g.map_closure(&program, &[])?;      // host work: the closure's images mapped
-g.run(|| unsharek::setup::mount_closure(&mounts))??; // this closure's syscalls are the guest's: its init
-let locked = g.lockdown(|s| {                     // unsharek-tcb: checks, closes every other fd,
-    s.grant(0).grant(1).grant(2);                 // installs the filter; grants are the only way out
-    Ok(())
-})?;
-locked.exec(&argv, &env)                          // the program; returns only if it couldn't start
+g.mount_closure(&[&program])?;                       // its store paths, mapped and mounted
+g.run(|| std::fs::write("/etc/motd", "hi\n"))??;     // setup: this thread's syscalls are the guest's
+let c = unsharek::SandboxConfig::new()
+    .grant([0, 1, 2])                                // kept: none but these, and the guest's
+    .pipe(|c| g.configure_sandbox(c))?;              // the guest's part, setup's last step
+unsharek::lockdown(c)?;                              // unsharek-tcb's lockdown, re-exported as is
+g.run(|| unsharek::execve(&argv, &env))?;            // after lockdown, run's closure is the program
 ```
 
 Before lockdown the process is an ordinary one, and `run` closures are ordinary Rust whose syscalls
@@ -53,11 +57,10 @@ more sandboxes, about 1 ms each. See [crates/unsharek](crates/unsharek/README.md
 
 ## How it works
 
-Syscall user dispatch routes a thread's syscalls to the guest kernel before lockdown, switched on
-and off per closure. Lockdown (unsharek-tcb) checks there is one thread and that every fd and
-mapping is allowed, closes the rest, and installs one seccomp filter: from then on every syscall
-traps (SIGSYS) into the runtime, which serves it in the guest kernel; only the runtime's own
-syscall instruction may reach the host, and only for the mode's few calls.
+unsharek links [LKL](https://github.com/lkl/linux) (Linux as a library) into its own process. Before lockdown,
+syscall user dispatch routes setup's calls to the guest kernel; after it, one seccomp filter traps
+every call into the runtime, which serves it in the guest kernel. Only the runtime's own syscall
+instruction reaches the host, and only for the mode's few calls.
 
 | Crate | What it is |
 |---|---|
@@ -72,46 +75,70 @@ syscall instruction may reach the host, and only for the mode's few calls.
 | [unsharek-build](crates/unsharek-build/README.md) | The fixed-address link for binaries that embed unsharek |
 | [guest-tests](crates/guest-tests/README.md), [fixtures](crates/unsharek-fixtures/README.md) | The tests: in the guest, and from the host |
 
-## Modes
+## The TCB and Runtime Modes
+By default `unsharek` runs Linux programs unmodified in `coroutine` mode, meaning that all in-guest threads are implemented as coroutines on a single host thread and non-preemptable. Most programs work in `coroutine` mode but for performance and compatibility, `unsharek` offers 3 modes:
 
 | Mode | For | Threads | Processes | Host syscalls after lockdown |
 |---|---|---|---|---|
 | `coroutine` (default) | single programs | the program's and the kernel's, as coroutines on one host thread | one | `read`, `write` (granted fds), `ppoll` (≤ 8 fds), `kill` (itself), `exit_group`, `rt_sigreturn` |
 | `threaded` | multithreaded programs | a host thread per program thread; one guest CPU passed between them | one | coroutine's, plus `clone` (a thread's exact flags) and `exit(0)` |
-| `fork` | programs that fork (bash, make) | as threaded | a guest fork is a host fork; one shared guest kernel | threaded's, plus `clone(SIGCHLD)`, no new stack |
+| `fork` | programs that fork (bash, make) | as threaded | a guest fork is a host fork; one shared guest kernel | threaded's, plus `clone(SIGCHLD)` or `clone(CLONE_PARENT \| SIGCHLD)`, no new stack |
 
-Anything else from the runtime's syscall instruction kills the sandbox; a call from anywhere else
-traps and is served in the guest. The exact policy, with each argument, is
-[unsharek-tcb's table](crates/unsharek-tcb/README.md).
+That list, and lockdown's checks of what fds and mappings the process keeps, are the whole TCB:
+nothing else in the process (the runtime, the guest kernel, the program) is trusted. The exact policy, each argument
+pinned and proven equal to its compiled filter, is [unsharek-tcb's table](crates/unsharek-tcb/README.md).
 
-## Network
+The experimental features below widen it, explicitly: `--net` adds `recvmsg` on its control socket
+and `close` of the connections it received, and both `--net` and `--ro`/`--rw` DIR add a host
+process of their own, isolated by its own filter (and Landlock), much like a VM's device process.
 
-The program's sockets are its own for loopback. With the library's hooks, a `connect` elsewhere is
-`on_connect`, whose stream unsharek copies to and from the program's socket; a `listen` is offered
-to `on_listen`; name lookups are `on_resolve`. With no hook, everything but loopback is unreachable.
-**A hook is not a policy point**: hooks run after lockdown in the program's address space, so a
-compromised program can skip them. Policy is enforced at the far end of the provider's fd, in its own
-process. See [crates/unsharek](crates/unsharek/README.md).
+## Network (experimental)
+The guest kernel impersonates the program's sockets (inspired by libkrun's Transparent Socket
+Impersonation): loopback stays in the guest; any other `connect` or `listen` is handed to the host.
+
+The CLI provides two modes:
+- `--net public`: the guest can reach public addresses only (no loopback, private ranges, link-local or metadata IPs)
+- `--net all`: the guest can reach whatever the host can reach
+
+Additionally, you can publish a port from the guest:
+- `--publish [IP:]HOST:GUEST`: connections to HOST on the host reach the guest's listener on GUEST
 
 ## Filesystem
-
-A Nix program's closure is shown as erofs images, one per store path, built once and cached; ELF
-files are mapped in place from them, shared across sandboxes through the host's page cache. `--ro`
-of a store path adds it (with its closure) the same way. Anything else the program writes goes to
-the guest's own memory.
+`--closure` store paths are mapped read-only before lockdown: their code maps in place, shared
+across sandboxes through the host's page cache. `--system` serves the host's system directories
+live instead.
 
 **Plugin (experimental): host directories, live.** `--ro DIR[:AT]` and `--rw DIR[:AT]` serve a host
-directory through the guest's stock virtio-fs driver, from a file server of its own
+directory through Linux's stock virtio-fs driver, from a file server of its own
 ([unsharek-fs-server](crates/unsharek-fs-server/README.md): virtiofsd's passthrough file system,
-confined by Landlock to the directory and by its own proven filter). The sandbox gains one granted
-socket per directory, and nothing in its filter. The host's changes are seen within a second; reads
-and writes cost a round trip to the server per request (about 5x native on large files today).
+confined by Landlock to the directory and by its own proven filter).
+
+## Motivation: yet another sandbox?
+A sandbox can be lightweight, interoperable, or strongly isolated. Until now you've had to pick two.
+
+- **Containers** (Docker, bwrap, nsjail): lightweight and interoperable, but weak on isolation (shares the host kernel, hundreds of syscalls by default).
+- **VMs** (Firecracker, Kata): strongly isolated, but heavy on memory overhead (tens of MB) and startup time (100+ms) and needs significant plumbing
+- **Isolates** (Cloudflare Workers): lightweight but weaker interop (custom runtime) and isolation story (v8 is a huge TCB)
+- **WASM**: lightweight and isolated, but can't run regular Linux programs
+- **gVisor**: middling on all three: a reimplemented kernel (compatibility gaps), dozens of host syscalls, and a large TCB
+
+`unsharek` is all three:
+- **lightweight**: <5MB overhead per instance, milliseconds to boot
+- **interoperable**: unmodified Linux programs on a real Linux kernel; pipes, sockets and stdio shared with the host like any process
+- **isolated**: 6 host syscalls in coroutine mode, each argument pinned and proven: less host kernel surface than a VM's KVM interface, with a [~600-line TCB](crates/unsharek-tcb/README.md)
+
+The timely reason is agents, but not for the reason you'd expect (i.e., sandboxing tool calls). Instead, it's that agents are producing code at a much faster rate than we can review or control. New primitives for fine-grained isolation, sharing, and policy are the bottleneck to deploying safely.
 
 ## Status and performance
-
-Works in every mode unless noted: unmodified dynamic and static programs (glibc, musl, Go), exec in
+`unsharek` has been run on  a handful for programs and works in every mode unless noted: unmodified dynamic and static programs (glibc, musl, Go), exec in
 the guest, signals, ttys, pipes, threads, fork mode's processes, templates (coroutine and threaded),
-the network hooks. `cargo xtask test` runs about 640 cases in seconds.
+the network. That said, it is early and expect rough edges.
+
+Very little has been done yet in terms of work for performance and there is no fundamental reason that the architecture
+cannot approach (and in some cases even beat -- such as in the case of syscall heavy code which in the guest can simply
+be  function call) native Linux programs. 
+
+Preliminary numbers:
 
 | | native | coroutine | threaded | fork |
 |---|---|---|---|---|
@@ -128,17 +155,20 @@ Medians on a 24-CPU Core Ultra 9, 2026-11-19: the full table, with spreads, is
 The guest has one CPU, which is most of the build gap ([bench/PERF.md](bench/PERF.md)). Known
 limits:
 
-- **Fork mode:** a forked process's network beyond loopback, `MAP_SHARED` memory across a fork, and
-  templates.
-- **Signals to running code** are delivered at the thread's next syscall, so Go's asynchronous
-  preemption doesn't land.
-- **Bad pointers** passed to a call the guest serves end the sandbox (SIGSEGV), not with EFAULT.
-- **At most 256 images** a sandbox; `exec` of `/proc/self/exe` is ENOEXEC.
+- **Fork mode:** `MAP_SHARED` memory across a fork, and templates.
+- **Signals to running code** are delivered at the thread's next syscall, in every mode: a loop
+  that makes no calls can't be interrupted from inside the guest (not even by `timeout`), and Go's
+  asynchronous preemption doesn't land. In coroutine mode such a loop also stalls every other thread.
+- **No MMU:** LKL is a no-MMU Linux, so compatibility isn't complete: a bad pointer passed to a call
+  ends the sandbox (SIGSEGV) rather than returning EFAULT, and fork is fork mode's, not the kernel's.
+- **At most 256 store paths** through `--closure`. `exec` of `/proc/self/exe` is ENOEXEC: the guest
+  kernel keeps one exe link for every process (init's), which the runtime answers `readlink` for
+  but can't exec.
 
 ## Development
 
 ```sh
-direnv allow                 # the devshell (.envrc, nix-direnv); or prefix: nix develop -c
+nix develop                  # or `direnv allow`; the devshell
 cargo xtask test             # everything, incremental, seconds warm (cargo-nextest; args pass through)
 cargo xtask test -E 'test(/::fork$/)'   # one mode of the suite
 cargo xtask perf             # the performance budgets; `vs-native` for build workloads
@@ -147,11 +177,6 @@ cargo xtask prove            # Kani: the filter is its policy (minutes)
 nix build                    # the distributed binary; .#checks.x86_64-linux.smoke, the release check
 ```
 
-The kernel is the submodule `crates/lkl-sys/linux` (`git clone --recurse-submodules`), built out of
-tree on first use (about 20 s) and incrementally after. `UNSHAREK_LKL_SRC` names another checkout and
-`UNSHAREK_LKL_CONFIG` a config fragment over `crates/lkl-sys/defconfig`; see
-[crates/lkl-sys](crates/lkl-sys/README.md), including custom kernels from the flake's `lib`. How to
-work on unsharek: [AGENTS.md](AGENTS.md).
 
 ## License
 
