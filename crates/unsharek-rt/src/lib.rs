@@ -21,7 +21,6 @@ extern crate alloc;
 
 pub mod arena;
 pub mod context;
-pub mod dns;
 pub mod exec;
 pub mod executor;
 pub mod futex;

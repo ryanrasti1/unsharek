@@ -13,6 +13,9 @@
 //   loopback              a server of the guest's own on 127.0.0.1: still the guest's
 //   resolve NAME IP NX DENIED   getaddrinfo: NAME is IP (no IPv6 address); NX has none
 //                         (EAI_NONAME); DENIED fails, not as a temporary failure
+//   udp IP PORT           a connected UDP socket: "ping" sent, "pong" back (a datagram each,
+//                         polled for, nonblocking); recvfrom says IP:PORT; an unconnected sendto
+//                         to an address beyond loopback is ENETUNREACH
 //   listen PORT PEER      a listen on 0.0.0.0:PORT gets the host's connection from PEER, which
 //                         says "hello from the host"
 //   churn IP PORT N       N connections one after another, each a ping echoed and closed, then
@@ -243,6 +246,36 @@ static void resolve(char **a)
 	printf("resolve: %s: %s\n", a[3], gai_strerror(r));
 }
 
+static void udp(char **a)
+{
+	struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(atoi(a[1])) }, from;
+	CHECK(inet_pton(AF_INET, a[0], &to.sin_addr) == 1, "address %s", a[0]);
+	int s = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+	CHECK(s >= 0, "socket: %s", strerror(errno));
+	// UDP's connect returns connected, nonblocking or not (a resolver's socket is so).
+	CHECK(connect(s, (struct sockaddr *)&to, sizeof(to)) == 0, "connect: %s", strerror(errno));
+	CHECK(send(s, "ping1", 5, 0) == 5, "send: %s", strerror(errno));
+	struct pollfd p = { .fd = s, .events = POLLIN };
+	CHECK(poll(&p, 1, 5000) == 1 && (p.revents & POLLIN), "poll: %d %s", p.revents, strerror(errno));
+	char buf[64] = { 0 };
+	socklen_t len = sizeof(from);
+	ssize_t n = recvfrom(s, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&from, &len);
+	CHECK(n == 5 && !memcmp(buf, "pong1", 5), "recvfrom: %zd %s %s", n, buf, strerror(errno));
+	CHECK(from.sin_addr.s_addr == to.sin_addr.s_addr && from.sin_port == to.sin_port, "from %s:%d", inet_ntoa(from.sin_addr), ntohs(from.sin_port));
+	// A second datagram, whole: its boundary kept.
+	CHECK(send(s, "ping22", 6, 0) == 6, "send: %s", strerror(errno));
+	CHECK(poll(&p, 1, 5000) == 1, "poll");
+	n = recv(s, buf, sizeof(buf) - 1, 0);
+	CHECK(n == 6 && !memcmp(buf, "pong22", 6), "recv: %zd", n);
+	close(s);
+	int u = socket(AF_INET, SOCK_DGRAM, 0);
+	struct sockaddr_in far = { .sin_family = AF_INET, .sin_port = htons(9) };
+	inet_pton(AF_INET, "10.0.0.9", &far.sin_addr);
+	CHECK(sendto(u, "x", 1, 0, (struct sockaddr *)&far, sizeof(far)) < 0 && errno == ENETUNREACH, "unconnected sendto: %s", strerror(errno));
+	close(u);
+	printf("udp: a connected socket's datagrams to and from %s:%s\n", a[0], a[1]);
+}
+
 static void do_listen(char **a)
 {
 	int l = socket(AF_INET, SOCK_STREAM, 0);
@@ -340,6 +373,8 @@ int main(int argc, char **argv)
 		loopback();
 	else if (!strcmp(c, "resolve"))
 		resolve(a);
+	else if (!strcmp(c, "udp"))
+		udp(a);
 	else if (!strcmp(c, "listen"))
 		do_listen(a);
 	else

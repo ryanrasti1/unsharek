@@ -1,7 +1,7 @@
 //! The provider's own filter (plugin: capnweb, experimental): what serving the sandbox takes, and
-//! nothing that opens a file. One connect is `socket` (TCP, IPv4 or IPv6), a nonblocking
-//! `connect`, `poll` and `getsockopt` for its end, `fcntl` for its flags; one lookup a UDP `socket`,
-//! `bind`, `connect`, `setsockopt` (a timeout), `sendto` and `recvfrom`; one reply a `write` or, with
+//! nothing that opens a file. One TCP connect is `socket` (IPv4 or IPv6), a nonblocking
+//! `connect`, `poll` and `getsockopt` for its end, `fcntl` for its flags; one UDP connect a UDP
+//! `socket`, `bind` and `connect` (it sends nothing itself: the sandbox does, on the fd); one reply a `write` or, with
 //! the socket in it, a `sendmsg` on the control socket only, then the socket's `close`. The rest is
 //! a single-threaded Rust process's (and a published port's `accept4`, its listener bound before): memory, futexes, signal returns, the exit. Proven equal to
 //! its program like the sandbox's (`policy!`).
@@ -9,9 +9,8 @@
 use libc::{seccomp_data, sock_filter};
 use libc::{
     SYS_accept4, SYS_bind, SYS_brk, SYS_close, SYS_connect, SYS_exit, SYS_exit_group, SYS_fcntl, SYS_futex, SYS_getrandom,
-    SYS_getsockopt, SYS_ioctl, SYS_madvise, SYS_mmap, SYS_mprotect, SYS_mremap, SYS_munmap, SYS_poll, SYS_ppoll, SYS_read, SYS_recvfrom,
-    SYS_rt_sigprocmask, SYS_rt_sigreturn, SYS_sendmsg, SYS_sendto, SYS_setsockopt, SYS_shutdown, SYS_sigaltstack, SYS_socket,
-    SYS_write,
+    SYS_getsockopt, SYS_ioctl, SYS_madvise, SYS_mmap, SYS_mprotect, SYS_mremap, SYS_munmap, SYS_poll, SYS_ppoll, SYS_read,
+    SYS_rt_sigprocmask, SYS_rt_sigreturn, SYS_sendmsg, SYS_shutdown, SYS_sigaltstack, SYS_socket, SYS_write,
 };
 pub use libc::{SECCOMP_RET_ALLOW, SECCOMP_RET_KILL_PROCESS};
 
@@ -25,9 +24,9 @@ pub fn policy(ctl: u64) -> impl Fn(&seccomp_data) -> u32 {
             return SECCOMP_RET_KILL_PROCESS;
         }
         match d.nr as i64 {
-            // Its fds: the control socket, the sockets it dials, the lookup's.
+            // Its fds: the control socket and the sockets it dials.
             SYS_read | SYS_write | SYS_close | SYS_ppoll | SYS_poll | SYS_fcntl => SECCOMP_RET_ALLOW,
-            // A TCP socket (close-on-exec), IPv4 or IPv6: a dial; a UDP one: a lookup.
+            // A TCP socket (close-on-exec), IPv4 or IPv6, or a UDP one: a dial.
             SYS_socket
                 if (d.args[0] == libc::AF_INET as u64 || d.args[0] == libc::AF_INET6 as u64)
                     && (d.args[1] == (libc::SOCK_STREAM | libc::SOCK_CLOEXEC) as u64
@@ -42,7 +41,7 @@ pub fn policy(ctl: u64) -> impl Fn(&seccomp_data) -> u32 {
             SYS_accept4 if d.args[3] == libc::SOCK_CLOEXEC as u64 => SECCOMP_RET_ALLOW,
             // The sandbox's half-close and close of a connection (its own fd can't).
             SYS_shutdown => SECCOMP_RET_ALLOW,
-            SYS_connect | SYS_bind | SYS_getsockopt | SYS_setsockopt | SYS_sendto | SYS_recvfrom => SECCOMP_RET_ALLOW,
+            SYS_connect | SYS_bind | SYS_getsockopt => SECCOMP_RET_ALLOW,
             // A reply with a dialled socket in it: on the control socket only, no flags.
             SYS_sendmsg if d.args[0] == ctl && d.args[2] == 0 => SECCOMP_RET_ALLOW,
             // A Rust process's own: memory, locks, random seeds, signal returns, its end.

@@ -48,7 +48,7 @@ pub use unsharek_tcb as tcb;
 /// it ([`tcb::register`]), so it runs the guest's preparation first.
 pub use unsharek_tcb::{Config as SandboxConfig, lockdown};
 pub use image::Image;
-pub use net::{Cx, GuestSocket, HeldFd, NetError, OnConnect, OnListen, OnResolve};
+pub use net::{Cx, GuestSocket, HeldFd, NetError, OnConnect, OnListen, Proto};
 /// How the sandbox runs the program's threads and processes. Each mode's host allowlist is a
 /// superset of the one before.
 pub use tcb::Mode;
@@ -353,6 +353,21 @@ fn host_entropy() -> Result<[u8; 64], Error> {
 }
 
 /// This process's other host threads (`/proc/self/task`, the caller's own excluded).
+/// The guest's resolv.conf from the host's: its `nameserver`, `search`, `domain` and `options`
+/// lines, the rest (comments) left out. Empty: no nameserver (glibc then asks 127.0.0.1, the
+/// guest's own loopback, where nothing answers).
+fn host_resolv(conf: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for line in conf.split(|&b| b == b'\n') {
+        let word = line.split(|b| b.is_ascii_whitespace()).next().unwrap_or_default();
+        if [&b"nameserver"[..], b"search", b"domain", b"options"].contains(&word) {
+            out.extend_from_slice(line);
+            out.push(b'\n');
+        }
+    }
+    out
+}
+
 fn other_threads() -> Vec<i32> {
     // SAFETY: gettid.
     let me = unsafe { libc::gettid() };
@@ -600,22 +615,21 @@ impl Guest {
     }
 
     /// The guest's `/etc/resolv.conf` and `/etc/hosts`, written (root's: [`setup::resolver`]) when
-    /// the program's names first resolve (an `on_resolve` or `on_connect` hook). A setup may change
-    /// them after.
+    /// the program first has a network (an `on_connect`): the host's resolv.conf (its
+    /// nameservers, asked through the hook like any UDP peer), read here, on the host. A setup may
+    /// change them after.
     fn resolves(&mut self) -> Result<(), Error> {
-        if !self.link.st.borrow().hooks.resolves() {
-            return Ok(());
-        }
-        setup::resolver().map_err(Error::io("the guest's resolver"))
+        let conf = std::fs::read("/etc/resolv.conf").unwrap_or_default();
+        setup::resolver(&host_resolv(&conf)).map_err(Error::io("the guest's resolver"))
     }
 
     /// The program's connects beyond loopback ([`net`]).
     /// A hook is not a policy point: it runs in the program's address space after lockdown, and
     /// a compromised program can skip it. Policy belongs at the far end of the held fds.
     pub fn on_connect(&mut self, hook: OnConnect) -> Result<(), Error> {
-        let first = !self.link.st.borrow().hooks.resolves();
+        let first = !self.link.st.borrow().hooks.connects();
         self.link.st.borrow_mut().hooks.on_connect = hook;
-        if first { self.resolves() } else { Ok(()) }
+        if first && self.link.st.borrow().hooks.connects() { self.resolves() } else { Ok(()) }
     }
 
     /// The program's listens beyond loopback ([`net`]).
@@ -623,14 +637,6 @@ impl Guest {
     /// a compromised program can skip it. Policy belongs at the far end of the held fds.
     pub fn on_listen(&mut self, hook: OnListen) {
         self.link.st.borrow_mut().hooks.on_listen = hook;
-    }
-
-    /// The program's name lookups ([`net`]); like every hook, not a policy point. Without one, but
-    /// with an `on_connect`, every name resolves to an address of its own (see [`Cx::name_of`]).
-    pub fn on_resolve(&mut self, hook: OnResolve) -> Result<(), Error> {
-        let first = !self.link.st.borrow().hooks.resolves();
-        self.link.st.borrow_mut().hooks.on_resolve = hook;
-        if first { self.resolves() } else { Ok(()) }
     }
 
     /// A task started on the hooks' executor at lockdown, before the program: a provider's

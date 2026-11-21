@@ -83,34 +83,31 @@ sandbox: exit 0
 
 ## net-policy: networking through a proxy that holds the policy
 
-After lockdown the sandbox can't make host sockets, so its network is the hooks: `OnResolve` and
-`OnConnect` (set on the guest), here multiplexed over one held fd (`Guest::hold_fd_as("net")`,
-found by the hooks with `cx.held("net")`; framing in `src/mux.rs`) to a proxy process started
-before the sandbox is booted. The session starts at lockdown (`on_start`), and each connect
-carries the name its address was resolved from (`cx.name_of`), so the proxy decides by name. The
-proxy holds the real network and the allowlist (a local HTTP server's name and port;
-`example.com:80` too with `--internet`), refuses the rest (`NetError::NoName`,
-`NetError::Refused`), and logs each attempt with the guest pid.
+After lockdown the sandbox can't make host sockets, so its network is the hooks: `OnConnect` (set
+on the guest), here multiplexed over one held fd (`Guest::hold_fd_as("net")`, found by the hook
+with `cx.held("net")`; framing in `src/mux.rs`) to a proxy process started before the sandbox is
+booted. The session starts at lockdown (`on_start`). The proxy holds the real network and the
+allowlist (addresses of no one's, 10.0.0.N, each mapped to a target with one port: a local HTTP
+server; `example.com:80` too with `--internet`), refuses the rest (`NetError::Refused`), and logs
+each attempt with the guest pid.
 
 The policy is in the proxy, not in the hooks, because of the **authority rule**: the hooks run in
 the program's address space, so a compromised program can rewrite them and drive the held fd
 itself. Whatever the fd's other end allows is what the program can do.
 
 ```
-[proxy] guest pid 1: resolve web.local -> 10.0.0.1
-[proxy] guest pid 1: connect 10.0.0.1:38011 (web.local:38011) -> allowed, to 127.0.0.1:38011
-[python] GET http://web.local:38011/ -> 'hello from the host!'
-[proxy] guest pid 1: resolve web.local -> 10.0.0.1
-[proxy] guest pid 1: connect 10.0.0.1:38012 -> refused (web.local allows port 38011 only)
-[python] GET http://web.local:38012/ -> failed: [Errno 111] Connection refused
-[proxy] guest pid 1: resolve elsewhere.test -> refused (no such name)
-[python] GET http://elsewhere.test/ -> failed: [Errno -2] Name or service not known
+[proxy] guest pid 1: connect 10.0.0.1:38011 -> allowed, to 127.0.0.1:38011
+[python] GET http://10.0.0.1:38011/ -> 'hello from the host!'
+[proxy] guest pid 1: connect 10.0.0.1:38012 -> refused (10.0.0.1 allows port 38011 only)
+[python] GET http://10.0.0.1:38012/ -> failed: [Errno 111] Connection refused
+[proxy] guest pid 1: connect 10.0.0.9:80 -> refused (not on the list)
+[python] GET http://10.0.0.9/ -> failed: [Errno 111] Connection refused
 sandbox: exit 0
 ```
 
-(Only A queries reach the hook: glibc's AAAA query beside each is answered with no data by
-unsharek. Without an `on_resolve` at all, every name would resolve to an address of unsharek's own,
-and the connect hook would still learn the name.)
+Names aren't this example's: the guest's resolver asks its nameservers over UDP, and a stream
+hook carries TCP only. A provider that hands in host fds (`OnConnect::fd`, as the CLI's `--net`
+does) serves them, as any connected UDP socket.
 
 ## threads: why threaded mode exists
 

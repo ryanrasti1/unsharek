@@ -4,7 +4,7 @@
 //! and listens there are the guest kernel's, as always. Everything else goes to the hooks given
 //! to the guest (`unsharek::Guest::on_connect` and the rest):
 //!
-//! - **`on_connect(cx, pid, addr)`**: a program's `connect` to `addr`. `Ok(stream)`: the program's
+//! - **`on_connect(cx, pid, addr)`**: a program's TCP `connect` to `addr`. `Ok(stream)`: the program's
 //!   connect succeeds, and unsharek copies both ways between its socket and `stream` (who closes
 //!   what: below). `Err(e)`: the connect fails with `e`'s errno. A blocking connect waits for the
 //!   hook; a nonblocking one is `EINPROGRESS`, then poll/epoll and `SO_ERROR` say how it went. If
@@ -14,18 +14,17 @@
 //!   `(peer, stream)` it yields is a connection the program accepts, `peer` its getpeername;
 //!   until the stream ends or the program closes the listener (the stream is dropped then). An
 //!   error leaves the listen the guest's alone (the program's `listen` succeeded already).
-//! - **`on_resolve(cx, pid, name)`**: a name lookup. The guest's `/etc/resolv.conf` names
-//!   10.0.2.3, the guest's libc asks it over UDP, and unsharek answers from this hook: A records
-//!   for its IPv4 addresses (IPv6 ones are left out). Only A queries reach the hook: any other
-//!   (glibc's AAAA beside each A) is answered with no data, NOERROR, at once.
-//! - **No `on_resolve`, but an `on_connect`**: every name resolves, to an address of its own
-//!   that unsharek picks (10.64.0.0/10, one per name, for the sandbox's life), and `on_connect`
-//!   learns which name an address came from with [`Cx::name_of`]: name-based policy with no
-//!   resolver of the provider's. (With an `on_resolve`, `name_of` names its addresses too.)
+//! - **UDP: [`OnConnect::fd`] only.** A connected UDP socket's `connect` (`proto`
+//!   [`Proto::Udp`]) is the `fd` hook's too, its fd a connected UDP socket of the host's: each
+//!   send and receive one datagram. The stream hooks (`new`, `tokio`, `drive`) carry bytes, not
+//!   datagrams: a UDP connect with one of them is ENETUNREACH. Names are no special case: the
+//!   guest's libc asks the nameservers of its `/etc/resolv.conf` (the host's, copied when an
+//!   `on_connect` is set) over UDP like any other datagram, so a lookup is an `fd` hook's UDP
+//!   connect to port 53. An unconnected datagram to a non-loopback address is ENETUNREACH.
 //! - **`on_start(cx)`** (`unsharek::Guest::on_start`): a task started at
 //!   lockdown, before the program: a provider's session, up before the first connect.
 //!
-//! With no hook, everything but loopback is unreachable (`ENETUNREACH`, and lookups fail).
+//! With no hook, everything but loopback is unreachable (`ENETUNREACH`, so lookups fail too).
 //!
 //! **Templates.** The hooks are given at build, once for every instance a template forks; each
 //! instance holds its own provider's fd under a name
@@ -33,10 +32,7 @@
 //!
 //! **Errors** ([`NetError`]), as the program sees them: for a connect, `Denied` EACCES,
 //! `Refused` ECONNREFUSED, `Unreachable` ENETUNREACH, `Timeout` ETIMEDOUT, `NoName` ENETUNREACH,
-//! `Unsupported` EAFNOSUPPORT, `Io` EIO. For a lookup (getaddrinfo's codes, through glibc's
-//! resolver): `NoName` NXDOMAIN (EAI_NONAME); `Denied` and `Unsupported` NOTAUTH, a failure
-//! not to retry (musl's EAI_FAIL; glibc folds it into EAI_NONAME: it would have retried REFUSED
-//! and NOTIMP, as a server's trouble, into EAI_AGAIN); the rest SERVFAIL (EAI_AGAIN).
+//! `Unsupported` EAFNOSUPPORT, `Io` EIO.
 //!
 //! **Who closes what**, between the program's socket and a hook's stream (each direction a byte
 //! stream of its own):
@@ -78,19 +74,20 @@
 
 use std::future::Future;
 use std::io;
-use std::net::{IpAddr, SocketAddr, SocketAddrV4};
+use std::net::{SocketAddr, SocketAddrV4};
 use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use unsharek_rt::dns::Rcode;
 use unsharek_rt::executor::{self, POLLIN, POLLOUT};
 use unsharek_rt::tsi::{self, ByteStream, Conn};
 use futures_io::{AsyncRead, AsyncWrite};
 use rustix::io::Errno;
 
 pub use unsharek_rt::executor::{FdReady, Sleep};
+/// A connect's protocol: TCP, or a connected UDP socket's.
+pub use unsharek_rt::tsi::Proto;
 
 
 /// Why a hook refused (see the module comment for each one's errno).
@@ -124,15 +121,6 @@ impl NetError {
             NetError::Io => libc::EIO,
         }
     }
-
-    /// The resolver's answer for a lookup that failed so.
-    fn rcode(self) -> Rcode {
-        match self {
-            NetError::NoName => Rcode::NxDomain,
-            NetError::Denied | NetError::Unsupported => Rcode::NotAuth,
-            _ => Rcode::ServFail,
-        }
-    }
 }
 
 /// An I/O error by its kind: refused, denied, timed out, unreachable; anything else `Io`.
@@ -161,11 +149,10 @@ pub type StartFn = Box<dyn FnOnce(Cx) -> Pin<Box<dyn Future<Output = ()>>>>;
 pub struct Hooks {
     pub on_connect: OnConnect,
     pub on_listen: OnListen,
-    pub on_resolve: OnResolve,
     pub on_start: Option<StartFn>,
 }
 
-use tsi::{ConnectFn, ListenFn, ResolveFn};
+use tsi::{ConnectFn, ListenFn};
 
 /// The program's connects to anything but loopback: `async |cx, pid, addr| -> Result<stream,
 /// NetError>`, the stream any `AsyncRead + AsyncWrite` (futures-io's; tokio's with
@@ -182,6 +169,11 @@ fn errno(e: NetError) -> Errno {
     Errno::from_raw_os_error(e.connect_errno())
 }
 
+/// A stream hook's answer to a UDP connect: a stream carries bytes, not datagrams.
+fn not_udp() -> tsi::BoxFuture<Result<Conn, Errno>> {
+    Box::pin(async { Err(Errno::NETUNREACH) })
+}
+
 impl OnConnect {
     pub fn new<F, Fut, S>(mut f: F) -> OnConnect
     where
@@ -189,22 +181,27 @@ impl OnConnect {
         Fut: Future<Output = Result<S, NetError>> + 'static,
         S: AsyncRead + AsyncWrite + Unpin + 'static,
     {
-        OnConnect(Some(Box::new(move |_, pid, a| {
+        OnConnect(Some(Box::new(move |_, pid, proto, a| {
+            if proto == Proto::Udp {
+                return not_udp();
+            }
             let fut = f(Cx, pid, SocketAddr::V4(a));
             Box::pin(async move { fut.await.map(|s| Conn::Stream(Box::pin(Io(s)))).map_err(errno) })
         })))
     }
 
     /// For a provider that hands over a host fd, the connection itself: the guest's socket is
-    /// backed by it, nothing copied ([`FdConn`]: its shutdown and close).
+    /// backed by it, nothing copied ([`FdConn`]: its shutdown and close). `proto` is the
+    /// socket's: for [`Proto::Udp`] the fd is a connected UDP socket's (the program's resolver's
+    /// queries are such connects, to its nameservers' port 53).
     pub fn fd<F, Fut, C>(mut f: F) -> OnConnect
     where
-        F: FnMut(Cx, i32, SocketAddr) -> Fut + 'static,
+        F: FnMut(Cx, i32, Proto, SocketAddr) -> Fut + 'static,
         Fut: Future<Output = Result<(RawFd, C), NetError>> + 'static,
         C: FdConn + 'static,
     {
-        OnConnect(Some(Box::new(move |_, pid, a| {
-            let fut = f(Cx, pid, SocketAddr::V4(a));
+        OnConnect(Some(Box::new(move |_, pid, proto, a| {
+            let fut = f(Cx, pid, proto, SocketAddr::V4(a));
             Box::pin(async move { fut.await.map(|(fd, c)| Conn::Fd(fd, Box::new(c))).map_err(errno) })
         })))
     }
@@ -217,7 +214,10 @@ impl OnConnect {
         Fut: Future<Output = Result<D, NetError>> + 'static,
         D: FnOnce(GuestSocket) + 'static,
     {
-        OnConnect(Some(Box::new(move |_, pid, a| {
+        OnConnect(Some(Box::new(move |_, pid, proto, a| {
+            if proto == Proto::Udp {
+                return not_udp();
+            }
             let fut = f(Cx, pid, SocketAddr::V4(a));
             Box::pin(async move {
                 fut.await
@@ -235,7 +235,10 @@ impl OnConnect {
         Fut: Future<Output = Result<S, NetError>> + 'static,
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
     {
-        OnConnect(Some(Box::new(move |_, pid, a| {
+        OnConnect(Some(Box::new(move |_, pid, proto, a| {
+            if proto == Proto::Udp {
+                return not_udp();
+            }
             let fut = f(Cx, pid, SocketAddr::V4(a));
             Box::pin(async move { fut.await.map(|s| Conn::Stream(Box::pin(TokioIo(s)))).map_err(errno) })
         })))
@@ -345,90 +348,31 @@ impl OnListen {
     }
 }
 
-/// The program's name lookups: `async |cx, pid, name| -> Result<Vec<IpAddr>, NetError>`. `name`
-/// is lowercased, without a trailing dot.
-///
-/// **Not a policy point.** It runs after lockdown, in the program's address space: anything it
-/// decides (refusing an address, a name), a compromised program can skip, by calling the
-/// provider's held fd itself. Enforce policy at the far end of the held fd, in the provider's
-/// own process.
-#[derive(Default)]
-pub struct OnResolve(pub(crate) Option<ResolveFn>);
-
-impl OnResolve {
-    pub fn new<F, Fut>(mut f: F) -> OnResolve
-    where
-        F: FnMut(Cx, i32, String) -> Fut + 'static,
-        Fut: Future<Output = Result<Vec<IpAddr>, NetError>> + 'static,
-    {
-        OnResolve(Some(Box::new(move |_, pid, name| {
-            let fut = f(Cx, pid, name.clone());
-            Box::pin(async move {
-                match fut.await {
-                    Ok(ips) => {
-                        let v4: Vec<_> = ips
-                            .into_iter()
-                            .filter_map(|ip| match ip {
-                                IpAddr::V4(v4) => Some(v4),
-                                IpAddr::V6(_) => None,
-                            })
-                            .collect();
-                        let mut n = names();
-                        for a in &v4 {
-                            n.by_addr.insert(*a, name.clone());
-                        }
-                        Ok(v4)
-                    }
-                    Err(e) => Err(e.rcode()),
-                }
-            })
-        })))
-    }
-}
-
 impl Hooks {
-    /// Whether the program's names resolve: an `on_resolve`, or an `on_connect` (names then
-    /// resolve to addresses of their own, [`Cx::address_for`]). The guest's resolver files are
-    /// written for it at build (`setup::resolver`).
-    pub fn resolves(&self) -> bool {
-        self.on_resolve.0.is_some() || self.on_connect.0.is_some()
+    /// Whether the program has a network beyond loopback (an `on_connect`): the guest's resolver
+    /// files are written for it at build (`setup::resolver`).
+    pub fn connects(&self) -> bool {
+        self.on_connect.0.is_some()
     }
 
     /// The network hooks, given to the runtime: the task to start at lockdown.
     pub fn install(self) -> Option<StartFn> {
-        let resolve = match (self.on_resolve.0, &self.on_connect.0) {
-            (Some(r), _) => Some(r),
-            (None, Some(_)) => OnResolve::new(|cx: Cx, _, name: String| {
-                let a = cx.address_for(&name);
-                async move { Ok(vec![a]) }
-            })
-            .0,
-            (None, None) => None,
-        };
-        tsi::set_hooks(tsi::Hooks { connect: self.on_connect.0, listen: self.on_listen.0, resolve });
+        tsi::set_hooks(tsi::Hooks { connect: self.on_connect.0, listen: self.on_listen.0 });
         self.on_start
     }
 }
 
 // ------------------------------------------------------------------------------------------------
-// Names: held fds by name, addresses by the name they were resolved from.
+// Names: held fds by name.
 
 /// What the hooks look up by name. Written by host code before lockdown and by the executor
 /// after: one thread at a time, so the lock is never contended (a contended `std` lock would
 /// park in a futex: module comment).
 struct Names {
     held: Vec<(String, HeldFd)>,
-    /// Each name a lookup answered, by address (the hook's addresses, or unsharek's own).
-    by_addr: std::collections::BTreeMap<std::net::Ipv4Addr, String>,
-    /// unsharek's own addresses, by name.
-    own: std::collections::BTreeMap<String, std::net::Ipv4Addr>,
 }
 
-static NAMES: std::sync::Mutex<Names> = std::sync::Mutex::new(Names {
-    held: Vec::new(),
-    by_addr: std::collections::BTreeMap::new(),
-    own: std::collections::BTreeMap::new(),
-});
+static NAMES: std::sync::Mutex<Names> = std::sync::Mutex::new(Names { held: Vec::new() });
 
 fn names() -> std::sync::MutexGuard<'static, Names> {
     NAMES.lock().unwrap_or_else(|e| e.into_inner())
@@ -440,11 +384,6 @@ pub fn name_held(name: &str, fd: HeldFd) {
     n.held.retain(|(k, _)| k != name);
     n.held.push((name.to_owned(), fd));
 }
-
-/// The first of unsharek's own addresses (10.64.0.0/10): far from loopback, from the nameserver's
-/// 10.0.2.3 and from a provider's usual 10.0.0.N.
-const OWN_BASE: u32 = u32::from_be_bytes([10, 64, 0, 1]);
-const OWN_COUNT: u32 = (1 << 22) - 2;
 
 // ------------------------------------------------------------------------------------------------
 // The adapters: a hook's streams as the runtime's.
@@ -528,26 +467,6 @@ impl Cx {
     /// The fd held under `name` (`unsharek::Guest::hold_fd_as`).
     pub fn held(&self, name: &str) -> Option<HeldFd> {
         names().held.iter().find(|(k, _)| k == name).map(|&(_, fd)| fd)
-    }
-
-    /// The name a lookup of the program's resolved to `addr` (the latest, if several), if any:
-    /// for an `on_connect` that decides by name.
-    pub fn name_of(&self, addr: IpAddr) -> Option<String> {
-        let IpAddr::V4(a) = addr else { return None };
-        names().by_addr.get(&a).cloned()
-    }
-
-    /// An address of `name`'s own, the same for the sandbox's life: what names resolve to when
-    /// there is no `on_resolve` (an `on_resolve` may answer with it too). 10.64.0.0/10.
-    pub fn address_for(&self, name: &str) -> IpAddr {
-        let mut n = names();
-        if let Some(a) = n.own.get(name) {
-            return IpAddr::V4(*a);
-        }
-        let k = n.own.len() as u32 % OWN_COUNT;
-        let a = std::net::Ipv4Addr::from(OWN_BASE + k);
-        n.own.insert(name.to_owned(), a);
-        IpAddr::V4(a)
     }
 
     /// Run `f` in the background on the executor, to completion (a provider's session, say).
