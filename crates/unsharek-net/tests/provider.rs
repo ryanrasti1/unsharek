@@ -121,7 +121,7 @@ fn connects_under_all() {
     let server = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = server.local_addr().unwrap().port();
     let (ctl, pid) = provider(Policy::All);
-    let (fd, _conn) = with_client(ctl, |c| Box::pin(c.connect(IpAddr::V4(Ipv4Addr::LOCALHOST), port))).expect("connect");
+    let (fd, _conn) = with_client(ctl, |c| Box::pin(c.connect(IpAddr::V4(Ipv4Addr::LOCALHOST), port, false))).expect("connect");
     let (mut peer, _) = server.accept().unwrap();
     // SAFETY: the received socket, ours now.
     let mut s = unsafe { std::net::TcpStream::from_raw_fd(fd) };
@@ -130,6 +130,44 @@ fn connects_under_all() {
     let mut got = [0u8; 4];
     peer.read_exact(&mut got).unwrap();
     assert_eq!(&got, b"ping");
+    end(ctl, pid);
+}
+
+/// A UDP connect: a connected UDP socket, passed in, one datagram each way (the guest's resolver's
+/// queries are such: no lookup of the provider's own any more).
+#[test]
+fn udp_connects_under_all() {
+    let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = server.local_addr().unwrap().port();
+    let (ctl, pid) = provider(Policy::All);
+    let (fd, _conn) = with_client(ctl, |c| Box::pin(c.connect(IpAddr::V4(Ipv4Addr::LOCALHOST), port, true))).expect("connect");
+    // SAFETY: the received socket, ours now.
+    let s = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
+    s.set_nonblocking(false).unwrap();
+    s.send(b"query").unwrap();
+    let mut b = [0u8; 16];
+    let (n, from) = server.recv_from(&mut b).unwrap();
+    assert_eq!(&b[..n], b"query");
+    server.send_to(b"answer", from).unwrap();
+    let n = s.recv(&mut b).unwrap();
+    assert_eq!(&b[..n], b"answer");
+    end(ctl, pid);
+}
+
+/// Names resolve under `public` though the host's nameservers are often local or private
+/// (127.0.0.53, a router's): port 53 on exactly those is allowed, any other port on them isn't.
+#[test]
+fn public_allows_the_host_nameservers_port_53() {
+    let Some(ns) = unsharek_net::host_nameservers().into_iter().find(|ip| !Policy::Public.allows(*ip)) else {
+        return; // no non-public nameserver here: nothing the exception would change
+    };
+    let (ctl, pid) = provider(Policy::Public);
+    let got = with_client(ctl, move |c| {
+        let c = Arc::clone(c);
+        Box::pin(async move { (c.connect(ns, 53, true).await.map(|r| r.0), c.connect(ns, 54, true).await.map(|r| r.0)) })
+    });
+    assert!(got.0.is_ok(), "{ns}:53: {:?}", got.0);
+    assert_eq!(got.1, Err(Some(protocol::DENIED)), "{ns}:54");
     end(ctl, pid);
 }
 
@@ -142,7 +180,7 @@ fn public_denies_local_and_private() {
         Box::pin(async move {
             let mut got = vec![];
             for ip in ips {
-                got.push(c.connect(IpAddr::V4(ip), 80).await);
+                got.push(c.connect(IpAddr::V4(ip), 80, false).await);
             }
             got
         })

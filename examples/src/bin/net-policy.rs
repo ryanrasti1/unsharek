@@ -3,13 +3,13 @@
 //! - this one: starts a local HTTP server and the proxy, builds the sandbox and forks it off
 //!   (`Guest::spawn`), the proxy and the sandbox joined by a socketpair;
 //! - the proxy (this example re-run, started before the sandbox's first guard: after it, the
-//!   process can't exec): holds the real network and the policy, an allowlist of names and
+//!   process can't exec): holds the real network and the policy, an allowlist of addresses and
 //!   ports, and logs every attempt with the guest pid that made it;
 //! - the sandbox: Python's `urllib` fetching an allowed URL and some refused ones. Its network
-//!   hooks (`OnConnect`, `OnResolve`) send every connect and lookup over its one held fd
-//!   (`Guest::hold_fd_as`, found by the hooks with `cx.held`) to the proxy
-//!   (`unsharek_examples::mux`: a tiny framing), a session started at lockdown (`on_start`). A
-//!   connect carries the name its address was resolved from (`cx.name_of`).
+//!   hook (`OnConnect`) sends every TCP connect over its one held fd (`Guest::hold_fd_as`,
+//!   found by the hook with `cx.held`) to the proxy (`unsharek_examples::mux`: a tiny framing),
+//!   a session started at lockdown (`on_start`). (Names: the guest's resolver speaks UDP to its
+//!   nameservers, which a stream hook doesn't carry; an `OnConnect::fd` provider would.)
 //!
 //! Run it:
 //!
@@ -40,12 +40,11 @@ for url in sys.argv[1:]:
         print(f"[python] GET {url} -> failed: {getattr(e, 'reason', e)}")
 "#;
 
-/// The allowlist: a name, the one port allowed on it, and where the proxy really connects. Each
-/// name resolves to an address of no one (10.0.0.N): a loopback answer would be the guest's own
-/// loopback, which never reaches the hooks. (Without an `on_resolve` at all, unsharek would give
-/// each name an address of its own, and the connect would still carry the name.)
+/// The allowlist: an address of no one's (10.0.0.N: a loopback one would be the guest's own
+/// loopback, which never reaches the hooks), the one port allowed on it, and where the proxy
+/// really connects.
 struct Allow {
-    name: String,
+    addr: Ipv4Addr,
     port: u16,
     target: String,
 }
@@ -53,25 +52,13 @@ struct Allow {
 struct Proxy(Vec<Allow>);
 
 impl mux::Policy for Proxy {
-    fn resolve(&mut self, pid: i32, name: &str) -> Result<Vec<Ipv4Addr>, NetError> {
-        let r = match self.0.iter().position(|a| a.name == name) {
-            Some(i) => Ok(vec![Ipv4Addr::new(10, 0, 0, i as u8 + 1)]),
-            None => Err(NetError::NoName),
-        };
-        match &r {
-            Ok(ips) => eprintln!("[proxy] guest pid {pid}: resolve {name} -> {}", ips[0]),
-            Err(e) => eprintln!("[proxy] guest pid {pid}: resolve {name} -> refused ({e})"),
-        }
-        r
-    }
-
-    fn connect(&mut self, pid: i32, addr: SocketAddrV4, name: &str) -> Result<TcpStream, NetError> {
-        // By name: the target is the allowlist's, whatever address the sandbox says.
-        let Some(a) = self.0.iter().find(|a| a.name == name) else { return refuse(pid, addr, "not a name we gave out") };
+    fn connect(&mut self, pid: i32, addr: SocketAddrV4) -> Result<TcpStream, NetError> {
+        // The target is the allowlist's, whatever the sandbox would rather reach.
+        let Some(a) = self.0.iter().find(|a| a.addr == *addr.ip()) else { return refuse(pid, addr, "not on the list") };
         if a.port != addr.port() {
-            return refuse(pid, addr, &format!("{} allows port {} only", a.name, a.port));
+            return refuse(pid, addr, &format!("{} allows port {} only", a.addr, a.port));
         }
-        eprintln!("[proxy] guest pid {pid}: connect {addr} ({}:{}) -> allowed, to {}", a.name, a.port, a.target);
+        eprintln!("[proxy] guest pid {pid}: connect {addr} -> allowed, to {}", a.target);
         let target = a.target.to_socket_addrs().map_err(NetError::from)?.next().ok_or(NetError::NoName)?;
         Ok(TcpStream::connect(target)?)
     }
@@ -85,10 +72,8 @@ fn refuse(pid: i32, addr: SocketAddrV4, why: &str) -> Result<TcpStream, NetError
 /// The sandbox, built here and forked off: `sock` is its end of the socketpair, held for the hooks.
 fn sandbox(sock: UnixStream, urls: Vec<String>) -> Result<unsharek::Child, unsharek::Error> {
     let python = ex::nix_program("UNSHAREK_TEST_PYTHON");
-    let (on_connect, on_resolve) = mux::hooks();
     let mut g = Guest::boot(GuestConfig::default())?;
-    g.on_connect(on_connect)?;
-    g.on_resolve(on_resolve)?;
+    g.on_connect(mux::hooks())?;
     g.on_start(mux::start);
     g.hold_fd_as("net", sock.into())?;
     g.mount_closure(&[&python])?;
@@ -106,9 +91,9 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if ex::role().as_deref() == Some("proxy") {
         let port: u16 = args[0].parse().unwrap();
-        let mut allow = vec![Allow { name: "web.local".into(), port, target: format!("127.0.0.1:{port}") }];
+        let mut allow = vec![Allow { addr: Ipv4Addr::new(10, 0, 0, 1), port, target: format!("127.0.0.1:{port}") }];
         if args.iter().any(|a| a == "--internet") {
-            allow.push(Allow { name: "example.com".into(), port: 80, target: "example.com:80".into() });
+            allow.push(Allow { addr: Ipv4Addr::new(10, 0, 0, 2), port: 80, target: "example.com:80".into() });
         }
         // SAFETY: fd 3 is the proxy's end, from the parent (`give_fd`), and nothing else owns it.
         mux::serve(UnixStream::from(unsafe { OwnedFd::from_raw_fd(3) }), Proxy(allow));
@@ -117,13 +102,13 @@ fn main() {
     let _ = ex::nix_program("UNSHAREK_TEST_PYTHON"); // skip before starting anything
     let port = http_server();
     let mut urls = vec![
-        format!("http://web.local:{port}/"),     // allowed
-        format!("http://web.local:{}/", port + 1), // the name, but not the port
-        "http://elsewhere.test/".to_string(),      // a name not on the list
+        format!("http://10.0.0.1:{port}/"),     // allowed
+        format!("http://10.0.0.1:{}/", port + 1), // the address, but not the port
+        "http://10.0.0.9/".to_string(),           // an address not on the list
     ];
     let internet = args.iter().any(|a| a == "--internet");
     if internet {
-        urls.push("http://example.com/".into());
+        urls.push("http://10.0.0.2/".into()); // example.com:80, as the proxy maps it
     }
 
     let (a, b) = UnixStream::pair().expect("socketpair");

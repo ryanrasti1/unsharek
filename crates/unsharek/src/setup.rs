@@ -158,21 +158,17 @@ fn close(fd: usize) {
     let _ = sys(l::__lkl__NR_close, [fd, 0, 0, 0, 0, 0]);
 }
 
-/// The nameserver the guest's libc asks: an address of no one, as the kernel sends every datagram
-/// to a non-loopback address to the runtime, which answers DNS on port 53 from the `on_resolve`
-/// hook (`net`). 10.0.2.3, slirp's (QEMU's user network) resolver.
-pub const NAMESERVER: &str = "10.0.2.3";
-
-/// The guest's `/etc/resolv.conf` (naming [`NAMESERVER`]) and `/etc/hosts` (localhost: no query
-/// for it), root's, 0644. Written by `unsharek::Guest::on_connect` or `on_resolve` when names first resolve
-/// (an `on_resolve` or `on_connect` hook), as init at boot, before any guard: a guard may then
-/// change them or chown them, and nothing is written for them after setup, whose
-/// credentials (a `setresuid` to a build user) it would have had (it failed with EACCES).
-/// Direct guest calls: outside a setup closure or in one.
-pub fn resolver() -> io::Result<()> {
+/// The guest's `/etc/resolv.conf` (`conf`: the host's, its nameservers and options, which the
+/// guest's libc asks over UDP like any other peer: no special case) and `/etc/hosts`
+/// (localhost: no query for it), root's, 0644. Written by `unsharek::Guest::on_connect` when the
+/// program first has a network, as init at boot, before any guard: a guard may then change them
+/// or chown them, and nothing is written for them after setup, whose credentials (a
+/// `setresuid` to a build user) it would have had (it failed with EACCES). A host directory
+/// mounted over `/etc` later (`--system`) shows the host's own files instead. Direct guest calls:
+/// outside a setup closure or in one.
+pub fn resolver(conf: &[u8]) -> io::Result<()> {
     mkdir(c"/etc", 0o755)?;
-    // One attempt, two seconds: the answer is local, a lost one isn't coming.
-    write_file(c"/etc/resolv.conf", format!("nameserver {NAMESERVER}\noptions timeout:2 attempts:1\n").as_bytes())?;
+    write_file(c"/etc/resolv.conf", conf)?;
     write_file(c"/etc/hosts", b"127.0.0.1 localhost\n::1 localhost\n")
 }
 

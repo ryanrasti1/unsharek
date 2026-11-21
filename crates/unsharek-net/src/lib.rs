@@ -4,17 +4,21 @@
 //!
 //! **What it is.** A host process the CLI forks before the sandbox boots, with one end of a
 //! `SOCK_SEQPACKET` pair (the sandbox holds the other). It serves one Cap'n Web object over it
-//! ([`protocol`]): `connect(ip, port)` dials `ip:port` if [`Policy`] allows it and answers with the
-//! connected socket, passed in (SCM_RIGHTS); `resolve(name)` asks the host's nameserver and answers
-//! with the names' IPv4 addresses. The sandbox's side reads and writes the socket it is given; it
-//! never makes a host connection itself, and nothing it sends can widen what this process allows.
+//! ([`protocol`]): `connect(ip, port, udp)` dials `ip:port` (a TCP connection, or a connected UDP
+//! socket) if [`Policy`] allows it and answers with the connected socket, passed in (SCM_RIGHTS).
+//! Names are no special case: the guest's resolver sends its queries over UDP, connected to the
+//! nameservers of its resolv.conf (the host's), as any other datagrams. The sandbox's side reads
+//! and writes the socket it is given; it never makes a host connection itself, and nothing it
+//! sends can widen what this process allows.
 //!
-//! **The policy point.** [`Policy`] is checked here, on the address dialled, after resolution:
-//! the sandbox can name any address, and only those the policy allows are dialled.
+//! **The policy point.** [`Policy`] is checked here, on the address dialled: the sandbox can name
+//! any address, and only those the policy allows are dialled. One exception, so names resolve:
+//! port 53 of the host's own nameservers (its resolv.conf's, read at start), which may be loopback
+//! or private (127.0.0.53, a router's), is allowed whenever the provider dials at all.
 //!
 //! **Its own confinement** ([`lockdown`]): every fd but the control socket and stderr closed,
-//! `no_new_privs`, and its own seccomp filter ([`filter`]: what one connect, one lookup and one
-//! reply take, each argument it can be pinned on), proven equal to its policy like the sandbox's.
+//! `no_new_privs`, and its own seccomp filter ([`filter`]: what one connect and one reply take,
+//! each argument it can be pinned on), proven equal to its policy like the sandbox's.
 //! A compromised provider has those calls and nothing else; it holds no file.
 
 #![allow(non_upper_case_globals)]
@@ -35,10 +39,9 @@ use capnweb::{CapnwebError, CapnwebValue, Error, Result, RpcSession, RpcSessionO
 /// The wire: the object's methods and its rejections' names (the sandbox's side maps each to an
 /// errno).
 pub mod protocol {
-    /// `connect(ip: string, port: number) -> [fd, Conn]`.
+    /// `connect(ip: string, port: number, udp: boolean) -> [fd, Conn]`: a TCP connection, or a
+    /// connected UDP socket.
     pub const CONNECT: &str = "connect";
-    /// `resolve(name: string) -> string[]` (IPv4 addresses).
-    pub const RESOLVE: &str = "resolve";
     /// `listen(port: number) -> Listener`: the port published for the guest's `port`.
     pub const LISTEN: &str = "listen";
     /// `Listener.accept() -> [fd, peerIp: string, peerPort: number, Conn]`.
@@ -54,8 +57,6 @@ pub mod protocol {
     pub const UNREACHABLE: &str = "Unreachable";
     /// The dial timed out (ETIMEDOUT).
     pub const TIMEOUT: &str = "Timeout";
-    /// The name has no IPv4 address (NXDOMAIN).
-    pub const NO_NAME: &str = "NoName";
 }
 
 /// Which addresses the provider dials.
@@ -117,7 +118,7 @@ fn is_public(ip: IpAddr) -> bool {
     }
 }
 
-/// How long a dial or a lookup waits.
+/// How long a dial waits.
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 
 fn rejection(name: &str, message: impl Into<String>) -> Error {
@@ -152,7 +153,8 @@ impl std::str::FromStr for Publish {
 /// The object the sandbox calls.
 pub struct Provider {
     policy: Policy,
-    nameserver: Option<SocketAddr>,
+    /// The host's nameservers: port 53 on them is allowed whenever the policy dials at all.
+    nameservers: Vec<IpAddr>,
     /// The published ports' listeners, bound before lockdown: (guest port, listener).
     listeners: Vec<(u16, Arc<TcpListener>)>,
     reactor: Arc<Reactor>,
@@ -235,16 +237,26 @@ impl Listener {
 
 #[rpc_target]
 impl Provider {
-    /// `connect(ip, port)`: the connected socket, nonblocking, passed in, and its [`Conn`]; or a
-    /// rejection.
-    async fn connect(&self, ip: String, port: f64) -> Result<Vec<CapnwebValue>> {
+    /// `connect(ip, port, udp)`: the connected socket (TCP, or with `udp` a connected UDP one),
+    /// nonblocking, passed in, and its [`Conn`]; or a rejection.
+    async fn connect(&self, ip: String, port: f64, udp: bool) -> Result<Vec<CapnwebValue>> {
         let ip: IpAddr = ip.parse().map_err(|_| Error::Type(format!("connect: {ip:?} is not an IP address")))?;
         if !(0.0..=65535.0).contains(&port) || port.fract() != 0.0 {
             return Err(Error::Type(format!("connect: port {port}")));
         }
         let addr = SocketAddr::new(ip, port as u16);
-        if !self.policy.allows(ip) {
+        if !self.allows(addr) {
             return Err(rejection(protocol::DENIED, format!("{addr}: not allowed")));
+        }
+        if udp {
+            let any: SocketAddr = if ip.is_ipv4() { (Ipv4Addr::UNSPECIFIED, 0).into() } else { (Ipv6Addr::UNSPECIFIED, 0).into() };
+            let unreachable = |e: io::Error| rejection(protocol::UNREACHABLE, format!("{addr}: {e}"));
+            let sock = UdpSocket::bind(any).map_err(unreachable)?;
+            sock.connect(addr).map_err(unreachable)?;
+            sock.set_nonblocking(true).map_err(unreachable)?;
+            let fd = sock.into_raw_fd();
+            let conn = Conn::of(fd)?;
+            return Ok(vec![CapnwebValue::custom(Fd(fd)), CapnwebValue::Target(Arc::new(conn))]);
         }
         let tcp = TcpStream::connect_timeout(&addr, TIMEOUT).map_err(|e| {
             let name = match e.kind() {
@@ -272,79 +284,24 @@ impl Provider {
         let l = Listener { tcp: Arc::clone(tcp), reactor: Arc::clone(&self.reactor) };
         Ok(CapnwebValue::Target(Arc::new(l)))
     }
+}
 
-    /// `resolve(name)`: the name's IPv4 addresses (A records) from the host's nameserver.
-    async fn resolve(&self, name: String) -> Result<Vec<String>> {
-        let ns = self.nameserver.ok_or_else(|| rejection(protocol::NO_NAME, "no nameserver"))?;
-        let addrs = lookup(ns, &name).map_err(|e| rejection(protocol::NO_NAME, format!("{name}: {e}")))?;
-        if addrs.is_empty() {
-            return Err(rejection(protocol::NO_NAME, format!("{name}: no IPv4 address")));
-        }
-        Ok(addrs.iter().map(Ipv4Addr::to_string).collect())
+impl Provider {
+    /// Whether the provider dials `addr`: the policy's, or port 53 of a host nameserver (while it
+    /// dials at all: `Deny` dials nothing).
+    fn allows(&self, addr: SocketAddr) -> bool {
+        self.policy.allows(addr.ip())
+            || (self.policy != Policy::Deny && addr.port() == 53 && self.nameservers.contains(&addr.ip()))
     }
 }
 
-/// The first `nameserver` of `/etc/resolv.conf`, read before lockdown.
-pub fn host_nameserver() -> Option<SocketAddr> {
-    let conf = std::fs::read_to_string("/etc/resolv.conf").ok()?;
+/// The `nameserver`s of the host's `/etc/resolv.conf`, read before lockdown.
+pub fn host_nameservers() -> Vec<IpAddr> {
+    let conf = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
     conf.lines()
         .filter_map(|l| l.trim().strip_prefix("nameserver"))
-        .find_map(|ip| ip.trim().parse::<IpAddr>().ok())
-        .map(|ip| SocketAddr::new(ip, 53))
-}
-
-/// An `A` query for `name` to `ns` over UDP, its answers' addresses.
-fn lookup(ns: SocketAddr, name: &str) -> io::Result<Vec<Ipv4Addr>> {
-    let bad = || io::Error::from(io::ErrorKind::InvalidData);
-    let mut q = vec![0x51, 0x7e, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
-    for label in name.trim_end_matches('.').split('.') {
-        if label.is_empty() || label.len() > 63 {
-            return Err(io::Error::from(io::ErrorKind::InvalidInput));
-        }
-        q.push(label.len() as u8);
-        q.extend(label.as_bytes());
-    }
-    q.extend([0, 0, 1, 0, 1]);
-    let bind: SocketAddr = if ns.is_ipv4() { (Ipv4Addr::UNSPECIFIED, 0).into() } else { (Ipv6Addr::UNSPECIFIED, 0).into() };
-    let udp = UdpSocket::bind(bind)?;
-    udp.connect(ns)?;
-    udp.set_read_timeout(Some(TIMEOUT))?;
-    udp.send(&q)?;
-    let mut r = [0u8; 1500];
-    let n = udp.recv(&mut r)?;
-    let r = &r[..n];
-    if n < 12 || r[0..2] != q[0..2] || r[3] & 0x0f != 0 {
-        return Err(bad());
-    }
-    let (qd, an) = (u16::from_be_bytes([r[4], r[5]]), u16::from_be_bytes([r[6], r[7]]));
-    let mut i = 12;
-    let skip_name = |mut i: usize| -> Option<usize> {
-        loop {
-            let len = *r.get(i)? as usize;
-            if len & 0xc0 == 0xc0 {
-                return Some(i + 2);
-            }
-            i += 1 + len;
-            if len == 0 {
-                return Some(i);
-            }
-        }
-    };
-    for _ in 0..qd {
-        i = skip_name(i).ok_or_else(bad)? + 4;
-    }
-    let mut out = vec![];
-    for _ in 0..an {
-        i = skip_name(i).ok_or_else(bad)?;
-        let h = r.get(i..i + 10).ok_or_else(bad)?;
-        let (kind, len) = (u16::from_be_bytes([h[0], h[1]]), u16::from_be_bytes([h[8], h[9]]) as usize);
-        let data = r.get(i + 10..i + 10 + len).ok_or_else(bad)?;
-        if kind == 1 && len == 4 {
-            out.push(Ipv4Addr::new(data[0], data[1], data[2], data[3]));
-        }
-        i += 10 + len;
-    }
-    Ok(out)
+        .filter_map(|ip| ip.trim().parse::<IpAddr>().ok())
+        .collect()
 }
 
 /// The provider's waits: each a task's waker on an fd, woken by [`serve`]'s idle `ppoll` over
@@ -494,7 +451,7 @@ pub fn bind_published(publish: &[Publish]) -> io::Result<Vec<(u16, TcpListener)>
 /// published ports' `listeners` ([`bind_published`]), until the sandbox's end closes; then the
 /// process exits 0. Locks down first ([`lockdown`]), keeping the listeners.
 pub fn serve(ctl: RawFd, policy: Policy, listeners: Vec<(u16, TcpListener)>) -> ! {
-    let nameserver = host_nameserver();
+    let nameservers = host_nameservers();
     let runtime = capnweb::local::LocalRuntime::new();
     let keep: Vec<RawFd> = listeners.iter().map(|(_, l)| l.as_raw_fd()).collect();
     if let Err(e) = lockdown(ctl, &keep) {
@@ -507,7 +464,7 @@ pub fn serve(ctl: RawFd, policy: Policy, listeners: Vec<(u16, TcpListener)>) -> 
         Err(_) => std::process::exit(125),
     };
     let listeners = listeners.into_iter().map(|(g, l)| (g, Arc::new(l))).collect();
-    let main = CapnwebValue::Target(Arc::new(Provider { policy, nameserver, listeners, reactor: Arc::clone(&reactor) }));
+    let main = CapnwebValue::Target(Arc::new(Provider { policy, nameservers, listeners, reactor: Arc::clone(&reactor) }));
     let session = runtime.block_on(async { RpcSession::new(Arc::new(transport), Some(main), RpcSessionOptions::default()) }, || {});
     if session.is_err() {
         std::process::exit(125);

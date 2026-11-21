@@ -3,12 +3,13 @@
 //! before the guest boots; [`install`] holds the control socket and sets the hooks, which call the
 //! provider over it. The CLI's cli/net.rs grants the control socket at lockdown (`recv_fds`).
 //!
-//! The hooks run on the sandbox's executor, as every hook does, and decide nothing: `connect` and
-//! `listen` ask the provider, whose policy holds, and the socket it passes in becomes the stream
+//! The hooks run on the sandbox's executor, as every hook does, and decide nothing: `connect` (TCP,
+//! and UDP's connected sockets: the guest's resolver's queries among them) and `listen` ask the
+//! provider, whose policy holds, and the socket it passes in becomes the stream
 //! backs the guest's socket itself (no copy). Not trusted:
 //! a compromised program can make the same calls itself, and gets only what the provider allows.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -22,7 +23,7 @@ use unsharek_net::protocol;
 pub use unsharek_net::{Policy, Publish};
 use unsharek_rt::executor::{self, POLLIN, POLLOUT};
 
-use crate::net::{Cx, FdConn, NetError, OnConnect, OnListen, OnResolve};
+use crate::net::{Cx, FdConn, NetError, OnConnect, OnListen, Proto};
 use crate::{Error, Guest};
 
 /// The network the CLI's `--net` and `--publish` ask for.
@@ -72,8 +73,8 @@ pub fn spawn(net: &NetConfig) -> Result<OwnedFd, Error> {
     }
 }
 
-/// Hold `ctl` and set the hooks: connects (if `dials`) and resolves through the provider, listens
-/// for published ports. Returns the control socket's fd, for [`grant`].
+/// Hold `ctl` and set the hooks: connects (if `dials`; names too, as the guest's resolver's UDP
+/// connects) through the provider, listens for published ports. Returns the control socket's fd, for [`grant`].
 pub fn install(g: &mut Guest, ctl: OwnedFd, dials: bool) -> Result<RawFd, Error> {
     let held = g.hold_fd(ctl)?;
     let fd = held.as_raw_fd();
@@ -85,15 +86,10 @@ pub fn install(g: &mut Guest, ctl: OwnedFd, dials: bool) -> Result<RawFd, Error>
     let client = Client::new(runtime, GateCtl(fd));
     if dials {
         let c = Arc::clone(&client);
-        g.on_connect(OnConnect::fd(move |_cx, _pid, addr: SocketAddr| {
-            let call = c.connect(addr.ip(), addr.port());
+        g.on_connect(OnConnect::fd(move |_cx, _pid, proto: Proto, addr: SocketAddr| {
+            let call = c.connect(addr.ip(), addr.port(), proto == Proto::Udp);
             let c = Arc::clone(&c);
             async move { call.await.map(|(fd, conn)| Conn::new(c, fd, conn)).map_err(net_error) }
-        }))?;
-        let c = Arc::clone(&client);
-        g.on_resolve(OnResolve::new(move |_cx, _pid, name| {
-            let call = c.resolve(name);
-            async move { call.await.map(|ips| ips.into_iter().map(IpAddr::V4).collect()).map_err(net_error) }
         }))?;
     }
     let c = Arc::clone(&client);
@@ -113,7 +109,6 @@ fn net_error(r: Rejection) -> NetError {
         Some(protocol::REFUSED) => NetError::Refused,
         Some(protocol::UNREACHABLE) => NetError::Unreachable,
         Some(protocol::TIMEOUT) => NetError::Timeout,
-        Some(protocol::NO_NAME) => NetError::NoName,
         _ => NetError::Io,
     }
 }

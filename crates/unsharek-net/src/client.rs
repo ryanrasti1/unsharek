@@ -4,7 +4,7 @@
 //! nothing; a compromised program can make these calls itself, and the provider's policy is what
 //! holds.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::os::fd::RawFd;
 use std::sync::{Arc, Mutex};
 
@@ -20,7 +20,7 @@ pub type Rejection = Option<&'static str>;
 
 fn rejection(e: &Error) -> Rejection {
     let Error::Serialized(e) = e else { return None };
-    [protocol::DENIED, protocol::REFUSED, protocol::UNREACHABLE, protocol::TIMEOUT, protocol::NO_NAME]
+    [protocol::DENIED, protocol::REFUSED, protocol::UNREACHABLE, protocol::TIMEOUT]
         .into_iter()
         .find(|n| *n == e.received_name())
 }
@@ -61,13 +61,18 @@ impl<S: PacketSocket> Client<S> {
         }
     }
 
-    /// `connect(ip, port)`: the connected socket's fd, received, and its `Conn` (the half-close;
-    /// released, the close).
-    pub fn connect(self: &Arc<Self>, ip: IpAddr, port: u16) -> impl Future<Output = Result<(RawFd, RpcStub), Rejection>> + Send + use<S> {
+    /// `connect(ip, port, udp)`: the connected socket's fd (TCP, or with `udp` a connected UDP
+    /// socket), received, and its `Conn` (the half-close; released, the close).
+    pub fn connect(
+        self: &Arc<Self>,
+        ip: IpAddr,
+        port: u16,
+        udp: bool,
+    ) -> impl Future<Output = Result<(RawFd, RpcStub), Rejection>> + Send + use<S> {
         let this = Arc::clone(self);
         capnweb::runtime::scope(Arc::clone(&self.runtime), async move {
             let main = this.main()?;
-            let args = vec![CapnwebValue::String(ip.to_string()), CapnwebValue::Number(f64::from(port))];
+            let args = vec![CapnwebValue::String(ip.to_string()), CapnwebValue::Number(f64::from(port)), CapnwebValue::Bool(udp)];
             let call = main.call(vec![protocol::CONNECT.to_owned()], RpcPayload::from_app_params(CapnwebValue::Array(args)));
             let CapnwebValue::Array(v) = call.pull().await.map_err(|e| rejection(&e))? else { return Err(None) };
             let [fd, CapnwebValue::Stub(conn)] = &v[..] else { return Err(None) };
@@ -114,28 +119,6 @@ impl<S: PacketSocket> Client<S> {
         capnweb::runtime::scope(Arc::clone(&self.runtime), async move {
             let call = conn.call(vec![protocol::SHUTDOWN_WRITE.to_owned()], RpcPayload::from_app_params(CapnwebValue::Array(vec![])));
             let _ = call.pull().await;
-        })
-    }
-
-    /// `resolve(name)`: its IPv4 addresses.
-    pub fn resolve(self: &Arc<Self>, name: String) -> impl Future<Output = Result<Vec<Ipv4Addr>, Rejection>> + Send + use<S> {
-        let this = Arc::clone(self);
-        capnweb::runtime::scope(Arc::clone(&self.runtime), async move {
-            let main = this.main()?;
-            let call = main.call(
-                vec![protocol::RESOLVE.to_owned()],
-                RpcPayload::from_app_params(CapnwebValue::Array(vec![CapnwebValue::String(name)])),
-            );
-            match call.pull().await.map_err(|e| rejection(&e))? {
-                CapnwebValue::Array(ips) => ips
-                    .into_iter()
-                    .map(|ip| match ip {
-                        CapnwebValue::String(ip) => ip.parse().map_err(|_| None),
-                        _ => Err(None),
-                    })
-                    .collect(),
-                _ => Err(None),
-            }
         })
     }
 }

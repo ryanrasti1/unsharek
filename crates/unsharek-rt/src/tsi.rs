@@ -1,6 +1,6 @@
 //! The runtime's half of the kernel's socket impersonation (arch/lkl/kernel/tsi.c): the `net_*`
 //! host ops, the guest's end of a connection as an async byte stream ([`GuestSocket`]), the copy
-//! between it and a hook's stream ([`splice`]), the resolver, and readiness for passed fds
+//! between it and a hook's stream ([`splice`]), and readiness for passed fds
 //! (`hostfd_poll`). The hooks themselves ([`Hooks`]) are unsharek's, type-erased here.
 //!
 //! **What the kernel does and what is here.** A program's connect to a non-loopback address
@@ -8,9 +8,10 @@
 //! the executor calls the `connect` hook; on success `lkl_net_done(sock, 0)` gives the
 //! connection's host end, a [`GuestSocket`], and [`splice`] copies both ways between it and the
 //! hook's stream. A listen offered by the kernel ([`net_listen`]) runs the `listen` hook, whose
-//! inbound streams become `lkl_net_accept` ends; a datagram to port 53 ([`net_sendto`]) is a
-//! resolver query (`dns`), answered with `lkl_net_reply` from the `resolve` hook's addresses.
-//! Every other datagram is ENETUNREACH (no UDP yet).
+//! inbound streams become `lkl_net_accept` ends. A UDP socket's connect is a connect like TCP's
+//! ([`Proto::Udp`]), its connection a connected UDP socket of the host's (an fd) or a stream of
+//! whole datagrams; the guest's resolver is one such, with nothing of DNS's here. An unconnected
+//! datagram to a non-loopback address is the kernel's ENETUNREACH.
 //!
 //! **Who closes what** ([`splice`], what capnix's `net` cap relies on): each direction is a byte
 //! stream on its own.
@@ -30,7 +31,6 @@
 //! process; another process's host ops would forward to it.
 
 use alloc::boxed::Box;
-use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use core::ffi::{c_int, c_uint, c_ulong, c_void};
@@ -42,7 +42,6 @@ use core::task::{Context, Poll, Waker};
 use lkl_sys as l;
 use rustix::io::Errno;
 
-use crate::dns::{self, Rcode};
 use crate::executor::{self, Cx};
 
 
@@ -127,21 +126,24 @@ pub enum Conn {
     Fd(i32, Box<dyn FdConn>),
 }
 
-/// The `connect` hook: `(cx, pid, addr)` to a connection or the connect's errno.
-pub type ConnectFn = Box<dyn FnMut(Cx, i32, SocketAddrV4) -> BoxFuture<Result<Conn, Errno>>>;
+/// A connect's protocol: a stream (TCP), or a connected datagram socket (UDP), whose connection
+/// carries whole datagrams to and from the one address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Proto {
+    Tcp,
+    Udp,
+}
+
+/// The `connect` hook: `(cx, pid, proto, addr)` to a connection or the connect's errno.
+pub type ConnectFn = Box<dyn FnMut(Cx, i32, Proto, SocketAddrV4) -> BoxFuture<Result<Conn, Errno>>>;
 /// The `listen` hook: `(cx, pid, addr)` to the inbound connections, or an errno (the listen stays
 /// the guest's).
 pub type ListenFn = Box<dyn FnMut(Cx, i32, SocketAddrV4) -> BoxFuture<Result<BoxIncoming, Errno>>>;
-/// The `resolve` hook: `(cx, pid, name)` to its IPv4 addresses or the resolver's answer code.
-pub type ResolveFn = Box<dyn FnMut(Cx, i32, String) -> BoxFuture<Result<Vec<Ipv4Addr>, Rcode>>>;
-
-/// The hooks, type-erased: unsharek's `Hooks` with its errors already errnos (connect) and
-/// response codes (resolve).
+/// The hooks, type-erased: unsharek's `Hooks` with its errors already errnos.
 #[derive(Default)]
 pub struct Hooks {
     pub connect: Option<ConnectFn>,
     pub listen: Option<ListenFn>,
-    pub resolve: Option<ResolveFn>,
 }
 
 struct Registry {
@@ -165,7 +167,7 @@ struct Obj {
 unsafe impl Sync for Registry {}
 
 static R: Registry = Registry {
-    hooks: RefCell::new(Hooks { connect: None, listen: None, resolve: None }),
+    hooks: RefCell::new(Hooks { connect: None, listen: None }),
     objs: RefCell::new(Vec::new()),
     fds: RefCell::new(Vec::new()),
 };
@@ -206,22 +208,17 @@ fn elsewhere() -> bool {
 #[derive(Clone, Copy)]
 enum Fwd {
     None,
-    Connect { sock: usize, pid: i32, addr: SocketAddrV4 },
+    Connect { sock: usize, pid: i32, proto: Proto, addr: SocketAddrV4 },
     Listen { sock: usize, pid: i32, addr: SocketAddrV4 },
-    /// A resolver query: its bytes in [`FwdQueue::msgs`]`[slot]`.
-    Resolve { sock: usize, pid: i32, ns: SocketAddrV4, slot: u8, len: u16 },
     Ready { obj: usize },
     FdShutdown { fd: i32, how: i32 },
     FdClose { fd: i32 },
 }
 
 const FWD_LEN: usize = 256;
-const FWD_MSGS: usize = 8;
-const FWD_MSG: usize = 512;
 
-/// The forwarded host ops, in order (a sock's connect before its readiness): a ring, and the
-/// queries' bytes. Shared (fork mode's processes), touched with the CPU token held. Full, a
-/// connect, listen or lookup fails at once (ENOBUFS); a readiness is kept once per object, and if
+/// The forwarded host ops, in order (a sock's connect before its readiness): a ring. Shared (fork mode's processes), touched with the CPU token held. Full, a
+/// connect or listen fails at once (ENOBUFS); a readiness is kept once per object, and if
 /// even that overflows every waiter is woken (`all`).
 #[unsafe(link_section = "unsharek_shared")]
 static FWD: FwdQueue = FwdQueue {
@@ -229,8 +226,6 @@ static FWD: FwdQueue = FwdQueue {
     head: Cell::new(0),
     len: Cell::new(0),
     all: Cell::new(false),
-    msgs: [const { Cell::new([0; FWD_MSG]) }; FWD_MSGS],
-    msg_used: [const { Cell::new(false) }; FWD_MSGS],
 };
 
 struct FwdQueue {
@@ -238,8 +233,6 @@ struct FwdQueue {
     head: Cell<usize>,
     len: Cell<usize>,
     all: Cell<bool>,
-    msgs: [Cell<[u8; FWD_MSG]>; FWD_MSGS],
-    msg_used: [Cell<bool>; FWD_MSGS],
 }
 
 // SAFETY: touched with the CPU token held (one host thread at a time, in any process).
@@ -291,18 +284,13 @@ pub fn take_forwarded() {
     while let Some(f) = FWD.pop() {
         match f {
             Fwd::None => {}
-            Fwd::Connect { sock, pid, addr } => {
+            Fwd::Connect { sock, pid, proto, addr } => {
                 register(sock);
-                executor::spawn(connect_task(sock, pid, addr, true));
+                executor::spawn(connect_task(sock, pid, proto, addr, true));
             }
             Fwd::Listen { sock, pid, addr } => {
                 register(sock);
                 executor::spawn(listen_task(sock, pid, addr, true));
-            }
-            Fwd::Resolve { sock, pid, ns, slot, len } => {
-                let msg = FWD.msgs[slot as usize].get()[..len as usize].to_vec();
-                FWD.msg_used[slot as usize].set(false);
-                executor::spawn(resolve_task(sock, pid, ns, msg));
             }
             Fwd::Ready { obj } => ready(obj),
             // SAFETY: as the host ops themselves.
@@ -390,32 +378,39 @@ fn done(sock: usize, err: c_int) -> *mut c_void {
     kernel(|| unsafe { l::lkl_net_done(sock as *mut c_void, err) })
 }
 
-/// The program's connect to a non-loopback address: the `connect` hook, on a task.
+/// The program's connect to a non-loopback address (`ty`: the socket's, a stream or a datagram
+/// socket): the `connect` hook, on a task.
 ///
 /// # Safety
 /// A host op: called by the kernel, with its pointers valid for the call.
-pub unsafe extern "C" fn net_connect(sock: *mut c_void, pid: c_int, addr: *const l::lkl_sockaddr, len: c_int) -> c_int {
+pub unsafe extern "C" fn net_connect(sock: *mut c_void, pid: c_int, addr: *const l::lkl_sockaddr, len: c_int, ty: c_int) -> c_int {
     let Some(addr) = addr_of(addr, len) else { return neg(Errno::INVAL) };
+    // The kernel's SOCK_STREAM and SOCK_DGRAM (include/linux/net.h), not in the bindings.
+    let proto = match ty {
+        1 => Proto::Tcp,
+        2 => Proto::Udp,
+        _ => return neg(Errno::PROTONOSUPPORT),
+    };
     if R.hooks.borrow().connect.is_none() {
         return neg(Errno::NETUNREACH);
     }
     let sock = sock as usize;
     if elsewhere() {
-        return if forward(Fwd::Connect { sock, pid, addr }) { 0 } else { neg(Errno::NOBUFS) };
+        return if forward(Fwd::Connect { sock, pid, proto, addr }) { 0 } else { neg(Errno::NOBUFS) };
     }
     register(sock);
-    executor::spawn(connect_task(sock, pid, addr, false));
+    executor::spawn(connect_task(sock, pid, proto, addr, false));
     0
 }
 
 /// `forwarded`: a forked process's connect, whose socket can't use a host fd of init's: an fd
 /// connection is served here instead ([`served`]).
-async fn connect_task(sock: usize, pid: i32, addr: SocketAddrV4, forwarded: bool) {
+async fn connect_task(sock: usize, pid: i32, proto: Proto, addr: SocketAddrV4, forwarded: bool) {
     // The hook is called on the executor, not in the host op.
     let fut = {
         let mut h = R.hooks.borrow_mut();
         match h.connect.as_mut() {
-            Some(f) => f(Cx, pid, addr),
+            Some(f) => f(Cx, pid, proto, addr),
             None => return,
         }
     };
@@ -445,6 +440,8 @@ async fn connect_task(sock: usize, pid: i32, addr: SocketAddrV4, forwarded: bool
             }
             let g = GuestSocket::new(end);
             match conn {
+                // UDP's end is seqpacket: one read is one datagram, as large as UDP's.
+                Conn::Stream(s) if proto == Proto::Udp => splice_with(g, s, 64 << 10).await,
                 Conn::Stream(s) => splice(g, s).await,
                 Conn::Drive(f) => f(g),
                 Conn::Fd(..) => unreachable!("an fd connection is given above"),
@@ -548,80 +545,6 @@ async fn listen_task(sock: usize, pid: i32, addr: SocketAddrV4, forwarded: bool)
         executor::spawn(splice(GuestSocket::new(end), stream));
     }
     unregister(sock);
-    done(sock, 0);
-}
-
-/// A datagram from the program to a non-loopback address: a resolver query if to port 53 and a
-/// `resolve` hook is set; anything else is ENETUNREACH.
-///
-/// # Safety
-/// A host op: called by the kernel, with its pointers valid for the call.
-pub unsafe extern "C" fn net_sendto(
-    sock: *mut c_void,
-    pid: c_int,
-    addr: *const l::lkl_sockaddr,
-    len: c_int,
-    buf: *const c_void,
-    size: c_ulong,
-) -> c_int {
-    let Some(to) = addr_of(addr, len) else { return neg(Errno::INVAL) };
-    if to.port() != 53 || R.hooks.borrow().resolve.is_none() {
-        return neg(Errno::NETUNREACH);
-    }
-    // SAFETY: the kernel's copy of the datagram, size bytes.
-    let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, size as usize) };
-    if elsewhere() {
-        // Its bytes into a shared slot, for init's executor; none free or too long: no answer
-        // (the resolver asks again, as for a lost datagram).
-        let Some(slot) = FWD.msg_used.iter().position(|u| !u.get()) else { return neg(Errno::NOBUFS) };
-        if bytes.len() > FWD_MSG {
-            return neg(Errno::MSGSIZE);
-        }
-        let mut m = [0u8; FWD_MSG];
-        m[..bytes.len()].copy_from_slice(bytes);
-        FWD.msgs[slot].set(m);
-        FWD.msg_used[slot].set(true);
-        let f = Fwd::Resolve { sock: sock as usize, pid, ns: to, slot: slot as u8, len: bytes.len() as u16 };
-        if !forward(f) {
-            FWD.msg_used[slot].set(false);
-            return neg(Errno::NOBUFS);
-        }
-        return 0;
-    }
-    let msg = bytes.to_vec();
-    executor::spawn(resolve_task(sock as usize, pid, to, msg));
-    0
-}
-
-async fn resolve_task(sock: usize, pid: i32, ns: SocketAddrV4, msg: Vec<u8>) {
-    let reply = match dns::parse(&msg) {
-        // Only an A query asks the hook (its answer is IPv4 addresses): another (glibc's AAAA
-        // beside each A) is no data at once, not a second call of the hook for the same name.
-        Ok(q) if q.qtype != dns::TYPE_A => Some(dns::answer(&q, Rcode::NoError, &[])),
-        Ok(q) => {
-            let fut = {
-                let mut h = R.hooks.borrow_mut();
-                h.resolve.as_mut().map(|f| f(Cx, pid, q.name.clone()))
-            };
-            let (rc, addrs) = match fut {
-                Some(f) => match f.await {
-                    Ok(a) => (Rcode::NoError, a),
-                    Err(rc) => (rc, Vec::new()),
-                },
-                None => (Rcode::Refused, Vec::new()),
-            };
-            Some(dns::answer(&q, rc, &addrs))
-        }
-        Err(Some((id, rc))) => Some(dns::failure(id, rc)),
-        Err(None) => None,
-    };
-    if let Some(r) = reply {
-        let from = sockaddr(ns);
-        // SAFETY: the lent sock; the answer as the nameserver's.
-        kernel(|| unsafe {
-            l::lkl_net_reply(sock as *mut c_void, from.as_ptr() as *const l::lkl_sockaddr, 16, r.as_ptr() as *const c_void, r.len() as c_ulong)
-        });
-    }
     done(sock, 0);
 }
 
@@ -799,8 +722,8 @@ struct Dir {
 }
 
 impl Dir {
-    fn new() -> Dir {
-        Dir { buf: alloc::vec![0; BUF], pos: 0, len: 0, eof: false, done: false }
+    fn new(size: usize) -> Dir {
+        Dir { buf: alloc::vec![0; size], pos: 0, len: 0, eof: false, done: false }
     }
 }
 
@@ -816,9 +739,14 @@ enum End {
 
 /// Copy both ways between the program's socket and a hook's stream until both directions are
 /// done; who closes what is in the module comment.
-pub async fn splice(mut g: GuestSocket, mut s: BoxStream) {
-    let mut up = Dir::new(); // the program → the stream
-    let mut down = Dir::new(); // the stream → the program
+pub async fn splice(g: GuestSocket, s: BoxStream) {
+    splice_with(g, s, BUF).await
+}
+
+/// [`splice`] with `buf`-byte buffers: a datagram stream's reads must each take a whole datagram.
+async fn splice_with(mut g: GuestSocket, mut s: BoxStream, buf: usize) {
+    let mut up = Dir::new(buf); // the program → the stream
+    let mut down = Dir::new(buf); // the stream → the program
     // After the program's close the stream is only shut down, never read again.
     let mut guest_closed = false;
     let end = poll_fn(|cx| {

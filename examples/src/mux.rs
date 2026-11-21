@@ -1,9 +1,9 @@
-//! A tiny multiplexing protocol for `net-policy`: every connect and lookup of a sandbox over ONE
+//! A tiny multiplexing protocol for `net-policy`: every TCP connect of a sandbox over ONE
 //! host fd (a socketpair end the sandbox holds as "net", `Guest::hold_fd_as`, which the hooks
 //! find with `cx.held`), to a proxy process at its other end. After
 //! `crates/unsharek/tests/net.rs`'s test provider.
 //!
-//! A frame is `id: u32 LE, op: u8, len: u32 LE, payload`. A connect or lookup is a request with a
+//! A frame is `id: u32 LE, op: u8, len: u32 LE, payload`. A connect is a request with a
 //! fresh id, answered by one reply; a connected stream's bytes and closes then go both ways under
 //! the request's id.
 //!
@@ -16,24 +16,22 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::future::poll_fn;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
-use unsharek::{Cx, HeldFd, NetError, OnConnect, OnResolve};
+use unsharek::{Cx, HeldFd, NetError, OnConnect};
 use futures_io::{AsyncRead, AsyncWrite};
 
-const CONNECT: u8 = 1; // pid: i32 LE, ip: 4 bytes, port: u16 BE, the name it was resolved from
-const RESOLVE: u8 = 2; // pid: i32 LE, name
+const CONNECT: u8 = 1; // pid: i32 LE, ip: 4 bytes, port: u16 BE
 const DATA: u8 = 3;
 const CLOSE: u8 = 4; // a half-close
 const RESET: u8 = 5; // an abort
 const CONNECTED: u8 = 10;
 const ERROR: u8 = 11; // the index of a NetError in ERRORS
-const ADDRS: u8 = 12; // IPv4 addresses, 4 bytes each
 
 const ERRORS: [NetError; 4] = [NetError::Denied, NetError::Refused, NetError::NoName, NetError::Io];
 
@@ -109,7 +107,7 @@ async fn reader(mut fd: HeldFd, s: Shared) {
         }
         buf.extend_from_slice(&chunk[..n]);
         while let Some((id, op, payload)) = take_frame(&mut buf) {
-            if let (CONNECTED | ERROR | ADDRS, Some(r)) = (op, ss.replies.get_mut(&id)) {
+            if let (CONNECTED | ERROR, Some(r)) = (op, ss.replies.get_mut(&id)) {
                 r.0 = Some((op, payload));
                 wake(&mut r.1);
             } else if let Some(st) = ss.streams.get_mut(&id) {
@@ -253,18 +251,16 @@ pub async fn start(cx: Cx) {
     session(cx);
 }
 
-/// The sandbox's network hooks, over the fd held as "net". A connect carries the name its address
-/// was resolved from (`cx.name_of`), so the proxy decides by name.
-pub fn hooks() -> (OnConnect, OnResolve) {
-    let connect = OnConnect::new(move |cx: Cx, pid, addr| {
+/// The sandbox's network hook, over the fd held as "net": each TCP connect, by address, for the
+/// proxy to decide.
+pub fn hooks() -> OnConnect {
+    OnConnect::new(move |cx: Cx, pid, addr| {
         let s = session(cx);
-        let name = cx.name_of(addr.ip()).unwrap_or_default();
         async move {
             let SocketAddr::V4(a) = addr else { return Err(NetError::Unsupported) };
             let mut p = pid.to_le_bytes().to_vec();
             p.extend_from_slice(&a.ip().octets());
             p.extend_from_slice(&a.port().to_be_bytes());
-            p.extend_from_slice(name.as_bytes());
             match request(&s, CONNECT, &p).await {
                 (id, CONNECTED, _) => Ok(Proxied { id, s, closed: false }),
                 (id, _, e) => {
@@ -273,29 +269,15 @@ pub fn hooks() -> (OnConnect, OnResolve) {
                 }
             }
         }
-    });
-    let resolve = OnResolve::new(move |cx, pid, name: String| {
-        let s = session(cx);
-        async move {
-            let mut p = pid.to_le_bytes().to_vec();
-            p.extend_from_slice(name.as_bytes());
-            match request(&s, RESOLVE, &p).await {
-                (_, ADDRS, a) => Ok(a.chunks(4).map(|c| IpAddr::V4(Ipv4Addr::new(c[0], c[1], c[2], c[3]))).collect()),
-                (_, _, e) => Err(error_of(&e)),
-            }
-        }
-    });
-    (connect, resolve)
+    })
 }
 
 // ---- in the proxy ----------------------------------------------------------------------------
 
-/// What the proxy allows. `pid` is the guest's, and a connect's `name` the one its address was
-/// resolved from, as the sandbox reports them: the program could lie about both, so they are for
-/// logs and for picking a target, never for trust. What the proxy grants is the policy.
+/// What the proxy allows. `pid` is the guest's, as the sandbox reports it: the program could lie,
+/// so it is for logs, never for trust. What the proxy grants is the policy.
 pub trait Policy {
-    fn resolve(&mut self, pid: i32, name: &str) -> Result<Vec<Ipv4Addr>, NetError>;
-    fn connect(&mut self, pid: i32, addr: SocketAddrV4, name: &str) -> Result<TcpStream, NetError>;
+    fn connect(&mut self, pid: i32, addr: SocketAddrV4) -> Result<TcpStream, NetError>;
 }
 
 /// Serves one sandbox's session on `sock` until it closes.
@@ -310,13 +292,9 @@ pub fn serve(mut sock: UnixStream, mut policy: impl Policy) {
         while let Some((id, op, p)) = take_frame(&mut buf) {
             let pid = || i32::from_le_bytes(p[..4].try_into().unwrap());
             match op {
-                RESOLVE => match policy.resolve(pid(), &String::from_utf8_lossy(&p[4..])) {
-                    Ok(ips) => send(&w, id, ADDRS, &ips.iter().flat_map(|ip| ip.octets()).collect::<Vec<_>>()),
-                    Err(e) => send(&w, id, ERROR, &code(e)),
-                },
                 CONNECT => {
                     let addr = SocketAddrV4::new(Ipv4Addr::new(p[4], p[5], p[6], p[7]), u16::from_be_bytes([p[8], p[9]]));
-                    match policy.connect(pid(), addr, &String::from_utf8_lossy(&p[10..])) {
+                    match policy.connect(pid(), addr) {
                         Ok(t) => {
                             let (mut r, w) = (t.try_clone().unwrap(), w.clone());
                             conns.insert(id, t);

@@ -83,7 +83,7 @@ fn net_policy() {
             "-> 'hello from the host!'",
             "allows port",
             "Connection refused",
-            "resolve elsewhere.test -> refused (no such name)",
+            "connect 10.0.0.9:80 -> refused (not on the list)",
             "sandbox: exit 0",
         ],
     );
