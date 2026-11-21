@@ -34,7 +34,7 @@ mkdir -p "$dir"
   if [[ ! $link -ef $bin ]]; then
     ln -f "$bin" "$link.new" && mv -f "$link.new" "$link" || exit 125
     # The image, built once for the binary's tests (and the binary seen to start in the guest).
-    out=$("$unsharek" --mode "$mode" --ro "$dir" -- "$link" --list 2>&1)
+    out=$("$unsharek" --mode "$mode" --ro "$dir" --closure "$dir" -- "$link" --list 2>&1)
     st=$?
     if ((st != 0)); then
       rm -f "$link"
@@ -48,4 +48,4 @@ export UNSHAREK_TEST_MODE=$mode
 # the harness's variables, which the tests' natively run selves see too).
 keep=()
 while IFS= read -r -d '' kv; do keep+=(--keep-env "${kv%%=*}"); done < <(env -0)
-exec "$unsharek" --mode "$mode" --ro "$dir" "${keep[@]}" -- "$link" "$@"
+exec "$unsharek" --mode "$mode" --ro "$dir" --closure "$dir" "${keep[@]}" -- "$link" "$@"

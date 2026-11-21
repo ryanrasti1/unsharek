@@ -18,18 +18,20 @@ mod tty;
 struct Cli {
     #[arg(long, value_enum, default_value_t = Mode::Coroutine)]
     mode: Mode,
-    /// More the program may see, read-only: a store path (with its closure, as an image), a host
-    /// file, or a host directory, served live (at AT, default its own path). Repeatable.
-    #[arg(long = "ro", value_name = "PATH[:AT]")]
+    /// A store path the program may see, with everything it references, read-only, each at its
+    /// own path (the program's code maps in place from them). A host directory: the store paths
+    /// its files reference (show the directory itself with --ro). Nothing is shown unless given:
+    /// not even the program's own. At most 256 store paths. Repeatable.
+    #[arg(long = "closure", value_name = "PATH")]
+    closure: Vec<std::path::PathBuf>,
+    /// A host directory the program may read, served live (at AT, default its own path).
+    /// Repeatable.
+    #[arg(long = "ro", value_name = "DIR[:AT]")]
     ro: Vec<fs::Arg>,
     /// A host directory the program may read and write, served live (at AT, default its own
     /// path). Repeatable.
     #[arg(long = "rw", value_name = "DIR[:AT]")]
     rw: Vec<fs::Arg>,
-    /// Map an erofs image as /dev/unsharek/NAME, and mount it at MOUNTPOINT if given.
-    /// Repeatable.
-    #[arg(long = "image", value_name = "NAME=PATH[:MOUNTPOINT]")]
-    images: Vec<unsharek::ImageArg>,
     /// Fork mode: the most processes alive at once.
     #[arg(long)]
     max_procs: Option<u32>,
@@ -82,7 +84,7 @@ fn main() -> ExitCode {
             rustix::process::Rlimit { current: Some(l), maximum: Some(l) },
         );
     }
-    let Cli { mode, mut ro, rw, images, max_procs, setenv, mut keep_env, system, net, publish, mut argv } = Cli::parse();
+    let Cli { mode, closure, mut ro, rw, max_procs, setenv, mut keep_env, system, net, publish, mut argv } = Cli::parse();
     if system {
         ro.extend(fs::SYSTEM.iter().filter(|d| std::path::Path::new(d).is_dir()).map(|d| fs::Arg { host: d.into(), at: None, live: true }));
         keep_env.extend(["PATH", "TERM", "LANG"].map(OsString::from));
@@ -99,9 +101,14 @@ fn main() -> ExitCode {
     // An interactive terminal (cli/tty.rs): fork mode, stdin a terminal. This process becomes the
     // terminal's supervisor, outside the sandbox; its child goes on.
     let tty = if matches!(mode, Mode::Fork) && tty::is_tty() { Some(tty::supervise()) } else { None };
-    // Plugin: host directories, live (cli/fs.rs).
-    let (live, images_ro): (Vec<fs::Arg>, Vec<fs::Arg>) = ro.into_iter().partition(|a| a.live || fs::live(&a.host));
-    let host_dirs = match fs::spawn(&live, &rw) {
+    // Plugin: host directories, live (cli/fs.rs). A store path's place is --closure.
+    if let Some(a) = ro.iter().find(|a| !a.live && !fs::live(&a.host)) {
+        let p = a.host.display();
+        let why = if a.host.is_dir() { "a store path: use --closure" } else { "not a directory" };
+        eprintln!("unsharek: --ro {p}: {why}");
+        return ExitCode::from(125);
+    }
+    let host_dirs = match fs::spawn(&ro, &rw) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("unsharek: a host directory's server: {e}");
@@ -137,8 +144,7 @@ fn main() -> ExitCode {
             Mode::Threaded => unsharek::Mode::Threaded,
             Mode::Fork => unsharek::Mode::Fork,
         },
-        allow_paths: images_ro.into_iter().map(|a| a.host).collect(),
-        images,
+        closures: closure,
         max_procs,
         argv,
         env,

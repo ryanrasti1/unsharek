@@ -4,8 +4,8 @@
 //! filter), to a virtio-fs device mounted at AT (default: DIR's own path). The sandbox gains a
 //! granted socket per directory, and nothing in its filter.
 //!
-//! A store path given to `--ro` stays an erofs image of the closure (immutable, its ELF files
-//! mapped in place), as does a file; only directories outside the store are served live.
+//! Store paths are `--closure`'s (immutable, each ELF file mapped in place): `--ro` refuses one,
+//! but for `--system`'s `/nix/store`, served live whole.
 
 use std::path::{Path, PathBuf};
 
@@ -68,7 +68,7 @@ impl std::str::FromStr for Arg {
     }
 }
 
-/// Whether `--ro PATH` is served live (a directory outside the store) rather than as an image.
+/// Whether `--ro PATH` can be served live: a directory outside the store.
 pub fn live(p: &Path) -> bool {
     p.is_dir() && !std::path::absolute(p).is_ok_and(|a| a.starts_with("/nix/store"))
 }

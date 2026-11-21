@@ -65,13 +65,12 @@ use std::marker::PhantomData;
 use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
 use unsharek_rt::{guest, sched};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("invalid image {0:?}: NAME=PATH[:MOUNTPOINT]")]
+    #[error("invalid image name {0:?}")]
     ImageArg(String),
     #[error("no program to run (argv is empty)")]
     NoProgram,
@@ -91,6 +90,9 @@ pub enum Error {
     Exec { path: PathBuf, errno: std::io::Error },
     #[error("lockdown: {0}")]
     Lockdown(#[from] tcb::Error),
+    /// The program's path is in nothing the guest is shown ([`run_with`]).
+    #[error("{}: the program isn't in the sandbox: add --closure <its store path> or --system", .0.display())]
+    ProgramNotInSandbox(PathBuf),
     /// Other host threads at lockdown (the guest's check, before the TCB's own).
     #[error("{0}")]
     Threads(String),
@@ -821,41 +823,15 @@ pub fn wait(pid: u32) -> std::io::Result<std::process::ExitStatus> {
 // ------------------------------------------------------------------------------------------------
 // The CLI's path.
 
-/// An image given on the command line: `NAME=PATH[:MOUNTPOINT]`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ImageArg {
-    pub name: String,
-    pub path: PathBuf,
-    pub mount: Option<PathBuf>,
-}
-
-impl FromStr for ImageArg {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self, Error> {
-        let bad = || Error::ImageArg(s.to_owned());
-        let (name, rest) = s.split_once('=').ok_or_else(bad)?;
-        if name.is_empty() || name.contains('/') || rest.is_empty() {
-            return Err(bad());
-        }
-        let (path, mount) = match rest.split_once(':') {
-            Some((p, m)) if !m.is_empty() => (p, Some(PathBuf::from(m))),
-            Some(_) => return Err(bad()),
-            None => (rest, None),
-        };
-        Ok(ImageArg { name: name.to_owned(), path: path.into(), mount })
-    }
-}
-
 /// Everything a sandbox needs to start.
 #[derive(Clone, Debug, Default)]
 pub struct Config {
     pub mode: Mode,
-    /// More host paths the program may see and map, besides its own closure: a store path
-    /// brings its closure; a path outside the store is shown as is, read-only.
-    pub allow_paths: Vec<PathBuf>,
-    /// More images to map (and mount, where a mount point is given).
-    pub images: Vec<ImageArg>,
+    /// What the guest is shown of the store, read-only (the CLI's `--closure`): a store path (or a
+    /// path in one) brings its closure; a host directory, the closures of the store paths its
+    /// files reference (the directory itself is `host_dirs`' to show). Nothing implicit: not even
+    /// the program's own.
+    pub closures: Vec<PathBuf>,
     /// Fork mode: the most processes alive at once, the first one included.
     pub max_procs: Option<u32>,
     /// The program and its arguments; `argv[0]` is the program's path.
@@ -881,17 +857,15 @@ pub struct HostDir {
     pub at: PathBuf,
 }
 
-/// The images the guest mounts for `config`'s program and allowed paths, built where the cache
-/// lacks them (the closure too is cached there: [`store::Cache::closure`]). Host-side, before
-/// lockdown; nothing is opened or mapped yet.
+/// The images the guest mounts for `config`'s closures, built where the cache lacks them (the
+/// closure too is cached there: [`store::Cache::closure`]). Host-side, before lockdown; nothing
+/// is opened or mapped yet.
 pub fn store(config: &Config) -> Result<store::Store, Error> {
-    let program = config.argv.first().ok_or(Error::NoProgram)?;
     let cache = match &config.image_cache {
         Some(dir) => store::Cache::new(dir),
         None => store::Cache::open_default()?,
     };
-    let live: Vec<PathBuf> = config.host_dirs.iter().map(|d| d.at.clone()).collect();
-    Ok(cache.store_live(Path::new(program), &config.allow_paths, &live)?)
+    Ok(cache.store_refs(&config.closures)?)
 }
 
 /// A [`SandboxConfig`] granting the program's stdio, as the CLI does ([`run`]): fds 0-2, and
@@ -902,8 +876,8 @@ pub fn stdio() -> SandboxConfig {
     c
 }
 
-/// Become the sandbox: [`Guest::boot`] for the mode, the closure's images (and `config.images`)
-/// mapped and mounted in a [`Guest::run`] closure, [`lockdown`] with the program's stdio granted
+/// Become the sandbox: [`Guest::boot`] for the mode, the closures' images mapped and mounted in a
+/// [`Guest::run`] closure, [`lockdown`] with the program's stdio granted
 /// (fds 0-2), the program [`execve`]d in [`Guest::run`]. Returns only on failure before the
 /// program starts; the process ends with the program's status.
 pub fn run(config: Config) -> Result<Infallible, Error> {
@@ -920,16 +894,16 @@ pub fn run_with(
 ) -> Result<Infallible, Error> {
     let store = store(&config)?;
     let mut g = Guest::boot(GuestConfig { mode: config.mode, max_procs: config.max_procs.unwrap_or(0), ..Default::default() })?;
-    let mut mounts = g.map_store(&store)?;
-    for i in &config.images {
-        let img = g.map_image_as(&i.path, &i.name)?;
-        if let Some(at) = &i.mount {
-            mounts.push(setup::Mount { image: img, at: at.clone(), kind: store::Kind::Dir });
-        }
-    }
+    let mounts = g.map_store(&store)?;
     // The program's path as the host resolves it: the guest's working directory is `/`.
     let mut argv = config.argv.clone();
-    argv[0] = std::path::absolute(&argv[0]).map_err(Error::io("the program's path"))?.into_os_string();
+    let program = std::path::absolute(argv.first().ok_or(Error::NoProgram)?).map_err(Error::io("the program's path"))?;
+    // Nothing is shown implicitly: the program must be in a closure or a host directory given.
+    let shown = store.mounts.iter().map(|m| &m.guest).chain(config.host_dirs.iter().map(|d| &d.at));
+    if !shown.into_iter().any(|at| program.starts_with(at)) {
+        return Err(Error::ProgramNotInSandbox(program));
+    }
+    argv[0] = program.into_os_string();
     for (i, d) in config.host_dirs.iter().enumerate() {
         hostfs::add(&format!("host{i}"), d.fd).map_err(Error::io("a host directory's device"))?;
     }
@@ -963,18 +937,6 @@ pub fn run_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn image_args() {
-        assert_eq!(
-            "store=/x/s.erofs:/nix/store".parse::<ImageArg>().unwrap(),
-            ImageArg { name: "store".into(), path: "/x/s.erofs".into(), mount: Some("/nix/store".into()) }
-        );
-        assert_eq!("a=/p".parse::<ImageArg>().unwrap().mount, None);
-        for bad in ["a", "=p", "a=", "a/b=p", "a=p:"] {
-            assert!(bad.parse::<ImageArg>().is_err(), "{bad} parsed");
-        }
-    }
 
     /// The runtime makes its threads and waits with the shapes the TCB's filter pins (a mismatch
     /// would be a sandbox killed at its first thread, never a wider filter: this says which to

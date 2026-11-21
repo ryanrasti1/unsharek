@@ -97,7 +97,7 @@ fn bash() -> String {
 
 #[test]
 fn interactive_bash_on_a_guest_pty() {
-    let (m, pid) = spawn(&["--mode", "fork", "--", &bash(), "--norc", "-i"]);
+    let (m, pid) = spawn(&["--mode", "fork", "--closure", &bash(), "--", &bash(), "--norc", "-i"]);
     let mut out = vec![];
     let t = Duration::from_secs(5);
     assert!(wait_for(&m, &mut out, "# ", t), "no prompt: {}", String::from_utf8_lossy(&out));
@@ -147,7 +147,9 @@ fn interactive_shell_has_the_network() {
         }
     });
     let bin_dir = unsharek_fixtures::bin_dir().display().to_string();
-    let (m, pid) = spawn(&["--mode", "fork", "--net", "all", "--ro", &bin_dir, "--", &bash(), "--norc", "-i"]);
+    let (m, pid) = spawn(&[
+        "--mode", "fork", "--net", "all", "--ro", &bin_dir, "--closure", &bin_dir, "--closure", &bash(), "--", &bash(), "--norc", "-i",
+    ]);
     let mut out = vec![];
     let t = Duration::from_secs(5);
     assert!(wait_for(&m, &mut out, "# ", t), "no prompt: {}", String::from_utf8_lossy(&out));
@@ -163,7 +165,7 @@ fn interactive_shell_has_the_network() {
 /// isn't on a terminal is as ever: no pty (the suite's cases, whose stdin is a pipe or /dev/null).
 #[test]
 fn terminal_settings_restored() {
-    let script = "stty -g > /dev/null; before=$(stty -g); X --mode fork -- B -c 'exit 3'; s=$?; after=$(stty -g); \
+    let script = "stty -g > /dev/null; before=$(stty -g); X --mode fork --closure B -- B -c 'exit 3'; s=$?; after=$(stty -g); \
                   [ \"$before\" = \"$after\" ] && echo SAME-$s || echo DIFFERENT-$s";
     let script = script.replace('X', env!("CARGO_BIN_EXE_unsharek")).replace('B', &bash());
     let (m, pid) = spawn_host_shell(&script);

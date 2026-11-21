@@ -401,6 +401,15 @@ impl Cache {
         self.images(&closure_in(None, paths, &[], Some(self))?)
     }
 
+    /// [`Cache::closures`], but a host directory brings only the closures of the store paths its
+    /// files reference, not an image of its own (the CLI's `--closure`: the directory is shown
+    /// live, by `--ro`, if at all).
+    pub fn store_refs(&self, paths: &[PathBuf]) -> Result<Store> {
+        let mut c = closure_in(None, paths, &[], Some(self))?;
+        c.host.clear();
+        self.images(&c)
+    }
+
     /// [`Cache::store`], with host directories served live (`live`: not imaged) besides: the
     /// program may be in one.
     pub fn store_live(&self, program: &Path, allow_paths: &[PathBuf], live: &[PathBuf]) -> Result<Store> {

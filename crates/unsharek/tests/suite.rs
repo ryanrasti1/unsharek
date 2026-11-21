@@ -101,7 +101,7 @@ struct Case {
     flags: Vec<&'static str>,
     env: Vec<(&'static str, &'static str)>,
     /// Programs from nixpkgs the case runs besides its own (devshell variables naming them): their
-    /// store paths are allowed (`--ro`), closures and all.
+    /// store paths are given (`--closure`), closures and all.
     uses: Vec<&'static str>,
     stdin: Option<&'static str>,
     /// Stdin a pipe held open and silent for the whole run (a reader blocks on it).
@@ -670,13 +670,18 @@ fn run(c: &Case, mode: Mode, secret: &PathBuf) -> Result<(), Failed> {
         Command::new(&prog)
     } else {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_unsharek"));
-        cmd.args(["--mode", mode.name(), "--ro"]).arg(fx::bin_dir());
+        // The fixtures' directory, live, and the store paths its programs reference.
+        cmd.args(["--mode", mode.name(), "--ro"]).arg(fx::bin_dir()).arg("--closure").arg(fx::bin_dir());
+        // A program from the store (an external case's): its closure, given as any other is.
+        if prog.starts_with("/nix/store") {
+            cmd.arg("--closure").arg(&prog);
+        }
         for var in &c.uses {
             let Some(p) = env::var_os(var) else { return Err(format!("{var} unset: run in the devshell (cargo xtask test)").into()) };
             let p = PathBuf::from(p);
             // Its store path (`/nix/store/<hash>-<name>`), which brings its closure.
             let store = p.ancestors().find(|a| a.parent() == Some(std::path::Path::new("/nix/store"))).unwrap_or(&p);
-            cmd.arg("--ro").arg(store);
+            cmd.arg("--closure").arg(store);
         }
         // The environment is empty but for what's kept: the variables this run sets below, the
         // programs the case uses (its scripts name them: `$UNSHAREK_TEST_GCC`), and the

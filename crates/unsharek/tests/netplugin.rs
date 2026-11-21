@@ -56,6 +56,8 @@ fn unsharek_stdin(mode: &str, flags: &[String], args: &[String], stdin: Stdio) -
     Command::new(env!("CARGO_BIN_EXE_unsharek"))
         .args(["--mode", mode, "--ro"])
         .arg(fx::bin_dir())
+        .arg("--closure")
+        .arg(fx::bin_dir())
         .args(flags)
         .arg("--")
         .arg(fx::bin("net"))

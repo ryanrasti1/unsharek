@@ -95,7 +95,8 @@ def run(cmd, timeout, env=None, cwd=None, cpus=None, perf=None):
 def sandboxed(unsharek, mode, allow, argv, max_procs=None):
     cmd = [unsharek, '--mode', mode, '--keep-env', 'PATH', '--keep-env', 'HOME']
     for a in allow:
-        cmd += ['--ro', a]
+        # A store path: its closure. A host directory: shown live, and the store paths it uses.
+        cmd += ['--closure', a] if os.path.realpath(a).startswith('/nix/store/') else ['--ro', a, '--closure', a]
     if max_procs:
         cmd += ['--max-procs', str(max_procs)]
     return cmd + ['--'] + argv

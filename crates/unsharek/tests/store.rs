@@ -52,19 +52,18 @@ fn fixture_closure_has_its_glibc_and_its_dir() {
     let dir = fs::canonicalize(fx::bin_dir()).unwrap();
     assert_eq!(c.host, BTreeSet::from([dir.clone()]));
 
-    let config = unsharek::Config {
-        argv: vec![fx::bin("hello").into()],
-        allow_paths: vec![fx::bin_dir()],
-        host_dirs: vec![],
-        image_cache: Some(shared_cache()),
-        ..Default::default()
-    };
-    let s = unsharek::store(&config).unwrap();
+    let s = store::Cache::new(&shared_cache()).closures(&[fx::bin_dir()]).unwrap();
     let own = s.mounts.iter().find(|m| m.guest == dir).expect("the fixtures dir's image");
     fsck(&own.image);
     let layout = fs::read_to_string(&own.layout).unwrap();
     assert!(layout.lines().any(|l| l.ends_with(" elf hello")), "{layout}");
     assert_eq!(s.mounts.len(), c.store.len() + 1);
+    // The CLI's --closure of the directory: the store paths it references, and no image of its
+    // own (the directory is --ro's to show, live).
+    let config = unsharek::Config { closures: vec![fx::bin_dir()], image_cache: Some(shared_cache()), ..Default::default() };
+    let refs = unsharek::store(&config).unwrap();
+    assert!(refs.mounts.iter().all(|m| m.guest != dir), "the directory imaged");
+    assert_eq!(refs.mounts.len(), c.store.len());
 }
 
 #[test]
