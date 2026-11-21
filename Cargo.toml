@@ -1,7 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["examples", "xtask", "crates/unsharek-tcb", "crates/unsharek-build", "crates/unsharek-erofs", "crates/unsharek", "crates/unsharek-fixtures", "crates/guest-tests", "crates/lkl-sys", "crates/unsharek-rt", "crates/unsharek-fs", "crates/unsharek-fs-server", "crates/unsharek-net"]
-# its own workspace (its own repository to be): unsharek-tcb depends on it by path
+# seccomp-fn is its own repository and workspace (the submodule seccomp-fn/); unsharek-tcb, also a
+# submodule, depends on it by a pinned git commit, patched below to the checkout here.
 exclude = ["seccomp-fn", "vendor"]
 
 [workspace.package]
@@ -31,3 +32,9 @@ debug = 1
 
 [profile.release]
 panic = "abort"
+
+# unsharek-tcb's pinned seccomp-fn is the submodule's checkout: one package with the path
+# dependencies above, and a submodule bump moves both.
+[patch."ssh://git@github.com/ryanrasti1/seccomp-fn.git"]
+seccomp-fn = { path = "seccomp-fn/seccomp-fn" }
+seccomp-fn-verify = { path = "seccomp-fn/seccomp-fn-verify" }

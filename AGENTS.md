@@ -51,7 +51,9 @@
 - The trusted computing base is the crate `unsharek-tcb` (`crates/unsharek-tcb/`) and nothing else
   (`crates/unsharek-tcb/README.md`: the guarantee, what isn't guaranteed, the design, the review checklist):
   lockdown's checks and the one seccomp filter. It depends on seccomp-fn and libc only, and on
-  nothing of unsharek's: build it as its own repository. Keep it small. A change that widens what
+  nothing of unsharek's: it is its own repository (ryanrasti1/unsharek-tcb, the submodule
+  `crates/unsharek-tcb`), as seccomp-fn is (`seccomp-fn/`). A change to either is a commit there,
+  and the submodule's bump here, in one commit of unsharek's. Keep it small. A change that widens what
   the host allows (a filter rule, a kind of guest fd or mapping lockdown accepts) is a TCB change,
   with a test in `crates/unsharek-tcb/tests/` (`filter.rs`; `lockdown.rs`), and
   crates/unsharek-tcb/README.md's table and checklist follow it (a test checks the table's rows against the

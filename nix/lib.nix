@@ -24,7 +24,7 @@ let
       ]))
       # unsharek-tcb's README: a test checks its allowlist table against the filter
       ../crates/unsharek-tcb/README.md
-      # seccomp-fn, the filter's compiler and proof (its own repository to be)
+      # seccomp-fn, the filter's compiler and proof (its own repository, a submodule)
       (fs.difference ../seccomp-fn (fs.maybeMissing ../seccomp-fn/target))
       # capnweb-rs, vendored with the network plugin's transport (vendor/capnweb-rs/PATCHES.md)
       ../vendor

@@ -8,7 +8,7 @@
   # unsharek's side of it, in one commit.
   inputs.self.submodules = true;
 
-  # seccomp-fn (its own repository to be): the filter's compiler, Kani and the proof's check.
+  # seccomp-fn (its own repository, the submodule seccomp-fn/): the filter's compiler, Kani and the proof's check.
   inputs.seccomp-fn = { url = "path:./seccomp-fn"; inputs.nixpkgs.follows = "nixpkgs"; };
 
   outputs = { self, nixpkgs, seccomp-fn }:

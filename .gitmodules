@@ -2,3 +2,9 @@
 	path = crates/lkl-sys/linux
 	url = git@github.com:ryanrasti/linux.git
 	branch = exobox-native
+[submodule "seccomp-fn"]
+	path = seccomp-fn
+	url = git@github.com:ryanrasti1/seccomp-fn.git
+[submodule "crates/unsharek-tcb"]
+	path = crates/unsharek-tcb
+	url = git@github.com:ryanrasti1/unsharek-tcb.git
