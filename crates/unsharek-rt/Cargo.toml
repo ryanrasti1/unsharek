@@ -1,0 +1,33 @@
+[package]
+name = "unsharek-rt"
+version = "0.0.0"
+description = "unsharek's in-sandbox runtime: what runs after lockdown, in the SIGSYS handler and on the guest kernel's behalf"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# The virtio-fs device's state, a static of the shared section (host.rs's FS_DEVICES)
+unsharek-fs = { path = "../unsharek-fs" }
+# thread: prctl(PR_SET_NO_NEW_PRIVS) before installing the filter; mm: mprotect for the
+# coroutine stacks' guard pages (sched); time: the clocks (vDSO), event: ppoll as the idle wait
+# (host)
+rustix = { workspace = true, features = ["thread", "mm", "time", "event", "fs", "termios"] }
+# The kernel and its host-operations table, which `host` fills in
+lkl-sys = { path = "../lkl-sys" }
+# exec: the ELF file and program headers, read in place from fixed buffers (no allocation)
+object = { version = "0.40", default-features = false, features = ["read_core", "elf"] }
+
+[features]
+# The measurement counters (src/stats.rs), compiled out without it.
+stats = []
+
+[dev-dependencies]
+# fork and waitpid for the filter's real-kernel test; struct layouts and constants checked
+# against glibc's x86-64 ABI (sysmap, xabi)
+libc = { workspace = true }
+# property tests of the arena against a page model
+proptest = { workspace = true }
+# exec's tests: real programs to load (static PIE, static non-PIE, PIE, non-PIE with ld.so)
+unsharek-fixtures = { path = "../unsharek-fixtures" }

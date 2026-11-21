@@ -1,0 +1,7 @@
+[package]
+name = "unsharek-fs"
+version = "0.0.0"
+description = "Host directories for the guest: a virtio-fs device whose FUSE requests go to a server over a socket"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
