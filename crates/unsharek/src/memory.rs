@@ -36,6 +36,14 @@ pub(crate) fn map_image(fd: RawFd, len: usize) -> io::Result<&'static [u8]> {
     Ok(unsafe { std::slice::from_raw_parts(p as *const u8, len) })
 }
 
+/// `fd`'s first `len` bytes mapped read-only and private over `at`, inside a mapping of the
+/// caller's (an immutable image's file blocks: `unsharek::Guest::map_image_over`), for the
+/// process's life.
+pub(crate) fn map_over(at: usize, fd: RawFd, len: usize) -> io::Result<()> {
+    // SAFETY: over pages of the caller's own read-only image mapping, which nothing uses yet.
+    check(unsafe { libc::mmap(at as *mut _, len, libc::PROT_READ, libc::MAP_PRIVATE | libc::MAP_FIXED, fd, 0) }).map(|_| ())
+}
+
 /// `fd`'s first `len` bytes mapped again, private, readable and executable, over `at` in the
 /// arena's image zone. On failure the zone's range is anonymous memory again, as reserved.
 pub(crate) fn map_image_at(at: usize, fd: RawFd, len: usize) -> io::Result<()> {

@@ -196,7 +196,7 @@ impl Synthesized {
     /// extended, not written), so they cost no disk. [`Error::Changed`]: a file isn't the size it
     /// was when the image was laid out.
     pub fn write(&self, image: &Path) -> Result<()> {
-        write_extents(&self.extents, &self.files, self.layout.size, image)
+        write_extents(&self.extents, &self.files, self.layout.size, image, true)
     }
 }
 
@@ -217,6 +217,16 @@ pub fn synthesize(roots: &[(PathBuf, PathBuf)]) -> Result<Synthesized> {
 pub fn build(source: &Path, image: &Path) -> Result<Layout> {
     let img = Image::scan(source)?;
     img.write(image)?;
+    Ok(img.layout)
+}
+
+/// [`build`] without the files' data: the metadata written, every file's blocks left a hole
+/// (the image file is its metadata on disk, sparse to its full size). Whoever mounts it maps each
+/// file's own host data over its blocks ([`Layout`] says where), as [`synthesize`]'s extents
+/// would. No file's data is read.
+pub fn build_metadata(source: &Path, image: &Path) -> Result<Layout> {
+    let img = Image::scan(source)?;
+    write_extents(&img.extents(), &img.files, img.layout.size, image, false)?;
     Ok(img.layout)
 }
 
@@ -381,7 +391,7 @@ impl Image {
 
     /// Writes the image (see [`Synthesized::write`]).
     pub fn write(&self, image: &Path) -> Result<()> {
-        write_extents(&self.extents(), &self.files, self.layout.size, image)
+        write_extents(&self.extents(), &self.files, self.layout.size, image, true)
     }
 
     /// Assigns nids and blocks.
@@ -525,8 +535,15 @@ impl Image {
     }
 }
 
-/// Writes `extents` to `image`: what each is, zeros as holes; `size` is their total.
-fn write_extents(extents: &[Extent], files: &[HostFile], size: u64, image: &Path) -> Result<()> {
+/// Writes `extents` to `image`: what each is, zeros as holes; `size` is their total. Without
+/// `data`, files' extents are holes too ([`build_metadata`]).
+fn write_extents(
+    extents: &[Extent],
+    files: &[HostFile],
+    size: u64,
+    image: &Path,
+    data: bool,
+) -> Result<()> {
     let mut out = File::create(image).map_err(io_err(image))?;
     let mut at = 0;
     for e in extents {
@@ -535,6 +552,7 @@ fn write_extents(extents: &[Extent], files: &[HostFile], size: u64, image: &Path
                 out.seek(SeekFrom::Start(at)).map_err(io_err(image))?;
                 out.write_all(bytes).map_err(io_err(image))?;
             }
+            Extent::File { .. } if !data => {}
             &Extent::File { file, offset, len } => {
                 let f = &files[file];
                 // The file's bytes the extent holds, and whether it runs to the file's end: then

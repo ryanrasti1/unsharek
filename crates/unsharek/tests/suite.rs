@@ -63,6 +63,8 @@ enum Arg {
     Denied(&'static str),
     /// The path a devshell variable names (a program from nixpkgs, as data).
     Env(&'static str),
+    /// `Case::immutable`'s file `data`, where the program sees it.
+    Immutable,
 }
 
 #[derive(Clone, Copy)]
@@ -114,6 +116,9 @@ struct Case {
     check: Option<fn(&str) -> Result<(), String>>,
     /// `--rw` the run's own directory (`Arg::MarkerDir`): a host directory served live.
     rw_dir: bool,
+    /// `--immutable` a directory of the run's own holding a file `data` ([`immutable_data`]):
+    /// `Some(None)` at its own path, `Some(Some(at))` at `at`.
+    immutable: Option<Option<&'static str>>,
 }
 
 fn case(name: &'static str, prog: Prog, modes: &'static [Mode], sandbox: Expect) -> Case {
@@ -134,6 +139,7 @@ fn case(name: &'static str, prog: Prog, modes: &'static [Mode], sandbox: Expect)
         cpu_budget: None,
         check: None,
         rw_dir: false,
+        immutable: None,
     }
 }
 
@@ -522,6 +528,14 @@ fn static_programs() -> Vec<Case> {
         Case { stdin: Some("b\nc\na\n"), ..bb("busybox_sort", ALL, &["sort"], ok("a\nb\nc\n")) },
         Case { stdin: Some("one two\nthree\n"), ..bb("busybox_wc", ALL, &["wc", "-lw"], ok("2         3")) },
         Case { stdin: Some("through cat\n"), ..bb("busybox_cat", ALL, &["cat"], ok("through cat")) },
+        // A host directory shown read-only without a copy (`--immutable DIR[:AT]`): its metadata
+        // an image (cached), each file's data mapped in place from the host's file. A file of
+        // four pages, the last cut short, read whole: each page the file's own, zeros past its
+        // end not read as data. At its own path (natively too), and elsewhere.
+        Case { immutable: Some(None), ..bb("immutable", ALL, &[], ok(IMMUTABLE_MD5)) }.args(vec![Arg::Lit("md5sum"), Arg::Immutable]),
+        Case { immutable: Some(Some("/imm")), ..bb("immutable_at", ALL, &[], ok(IMMUTABLE_MD5)) }
+            .args(vec![Arg::Lit("md5sum"), Arg::Immutable])
+            .native(None),
         bb("busybox_sh", ALL, &["sh", "-c", "x=$((6*7)); read -r y </proc/self/comm; echo $x $y; case $x in 4*) echo SH_OK;; esac"], ok("42 busybox\nSH_OK")),
         bb(
             "busybox_pipeline",
@@ -539,6 +553,16 @@ fn static_programs() -> Vec<Case> {
 
 /// go_httpbin's script (busybox sh): the server in the background on a port of its own (natively
 /// the host's loopback is shared), polled until it answers.
+/// `Case::immutable`'s file: a marker, then bytes for four pages, the last cut short.
+fn immutable_data() -> Vec<u8> {
+    let mut d = b"IMMUTABLE_DATA_OK".to_vec();
+    d.extend((0..3 * 4096 + 100).map(|i| b'a' + (i % 26) as u8));
+    d
+}
+
+/// Its md5sum (the native run checks it too).
+const IMMUTABLE_MD5: &str = "9004a3bb91a68ead91b2bdbb74b579a5";
+
 const HTTPBIN: &str = r#"b=$UNSHAREK_TEST_BUSYBOX; p=$((20000 + $$ % 20000)); u=http://127.0.0.1:$p
 $UNSHAREK_TEST_HTTPBIN -host 127.0.0.1 -port $p >/dev/null 2>&1 &
 pid=$!
@@ -657,6 +681,15 @@ fn run(c: &Case, mode: Mode, secret: &PathBuf) -> Result<(), Failed> {
     };
     let marker_dir = tempfile::tempdir()?;
     let marker = marker_dir.path().join("created-by-the-program");
+    let imm_dir = marker_dir.path().join("immutable");
+    if c.immutable.is_some() {
+        std::fs::create_dir(&imm_dir)?;
+        std::fs::write(imm_dir.join("data"), immutable_data())?;
+    }
+    let imm_file = match c.immutable {
+        Some(Some(at)) if mode != Mode::Native => PathBuf::from(at).join("data"),
+        _ => imm_dir.join("data"),
+    };
     let args = c.args.iter().map(|a| match a {
         Arg::Lit(s) => PathBuf::from(s),
         Arg::Secret => secret.clone(),
@@ -665,6 +698,7 @@ fn run(c: &Case, mode: Mode, secret: &PathBuf) -> Result<(), Failed> {
         Arg::Fixture(name) => fx::bin(name),
         Arg::Denied(name) => fx::denied_dir().join(name),
         Arg::Env(var) => env::var_os(var).map(PathBuf::from).unwrap_or_default(),
+        Arg::Immutable => imm_file.clone(),
     });
     let mut cmd = if mode == Mode::Native {
         Command::new(&prog)
@@ -692,6 +726,11 @@ fn run(c: &Case, mode: Mode, secret: &PathBuf) -> Result<(), Failed> {
         }
         if c.rw_dir {
             cmd.arg("--rw").arg(marker_dir.path());
+        }
+        match c.immutable {
+            Some(None) => drop(cmd.arg("--immutable").arg(&imm_dir)),
+            Some(Some(at)) => drop(cmd.arg("--immutable").arg(format!("{}:{at}", imm_dir.display()))),
+            None => {}
         }
         cmd.args(&c.flags).arg("--").arg(&prog);
         cmd

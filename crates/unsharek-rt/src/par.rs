@@ -758,8 +758,21 @@ pub unsafe fn enable(s: &'static Sched, root: Tid) -> Result<(), rustix::io::Err
 
 /// Enter the kernel to serve a trapped syscall on this host thread: take the token and make this
 /// host's bound coroutine the current one. Returns the slot id for [`leave`].
+///
+/// A trap made by runtime code running on this host thread with the token already held, in a
+/// coroutine that isn't the thread's bound one, changes nothing: that coroutine stays current, and
+/// [`leave`] keeps the token ([`NESTED`]). Fork mode's hooks' executor on init's kernel thread is
+/// one: an `OnConnect::fd` hook's FdConn, dropped, closes its fd, a kept fd, whose `close` traps.
+/// That trap made the bound coroutine the running one, and the kernel thread has none (`running`
+/// 0): the call's next block (LKL's `sem_down` as the tsi task's switch, `lkl_net_syscall`) had
+/// no coroutine to switch from and returned at once, unwoken, the tsi task not the kernel's
+/// current, and LKL hit `lkl_bug` ("thread_sched_jb() can be used only for host task":
+/// `net_udp::fork`). And `leave` gave the token away while the executor ran on.
 pub fn enter() -> u16 {
     let h = me();
+    if PAR.owner.load(Ordering::Acquire) == h.id as u32 && h.running.get() != h.bound.get() {
+        return NESTED;
+    }
     acquire(h.id);
     let bound = Tid::from_raw(h.bound.get());
     h.set_running(bound);
@@ -770,8 +783,13 @@ pub fn enter() -> u16 {
 /// Done serving a trapped syscall: give up the token (the kernel thread takes it if a timer is
 /// pending) and return to user mode.
 pub fn leave(id: u16) {
-    give(id, true);
+    if id != NESTED {
+        give(id, true);
+    }
 }
+
+/// [`enter`]'s id for a trap nested in runtime code that already held the token.
+const NESTED: u16 = u16::MAX;
 
 /// The guest tid this host thread's first LKL call must `attach_thread` (0: none/already attached).
 /// Reads and clears it.

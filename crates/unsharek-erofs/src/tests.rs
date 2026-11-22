@@ -236,3 +236,32 @@ fn directory_blocks() {
         "block 1 starts with its own dirents"
     );
 }
+
+/// `build_metadata` is `build` with every file's data a hole: the same layout, the same bytes
+/// once each file's data is put over its blocks (what mapping the host files over it does), and
+/// no data block on disk.
+#[test]
+fn metadata_only_is_the_image_without_its_data() {
+    use std::os::unix::fs::MetadataExt;
+    let src = tree(&[
+        ("big", vec![7; 1 << 20]),
+        ("a/c", b"c".to_vec()),
+        ("l.so", elf64(3, &[(0, 0, 9, 0x9000)], 9)),
+    ]);
+    let (full, meta) = (
+        tempfile::NamedTempFile::new().unwrap(),
+        tempfile::NamedTempFile::new().unwrap(),
+    );
+    let l1 = build(src.path(), full.path()).unwrap();
+    let l2 = build_metadata(src.path(), meta.path()).unwrap();
+    assert_eq!(l1, l2);
+    let mut bytes = fs::read(meta.path()).unwrap();
+    assert_eq!(bytes.len() as u64, l1.size);
+    for f in &l1.files {
+        let data = fs::read(src.path().join(&f.path)).unwrap();
+        bytes[f.offset as usize..][..data.len()].copy_from_slice(&data);
+    }
+    assert_eq!(bytes, fs::read(full.path()).unwrap());
+    // The megabyte isn't on disk (a few blocks of metadata are).
+    assert!(fs::metadata(meta.path()).unwrap().blocks() * 512 < 64 << 10);
+}

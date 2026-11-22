@@ -32,6 +32,11 @@ struct Cli {
     /// path). Repeatable.
     #[arg(long = "rw", value_name = "DIR[:AT]")]
     rw: Vec<fs::Arg>,
+    /// A host directory shown read-only at AT (default its own path), its files mapped in place,
+    /// not copied: it must not change while the program runs. Provisional (hidden): the CLI's
+    /// mounts are to become one flag. Repeatable.
+    #[arg(long = "immutable", value_name = "DIR[:AT]", hide = true, value_parser = immutable)]
+    immutable: Vec<unsharek::Immutable>,
     /// Fork mode: the most processes alive at once.
     #[arg(long)]
     max_procs: Option<u32>,
@@ -74,6 +79,21 @@ enum Mode {
     Fork,
 }
 
+/// `DIR[:AT]`, AT absolute; DIR relative to the current directory.
+fn immutable(arg: &str) -> Result<unsharek::Immutable, String> {
+    let (dir, at) = match arg.split_once(':') {
+        Some((d, a)) => (std::path::PathBuf::from(d), std::path::PathBuf::from(a)),
+        None => {
+            let d = std::path::absolute(arg).map_err(|e| e.to_string())?;
+            (d.clone(), d)
+        }
+    };
+    if !at.is_absolute() {
+        return Err(format!("{}: not an absolute path", at.display()));
+    }
+    Ok(unsharek::Immutable { dir, at })
+}
+
 fn main() -> ExitCode {
     // The image builder holds each file of a store path open until it writes the image (tzdata:
     // thousands), past the usual soft limit of 1024 ("Too many open files"). The hard limit is
@@ -84,7 +104,7 @@ fn main() -> ExitCode {
             rustix::process::Rlimit { current: Some(l), maximum: Some(l) },
         );
     }
-    let Cli { mode, closure, mut ro, rw, max_procs, setenv, mut keep_env, system, net, publish, mut argv } = Cli::parse();
+    let Cli { mode, closure, immutable, mut ro, rw, max_procs, setenv, mut keep_env, system, net, publish, mut argv } = Cli::parse();
     if system {
         ro.extend(fs::SYSTEM.iter().filter(|d| std::path::Path::new(d).is_dir()).map(|d| fs::Arg { host: d.into(), at: None, live: true }));
         keep_env.extend(["PATH", "TERM", "LANG"].map(OsString::from));
@@ -148,6 +168,7 @@ fn main() -> ExitCode {
         max_procs,
         argv,
         env,
+        immutable,
         image_cache: None,
         host_dirs: host_dirs.clone(),
         tty,

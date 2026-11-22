@@ -20,6 +20,8 @@
 //! v<FORMAT>/host/<dirname>-<key>.erofs  one per allowed host directory; <key> hashes the tree's
 //! v<FORMAT>/host/<dirname>-<key>.layout  metadata, so an edit makes a new key and a rebuild
 //! v<FORMAT>/host/<dirname>-<key>.refs    the store paths the tree mentions (its scan), same key
+//! v<FORMAT>/immutable/<dirname>-<key>.erofs  one per immutable directory: its metadata only
+//! v<FORMAT>/immutable/<dirname>-<key>.layout  (the data is the directory's own), keyed as host/
 //! v<FORMAT>/requisites/<key>             the closure of a set of store paths; <key> hashes their
 //!                                        names, which the file repeats (checked on reading)
 //! ```
@@ -337,6 +339,10 @@ pub struct Mount {
     pub layout: PathBuf,
     /// What the image's root is.
     pub kind: Kind,
+    /// An immutable host directory's ([`Cache::immutable_image`]): the image is its metadata only,
+    /// each file's data mapped from this directory's own file when mapped
+    /// (`unsharek::Guest::map_store`). None: the image holds its data.
+    pub files_from: Option<PathBuf>,
 }
 
 /// What a [`Mount`]'s image holds.
@@ -561,23 +567,71 @@ impl Cache {
         Err(Error::Unstable(dir.to_owned()))
     }
 
+    /// Host directory `dir` (canonical) shown read-only at `at` without a copy
+    /// (`unsharek::Config::immutable`): an image of its metadata alone, cached under `immutable/`
+    /// by the tree's metadata ([`tree_key`]: paths, modes, sizes, mtimes, inodes, symlinks'
+    /// targets), its files' data mapped in place from `dir`'s own files when the image is mapped
+    /// (`unsharek::Guest::map_store`), as `unsharek_erofs::synthesize` lays an image over host
+    /// files. No file's data is read here.
+    ///
+    /// So `dir` must not change while a sandbox uses it; what happens if it does is the host's:
+    /// - an edit in place may become visible to the guest (the mapping is the file's pages), or
+    ///   not (a page the guest's kernel has cached stays); a file replaced (a new inode: an
+    ///   editor's save) isn't seen, the old one stays mapped;
+    /// - a file truncated under a running sandbox is SIGBUS at the next touch of a page past its
+    ///   new end: the sandbox dies and reads nothing else (it fails closed);
+    /// - so too the cached image itself: truncating a cached `.erofs` (this one, or any image)
+    ///   under a running sandbox that mapped it is SIGBUS. Neither is guarded against: the
+    ///   directory is the user's, and so is the cache.
+    pub fn immutable_image(&self, dir: &Path, at: &Path) -> Result<Mount> {
+        if !fs::metadata(dir).map_err(io_err(dir))?.is_dir() {
+            return Err(Error::NotDir(dir.to_owned()));
+        }
+        // As `host_image`: the key's walk again after the build, so an image is never cached
+        // under a key of a tree it doesn't describe.
+        for _ in 0..3 {
+            let key = tree_key(dir)?;
+            let mut mount = self.mount(at, "immutable", Kind::Dir, &host_name(dir, key));
+            mount.files_from = Some(dir.to_owned());
+            if exists(&mount.image)? {
+                return Ok(mount);
+            }
+            match self.build(dir, &mount, || if tree_key(dir)? == key { Ok(()) } else { Err(Error::Unstable(dir.to_owned())) }) {
+                Err(Error::Unstable(_)) => continue,
+                got => return got.map(|()| mount),
+            }
+        }
+        Err(Error::Unstable(dir.to_owned()))
+    }
+
     /// `guest`'s mount, its image `<dir>/<name>` in the cache.
     fn mount(&self, guest: &Path, dir: &str, kind: Kind, name: &OsStr) -> Mount {
         let base = self.root.join(dir).join(name);
-        Mount { guest: guest.to_owned(), image: with_suffix(&base, ".erofs"), layout: with_suffix(&base, ".layout"), kind }
+        Mount { guest: guest.to_owned(), image: with_suffix(&base, ".erofs"), layout: with_suffix(&base, ".layout"), kind, files_from: None }
     }
 
     /// Builds `src`'s image into temporary files beside `mount`'s, and renames them into place
     /// if `check` (run after the build) agrees.
+    /// A mount with `files_from` gets an image of the metadata only.
+    ///
+    /// The temporary image is created and locked (`flock`) first, and held until the end: a
+    /// builder that dies (killed, `^C`) loses the lock with its fds, and the next build in the
+    /// directory reclaims what it left ([`reclaim`]). An error or a panic here removes them on
+    /// the way out (`Tmp`'s drop).
     fn build(&self, src: &Path, mount: &Mount, check: impl FnOnce() -> Result<()>) -> Result<()> {
         let dir = mount.image.parent().unwrap();
         fs::create_dir_all(dir).map_err(io_err(dir))?;
+        reclaim(dir);
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp = |p: &Path| with_suffix(p, &format!(".{}-{seq}.tmp", process::id()));
         let (image, layout) = (tmp(&mount.image), tmp(&mount.layout));
+        let guard = Tmp(vec![layout.clone(), image.clone()]);
+        let held = File::options().write(true).create_new(true).open(&image).map_err(io_err(&image))?;
+        flock(&held, libc::LOCK_EX).map_err(io_err(&image))?;
         let built = (|| {
             let err = |source| Error::Image { path: src.to_owned(), source };
             let lay = match mount.kind {
+                Kind::Dir if mount.files_from.is_some() => unsharek_erofs::build_metadata(src, &image).map_err(err)?,
                 Kind::Dir => unsharek_erofs::build(src, &image).map_err(err)?,
                 // A file or a symlink, under its own name in the image's root.
                 Kind::Entry => {
@@ -597,13 +651,75 @@ impl Cache {
             fs::rename(&layout, &mount.layout).map_err(io_err(&mount.layout))?;
             fs::rename(&image, &mount.image).map_err(io_err(&mount.image))
         })();
-        if built.is_err() {
-            let _ = fs::remove_file(&image);
-            let _ = fs::remove_file(&layout);
-        } else {
+        if built.is_ok() {
+            // Renamed into place: nothing of ours is left to remove.
+            std::mem::forget(guard);
             self.builds.fetch_add(1, Ordering::Relaxed);
         }
+        drop(held);
         built
+    }
+}
+
+/// `flock(2)` (std's `File::lock` is past the crate's MSRV): held by the open file, so for as
+/// long as the process lives or until the file is closed.
+fn flock(f: &File, op: i32) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: flock on an fd the caller owns, open for the call.
+    if unsafe { libc::flock(f.as_raw_fd(), op) } == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
+/// Temporary files removed when dropped: on an error's return or a panic's unwinding.
+struct Tmp(Vec<PathBuf>);
+
+impl Drop for Tmp {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            let _ = fs::remove_file(p);
+        }
+    }
+}
+
+/// How old an unlocked temporary file must be before [`reclaim`] takes it: a builder's image
+/// between its creation and its lock, a layout or a list being written (milliseconds, each).
+const TMP_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Removes the temporary files in cache directory `dir` that no live process is writing: what a
+/// builder killed mid-build left (it can't clean up after SIGKILL). An image's temporary is
+/// locked by its builder for as long as it lives, so one that can be locked is abandoned (the
+/// lock is the test, not the pid in the name: pids are reused, and differ between pid
+/// namespaces sharing the cache). A layout's, or a list's, is unlocked: it goes once older than
+/// [`TMP_GRACE`], unless its image's is held. Best effort: an error leaves the file for the next
+/// build. Run before each build, never on a start that builds nothing.
+fn reclaim(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    let tmps: Vec<PathBuf> =
+        entries.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.as_os_str().as_bytes().ends_with(b".tmp")).collect();
+    let now = std::time::SystemTime::now();
+    const IMAGE: &[u8] = b".erofs.";
+    let at_image = |name: &[u8]| name.windows(IMAGE.len()).position(|w| w == IMAGE);
+    // The layouts of held images' temporaries (`<base>.erofs.<pid>-<seq>.tmp`): kept.
+    let mut busy = BTreeSet::new();
+    let mut gone = Vec::new();
+    for p in &tmps {
+        let Ok(f) = File::open(p) else { continue };
+        let old = f.metadata().and_then(|m| m.modified()).is_ok_and(|t| now.duration_since(t).unwrap_or_default() > TMP_GRACE);
+        let name = p.as_os_str().as_bytes();
+        match flock(&f, libc::LOCK_EX | libc::LOCK_NB) {
+            Err(_) => {
+                if let Some(at) = at_image(name) {
+                    busy.insert([&name[..at], b".layout.", &name[at + IMAGE.len()..]].concat());
+                }
+            }
+            // Held while removed, so no builder is between creating and locking it.
+            Ok(()) if old => gone.push((p, f)),
+            Ok(()) => {}
+        }
+    }
+    for (p, _held) in gone {
+        if !busy.contains(p.as_os_str().as_bytes()) {
+            let _ = fs::remove_file(p);
+        }
     }
 }
 
@@ -759,6 +875,89 @@ mod tests {
         let mut refs = Refs::new();
         scan_file(&path, &mut refs, &mut vec![0; REF_MAX + SCAN_CHUNK]).unwrap();
         assert_eq!(refs[HASH.as_bytes()], b"glibc-2.44-57");
+    }
+
+    /// A builder killed mid-build (nextest's timeout, ^C, an OOM kill) left its temporary image
+    /// behind for good: `build` cleaned up only after an error it returned, and nothing ever
+    /// looked at another process's leftovers. They added up to ~65 GB in
+    /// `~/.cache/unsharek/images`. Now the next build in that directory reclaims every temporary
+    /// file no live builder holds.
+    #[test]
+    fn a_killed_builders_temporary_files_are_reclaimed() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(cache_dir.path());
+        let src = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("f"), b"hello").unwrap();
+        // What the killed builder left: an image half written, its layout, a list's temporary.
+        let host = cache.root.join("host");
+        fs::create_dir_all(&host).unwrap();
+        let old = std::time::SystemTime::now() - 2 * TMP_GRACE;
+        let left: Vec<PathBuf> = ["x-0123.erofs.999999-0.tmp", "x-0123.layout.999999-0.tmp", "x-0123.refs.999999-1.tmp"]
+            .iter()
+            .map(|n| host.join(n))
+            .collect();
+        for p in &left {
+            let f = File::create(p).unwrap();
+            f.set_len(1 << 20).unwrap();
+            f.set_modified(old).unwrap();
+        }
+        // A live builder's image, held (its lock) and old, and its layout: kept. A fresh one,
+        // unheld: kept (it may be a builder's between creating and locking it).
+        let live = host.join("y-0123.erofs.1-0.tmp");
+        let held = File::create(&live).unwrap();
+        held.set_modified(old).unwrap();
+        flock(&held, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        let live_layout = host.join("y-0123.layout.1-0.tmp");
+        File::create(&live_layout).unwrap().set_modified(old).unwrap();
+        let fresh = host.join("z-0123.erofs.1-1.tmp");
+        File::create(&fresh).unwrap();
+
+        cache.host_image(&fs::canonicalize(src.path()).unwrap()).unwrap();
+        for p in &left {
+            assert!(!p.exists(), "{} leaked", p.display());
+        }
+        assert!(live.exists() && live_layout.exists() && fresh.exists());
+        let tmps = fs::read_dir(&host).unwrap().filter(|e| e.as_ref().unwrap().path().to_string_lossy().ends_with(".tmp"));
+        assert_eq!(tmps.count(), 3, "only the held and the fresh temporary files remain");
+    }
+
+    /// A build that panics (a bug in the builder, an unwrap) unwound past `build`'s cleanup; its
+    /// temporary files must go all the same.
+    #[test]
+    fn a_panicking_build_leaves_no_temporary_files() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(cache_dir.path());
+        let src = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("f"), b"hello").unwrap();
+        let mount = cache.mount(src.path(), "host", Kind::Dir, OsStr::new("p-0"));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cache.build(src.path(), &mount, || panic!("in the check"))));
+        assert!(r.is_err());
+        let left: Vec<_> = fs::read_dir(cache.root.join("host")).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert!(left.is_empty(), "left behind: {left:?}");
+    }
+
+    /// An immutable directory's image is its metadata only: the files' data stays in the host's
+    /// files (mapped over the image when it's mounted), so the cache holds no copy of it. Keyed
+    /// by the tree's metadata, as a host directory's: an edit (a new size or mtime) is a new
+    /// image, and the same tree finds the one it has.
+    #[test]
+    fn an_immutable_image_holds_no_data_and_follows_edits() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(cache_dir.path());
+        let src = tempfile::tempdir().unwrap();
+        let dir = fs::canonicalize(src.path()).unwrap();
+        let f = dir.join("f");
+        fs::write(&f, vec![1u8; 4 << 20]).unwrap();
+        let first = cache.immutable_image(&dir, Path::new("/at")).unwrap();
+        assert_eq!(first.guest, Path::new("/at"));
+        assert_eq!(first.files_from.as_deref(), Some(dir.as_path()));
+        assert!(fs::metadata(&first.image).unwrap().blocks() * 512 < 64 << 10, "the data was copied");
+        assert_eq!(cache.immutable_image(&dir, Path::new("/at")).unwrap(), first);
+        assert_eq!(cache.builds(), 1);
+        fs::write(&f, b"other").unwrap();
+        let second = cache.immutable_image(&dir, Path::new("/at")).unwrap();
+        assert_ne!(second.image, first.image);
+        assert_eq!(cache.builds(), 2);
     }
 
     #[test]

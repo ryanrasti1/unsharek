@@ -547,7 +547,89 @@ impl Guest {
 
     /// Each of `store`'s images mapped, with where [`setup::mount_closure`] mounts it.
     pub fn map_store(&mut self, store: &store::Store) -> Result<Vec<setup::Mount>, Error> {
-        store.mounts.iter().map(|m| Ok(setup::Mount { image: self.map_image(&m.image)?, at: m.guest.clone(), kind: m.kind })).collect()
+        store
+            .mounts
+            .iter()
+            .map(|m| {
+                let image = match &m.files_from {
+                    Some(dir) => self.map_image_over(&m.image, &m.layout, dir)?,
+                    None => self.map_image(&m.image)?,
+                };
+                Ok(setup::Mount { image, at: m.guest.clone(), kind: m.kind })
+            })
+            .collect()
+    }
+
+    /// An immutable directory's image ([`store::Cache::immutable_image`]): its metadata image
+    /// mapped, then each file of `layout` mapped over its blocks from `dir`'s own file, private and
+    /// read-only (`MAP_FIXED`): one mapping the guest's disk is, as any image's, whose files'
+    /// pages are the host's files' (the page cache's), never copied. A file's last page past its
+    /// end reads zeros, as the image has there.
+    ///
+    /// Each file is opened again by its path (`O_NOFOLLOW`: a file replaced by a symlink since the
+    /// walk is refused, as is one of another size) and closed once mapped; the mappings stay.
+    /// What a change to `dir` does from then on is [`store::Cache::immutable_image`]'s: an edit
+    /// may show, a truncation is SIGBUS. One mapping per file: a tree of more files than
+    /// `vm.max_map_count` (65530) fails here (ENOMEM). Not mapped in the image zone, so a program
+    /// mapping an ELF from it gets a copy (as an image without a layout).
+    fn map_image_over(&mut self, image: &Path, layout: &Path, dir: &Path) -> Result<Image, Error> {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        self.own()?;
+        let file = File::open(image).map_err(Error::io(image.display().to_string()))?;
+        let base = image.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = base.strip_suffix(".erofs").unwrap_or(&base).to_owned();
+        if name.is_empty() || name.starts_with('.') {
+            return Err(Error::ImageArg(name));
+        }
+        let text = std::fs::read(layout).map_err(Error::io(layout.display().to_string()))?;
+        let len = file.metadata().map_err(Error::io(name.clone()))?.len() as usize;
+        if len == 0 || !len.is_multiple_of(4096) {
+            return Err(Error::io(name)(std::io::Error::new(std::io::ErrorKind::InvalidData, "not an image of whole blocks")));
+        }
+        let data = memory::map_image(file.as_raw_fd(), len).map_err(Error::io(format!("mapping {name}")))?;
+        for line in text.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+            let bad = || Error::io(layout.display().to_string())(std::io::Error::new(std::io::ErrorKind::InvalidData, "a bad layout line"));
+            // `offset slot size elf|data path`, the path escaped (`Layout::to_text`).
+            let mut f = line.splitn(5, |&b| b == b' ');
+            let num = |x: Option<&[u8]>| x.and_then(|x| std::str::from_utf8(x).ok()?.parse::<u64>().ok());
+            let (Some(offset), Some(_slot), Some(size), Some(_kind), Some(path)) = (num(f.next()), num(f.next()), num(f.next()), f.next(), f.next()) else {
+                return Err(bad());
+            };
+            if size == 0 {
+                continue;
+            }
+            let mut rel = Vec::with_capacity(path.len());
+            let mut it = path.iter();
+            while let Some(&b) = it.next() {
+                rel.push(match b {
+                    b'\\' => match it.next() {
+                        Some(b'n') => b'\n',
+                        Some(&c) => c,
+                        None => return Err(bad()),
+                    },
+                    b => b,
+                });
+            }
+            let rel = PathBuf::from(std::ffi::OsString::from_vec(rel));
+            if rel.is_absolute() || rel.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+                return Err(bad());
+            }
+            let host = dir.join(&rel);
+            let what = || host.display().to_string();
+            let src = File::options().read(true).custom_flags(libc::O_NOFOLLOW).open(&host).map_err(Error::io(what()))?;
+            let md = src.metadata().map_err(Error::io(what()))?;
+            if !md.is_file() || md.len() != size {
+                return Err(Error::io(what())(std::io::Error::new(std::io::ErrorKind::InvalidData, "changed since its image was made")));
+            }
+            let span = (size as usize).next_multiple_of(4096);
+            if !(offset as usize).is_multiple_of(4096) || offset as usize + span > len {
+                return Err(bad());
+            }
+            memory::map_over(data.as_ptr() as usize + offset as usize, src.as_raw_fd(), span).map_err(Error::io(format!("mapping {}", what())))?;
+        }
+        let name: &'static str = Box::leak(name.into_boxed_str());
+        image::register(name, data, None).map_err(Error::io(format!("the guest's /dev/unsharek/{name}")))
     }
 
     /// `fd`, open, kept as one of the guest's plumbing fds.
@@ -845,6 +927,11 @@ pub struct Config {
     pub argv: Vec<OsString>,
     /// The program's environment, `NAME=value` each.
     pub env: Vec<OsString>,
+    /// Host directories shown read-only, each at its guest path, without a copy
+    /// ([`store::Cache::immutable_image`]): an image of the directory's metadata, cached, its
+    /// files' data mapped in place from the host's files. The directory must not change while
+    /// the sandbox runs (an edit may show; a truncated file is SIGBUS).
+    pub immutable: Vec<Immutable>,
     /// Where store images are cached; None: [`store::Cache::default_dir`].
     pub image_cache: Option<PathBuf>,
     /// Host directories served live, through virtio-fs ([`hostfs`]): each a server's socket (the
@@ -864,6 +951,13 @@ pub struct HostDir {
     pub at: PathBuf,
 }
 
+/// A host directory shown read-only at `at` without a copy ([`Config::immutable`]).
+#[derive(Clone, Debug)]
+pub struct Immutable {
+    pub dir: PathBuf,
+    pub at: PathBuf,
+}
+
 /// The images the guest mounts for `config`'s closures, built where the cache lacks them (the
 /// closure too is cached there: [`store::Cache::closure`]). Host-side, before lockdown; nothing
 /// is opened or mapped yet.
@@ -872,7 +966,12 @@ pub fn store(config: &Config) -> Result<store::Store, Error> {
         Some(dir) => store::Cache::new(dir),
         None => store::Cache::open_default()?,
     };
-    Ok(cache.store_refs(&config.closures)?)
+    let mut store = cache.store_refs(&config.closures)?;
+    for i in &config.immutable {
+        let dir = std::fs::canonicalize(&i.dir).map_err(Error::io(i.dir.display().to_string()))?;
+        store.mounts.push(cache.immutable_image(&dir, &i.at)?);
+    }
+    Ok(store)
 }
 
 /// Become the sandbox: [`Guest::boot`] for the mode, the closures' images mapped and mounted in a

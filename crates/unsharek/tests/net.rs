@@ -768,18 +768,17 @@ fn main() {
     fork_case("net_refused_child", "provider_fork", forked("1", "refused", &["10.0.0.66", &echo]), "NET_REFUSED_OK");
     fork_case("net_listen_child", "provider_fork", forked("1", "listen", &["7000", "10.9.9.9:4242"]), "NET_LISTEN_OK");
     // A forked process's lookups and UDP: its connected UDP sockets' datagrams served by init's
-    // process (the fd is init's), whole, through a seqpacket end. Known bug, so ignored: in fork
-    // mode a UDP fd this harness's `OnConnect::fd` hook hands in (granted at lockdown, not
-    // received) has the kernel hit lkl_bug ("thread_sched_jb() can be used only for host task")
-    // at the program's first send. The CLI's provider (fds received on its control socket) does
-    // the same in fork mode and works (`unsharek --mode fork --net all -- net udp IP PORT`, and
-    // real lookups).
+    // process (the fd is init's), whole, through a seqpacket end. These hit lkl_bug ("thread_sched_jb()
+    // can be used only for host task") at the program's first send: the hook's FdConn (`Udp`) closes
+    // its fd, a kept one (granted at lockdown, unlike the CLI's provider's, received), so the close
+    // traps, on init's kernel thread, in the executor, and the trap's par::enter made the thread's
+    // bound coroutine (none) the running one; LKL's next block, as the tsi task, returned unwoken.
     for (name, argv, marker) in [
         ("net_resolve_child", forked("1", "resolve", &["echo.test", "10.0.0.1", "nx.test", "denied.test"]), "NET_RESOLVE_OK"),
         ("net_udp", net("udp", &["10.0.0.53", "53"]), "NET_UDP_OK"),
         ("net_udp_child", forked("1", "udp", &["10.0.0.53", "53"]), "NET_UDP_OK"),
     ] {
-        trials.push(Trial::test(format!("{name}::fork"), move || check("dns_fork", argv, marker)).with_ignored_flag(true));
+        trials.push(Trial::test(format!("{name}::fork"), move || check("dns_fork", argv, marker)));
     }
     trials.push(Trial::test("passfd_epoll::coroutine", || {
         let argv = vec![fx::bin("fd_epoll").display().to_string()];

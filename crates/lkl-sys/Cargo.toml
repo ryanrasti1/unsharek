@@ -4,7 +4,7 @@ version = "0.0.0"
 description = "The kernel (LKL, lkl/), built by crates/lkl-sys/Makefile and linked in, with bindings to its entry points and host-operations table"
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license = "GPL-2.0-only"
 publish = false
 # One kernel per binary: a second crate linking another lkl.o would collide.
 links = "lkl"

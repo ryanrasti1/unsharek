@@ -1,7 +1,7 @@
-[submodule "lkl/linux"]
+[submodule "crates/lkl-sys/linux"]
 	path = crates/lkl-sys/linux
 	url = git@github.com:ryanrasti/linux.git
-	branch = exobox-native
+	branch = unsharek
 [submodule "seccomp-fn"]
 	path = seccomp-fn
 	url = git@github.com:ryanrasti1/seccomp-fn.git
