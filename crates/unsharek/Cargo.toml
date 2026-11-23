@@ -16,10 +16,8 @@ clap.workspace = true
 unsharek-erofs = { path = "../unsharek-erofs" }
 # The in-sandbox runtime: boot, the gate, routing, exec; given the inventory's resources
 unsharek-rt = { path = "../unsharek-rt" }
-# Host directories through virtio-fs (src/hostfs.rs): the device, whose server is a socket
+# Host directories through virtio-fs (src/hostfs.rs): the device, served in process
 unsharek-fs = { path = "../unsharek-fs" }
-# Plugin (experimental): the CLI's --ro DIR and --rw DIR servers (src/cli/fs.rs)
-unsharek-fs-server = { path = "../unsharek-fs-server" }
 # Errno, the runtime's error type, in the hooks' adapters (src/net.rs)
 rustix.workspace = true
 # The global allocator after lockdown (src/alloc.rs): the hooks' and the executor's allocations,
@@ -28,7 +26,7 @@ talc = { version = "5", default-features = false }
 # The hooks' stream traits (futures-io's AsyncRead/AsyncWrite, futures-core's Stream)
 futures-io = "0.3"
 futures-core = "0.3"
-# tokio's AsyncRead/AsyncWrite too, for providers built on them (capnweb-rs's channel)
+# tokio's AsyncRead/AsyncWrite too, for providers built on them
 tokio = { version = "1", default-features = false, optional = true }
 # The API's host calls before lockdown (the auxiliary vector, entropy, the reservations, fcntl,
 # fork, the pidfd)
@@ -36,9 +34,6 @@ libc.workspace = true
 thiserror.workspace = true
 # The TCB: lockdown's checks and the filter (crates/unsharek-tcb/ at the repository's root)
 unsharek-tcb = { path = "../unsharek-tcb" }
-# Plugin (experimental): the network provider and its protocol (src/provider.rs)
-unsharek-net = { path = "../unsharek-net" }
-capnweb = { package = "capnweb-rs", path = "../../vendor/capnweb-rs", default-features = false, features = ["std"] }
 [features]
 tokio = ["dep:tokio"]
 # The runtime's measurement counters, printed at the sandbox's end (unsharek-rt's src/stats.rs).

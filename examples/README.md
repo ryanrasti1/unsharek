@@ -107,8 +107,8 @@ sandbox: exit 0
 ```
 
 Names aren't this example's: the guest's resolver asks its nameservers over UDP, and a stream
-hook carries TCP only. A provider that hands in host fds (`OnConnect::fd`, as the CLI's `--net`
-does) serves them, as any connected UDP socket.
+hook carries TCP only. A hook that hands in host fds (`OnConnect::fd`, as the CLI's `--net host`
+does with the host's own sockets) serves them, as any connected UDP socket.
 
 ## threads: why threaded mode exists
 

@@ -62,8 +62,10 @@
 //! (`unsharek::Guest::hold_fd`, [`Cx::readable`]), and use streams opened
 //! before lockdown (a `TcpStream` connected before `run`, held). Not: make syscalls (they would
 //! be the guest's, as init's: a thread of the program's process, which an exec waits for), open
-//! host sockets or files (no host syscall is left for that), or block (the executor is one of
-//! the sandbox's coroutines: a blocking call stops the program too).
+//! host sockets or files (no host syscall is left for that, but with unsharek-tcb's net plugin
+//! passed to lockdown: then its socket calls, through the gate, as [`crate::hostnet`]'s hooks
+//! make them), or block (the executor is one of the sandbox's coroutines: a blocking call stops
+//! the program too).
 //!
 //! Every hook and task runs on that one executor, in every mode: in threaded mode only while it
 //! holds the guest's CPU, so never on two host threads at once; in fork mode only in init's
@@ -506,8 +508,9 @@ pub struct HeldFd {
 }
 
 impl AsRawFd for HeldFd {
+    /// Its number now: lockdown's caller may have moved it into `0..n` (`configure_sandbox`).
     fn as_raw_fd(&self) -> RawFd {
-        self.fd
+        unsharek_rt::host::moved_number(self.fd)
     }
 }
 
@@ -524,12 +527,12 @@ impl HeldFd {
 
     /// One `read`; `WouldBlock` if nothing is there.
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        unsharek_rt::trap::read(self.fd as u32, buf).map_err(io_err)
+        unsharek_rt::trap::read(self.as_raw_fd() as u32, buf).map_err(io_err)
     }
 
     /// One `write`; `WouldBlock` if there's no room.
     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
-        unsharek_rt::trap::write(self.fd as u32, buf).map_err(io_err)
+        unsharek_rt::trap::write(self.as_raw_fd() as u32, buf).map_err(io_err)
     }
 
     /// Read what is there, waiting (on the executor) until something is: `Ok(0)` is EOF. (As
@@ -554,7 +557,7 @@ impl HeldFd {
         loop {
             match f() {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    if executor::poll_fd(self.fd, events, cx).is_pending() {
+                    if executor::poll_fd(self.as_raw_fd(), events, cx).is_pending() {
                         return Poll::Pending;
                     }
                 }

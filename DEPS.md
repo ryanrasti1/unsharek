@@ -198,7 +198,7 @@ when a hook or a passed fd's poll first needs it.
 | talc 5 (no default features) | the global allocator after lockdown: the hooks' and the executor's allocations, from a region reserved before (glibc's malloc can't grow then); its lock a spin lock of unsharek's (no futex) | library | ~2.7 KB; pulls lock_api and allocator-api2 (no std) |
 | futures-io 0.3 | `AsyncRead`/`AsyncWrite`: the hooks' streams, `HeldFd`, `GuestSocket` | library | traits only |
 | futures-core 0.3 | `Stream`: `on_listen`'s inbound connections | library | traits only |
-| tokio 1 (optional, feature `tokio`, no default features) | tokio's `AsyncRead`/`AsyncWrite` for hooks' streams and `HeldFd`/`GuestSocket` (capnweb-rs's channel) | library | off by default; with it, tokio's io traits only (no runtime) |
+| tokio 1 (optional, feature `tokio`, no default features) | tokio's `AsyncRead`/`AsyncWrite` for hooks' streams and `HeldFd`/`GuestSocket` (a provider's channel) | library | off by default; with it, tokio's io traits only (no runtime) |
 | rustix (workspace) | `Errno`, the runtime's error type, in the adapters | library | already in the tree |
 
 ## The library's reshape (2026-11-18): builder, intercept guards, templates (crates/unsharek-build)
@@ -288,26 +288,21 @@ prove, and to test; `install` lives in unsharek-tcb's lockdown.
 | seccomp-fn (path): syn 3 (`full`), quote, proc-macro2 | `compile!` | build time only | as the macro crate before |
 | seccomp-fn-verify (path) | the proof and the sampled test | unsharek-tcb (`policy!` expands only under `cfg(kani)`; `check_sampled` in its tests) | none in the binary |
 
-## Host directories (2026-11-19): unsharek-fs, unsharek-fs-server (plugin)
-`--ro DIR` and `--rw DIR`: the guest's stock virtio-fs driver (kernel config only: VIRTIO_MMIO,
-FUSE_FS, VIRTIO_FS) on unsharek-fs's device, whose FUSE requests go over a socket to
-unsharek-fs-server's process. Sizes from the release binary (x86_64-unknown-linux-gnu, symbols by
-crate): stripped 9.30 MB.
+## Host directories (2026-11-21): unsharek-fs, served in process (plugin)
+`--mount DIR:ro` and `DIR:rw`: the guest's stock virtio-fs driver (kernel config only:
+VIRTIO_MMIO, FUSE_FS, VIRTIO_FS) on unsharek-fs's device, its FUSE requests served in the sandbox
+by unsharek-fs's passthrough with the host's own file calls (unsharek-tcb's fs plugin rows,
+Landlock). No dependency of its own. (Until 2026-11-21 a server process, unsharek-fs-server, on
+fuse-backend-rs and landlock: removed with it.)
 
 | Crate | For | Where | Cost noted |
 |---|---|---|---|
-| unsharek-fs (path) | the virtio-fs device | the runtime's host side (not trusted) | ~2 KB `.text`; 2 MB of `.bss` (its request and reply buffers) |
-| fuse-backend-rs 0.14 (`fusedev`): vmm-sys-util, caps, bitflags, log, nix | virtiofsd's passthrough file system, as a library over byte buffers | the server process (plugin) | ~165 KB, plus ~105 KB of its generic code in unsharek-fs-server; caps ~11 KB |
-| landlock 0.4: enumflags2, thiserror | the server's confinement to its directory | the server process (plugin) | ~10 KB |
+| unsharek-fs (path) | the virtio-fs device and its passthrough | the runtime's host side (not trusted) | small `.text`; 2 MB of `.bss` (its request and reply buffers) plus ~80 KB (path scratch, directory buffers); per directory, a ~4.6 MB NORESERVE mapping (the node table: only touched pages cost) |
 | kernel: VIRTIO_MMIO, FUSE_FS, VIRTIO_FS | the guest's driver | lkl-sys's defconfig | ~180 KB |
-## The network plugin (2026-11-19): capnweb-rs, vendored (experimental)
-`--net public|all` and `--publish` (crates/unsharek/src/provider.rs, crates/unsharek-net): a
-provider process makes the connections, under its policy, and passes them in over a control
-socket, in Cap'n Web. capnweb-rs is a vendored copy (`vendor/capnweb-rs`, its patches in
-PATCHES.md: a packet transport an embedder's executor drives), without default features (no
-tokio, no stack growth) in the sandbox and with `local-runtime` in the provider.
 
-| Crate | For | Where | Cost noted |
-|---|---|---|---|
-| capnweb-rs (vendored path), with num-bigint, serde_json, hashbrown, spin, async-trait, futures | the control socket's protocol | unsharek (in the sandbox), unsharek-net (the provider) | +987 KB stripped release binary (8,834,600 B to 9,821,744 B, x86_64-unknown-linux-gnu, against the measurement above); `.text` by crate: capnweb 456 KiB, unsharek_net 71 KiB, num_bigint 61 KiB, serde_json 35 KiB |
-| unsharek-net (path) | the provider, its filter, the client | unsharek | in the line above |
+## The network plugin (2026-11-21): the host's own sockets (experimental)
+`--net host` (crates/unsharek/src/hostnet.rs): the guest's non-loopback sockets are host sockets
+made through the gate (unsharek-tcb's net plugin rows). No dependency. (Until 2026-11-21 a
+provider process over a vendored capnweb-rs, unsharek-net: removed with it. The stripped release
+binary went from 9,821,744 B to 9,170,640 B, x86_64-unknown-linux-gnu, with both plugins'
+removals.)

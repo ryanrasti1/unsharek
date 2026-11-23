@@ -99,12 +99,14 @@ fn child(layer: &str, name: &str) -> ! {
         "template" => template(m),
         "hostdir_live" => hostdir_live(m),
         "run_fn" => run_fn(m, name),
+        "landlock" => landlock(m, name),
         "run_after_failed" => {
             // A lockdown that fails (a grant of an fd that isn't open) leaves the guest half
             // prepared: a run after it is an error, never a setup closure or the program.
             let mut g = boot(m);
             let c = g.configure_sandbox(unsharek::SandboxConfig::new().grant([0, 1, 2, 900])).unwrap();
-            let refused = matches!(unsharek::lockdown(c), Err(unsharek::tcb::Error::NotOpen(900)));
+            // (Not open, it stays at 900, past the kept fds' 0..n: a gap.)
+            let refused = matches!(unsharek::lockdown(c), Err(unsharek::tcb::Error::Gap { .. } | unsharek::tcb::Error::NotOpen(900)));
             let after = matches!(g.run(|| 0), Err(unsharek::Error::NotLockedDown));
             println!("RUN_AFTER_FAILED {refused} {after}");
             std::process::exit(0)
@@ -127,15 +129,15 @@ fn child(layer: &str, name: &str) -> ! {
     std::process::exit(125)
 }
 
-/// A host directory served live (unsharek-fs-server, through `hostfs`): a change the host makes
+/// A host directory served live (through `hostfs`, unsharek-fs's in-process passthrough): a change the host makes
 /// between two setup closures is what the guest reads in the second (the store's images are
 /// snapshots; this is the host's file, as of now).
 fn hostdir_live(m: Mode) -> unsharek::Error {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("f"), "before").unwrap();
-    let fd = unsharek_fs_server::spawn(&unsharek_fs_server::Dir { host: dir.path().into(), writable: false, ..Default::default() }).unwrap();
     let mut g = boot(m);
-    unsharek::hostfs::add("live", std::os::fd::AsRawFd::as_raw_fd(&fd)).unwrap();
+    let real = std::fs::canonicalize(dir.path()).unwrap();
+    unsharek::hostfs::add("live", &real, false, m == Mode::Fork).unwrap();
     let at = dir.path().to_owned();
     let read = |g: &mut Guest| g.run(|| std::fs::read_to_string(at.join("f")).unwrap()).unwrap();
     let a = dir.path().to_owned();
@@ -143,6 +145,12 @@ fn hostdir_live(m: Mode) -> unsharek::Error {
     check("the guest reads the host's file", read(&mut g) == "before");
     std::fs::write(dir.path().join("f"), "after, longer").unwrap();
     check("then the host's change", read(&mut g) == "after, longer");
+    // A file past one readahead (128 KiB): its reply is 33 descriptors and more, which the device
+    // cut at 32, a short read the guest took for EOF (a 1.4 MB file read as 124 KiB).
+    let big: Vec<u8> = (0..1_500_000u32).map(|i| (i * 7 + i / 4096) as u8).collect();
+    std::fs::write(dir.path().join("big"), &big).unwrap();
+    let got = g.run(|| std::fs::read(at.join("big")).unwrap()).unwrap();
+    check("a file past a readahead, whole", got == big);
     // Names are cached for a second (the server's entry timeout), of the guest's time: the wait is
     // the guest's (its clock runs while it does).
     std::fs::remove_file(dir.path().join("f")).unwrap();
@@ -284,9 +292,11 @@ fn entries(m: Mode) -> unsharek::Error {
 fn run_fn(m: Mode, what: &str) -> unsharek::Error {
     let mut g = boot(m);
     // A host fd opened now, before lockdown: the closure finds it closed.
+    // At 900, past the kept fds' 0..n: a number below n may be a kept fd's after their move.
     let before = std::fs::File::open(env!("CARGO_MANIFEST_DIR")).unwrap();
-    let before_fd = before.as_raw_fd();
-    std::mem::forget(before);
+    // SAFETY: dup2 of this process's fd onto a free number.
+    let before_fd = unsafe { libc::dup2(before.as_raw_fd(), 900) };
+    drop(before);
     let host_path = env!("CARGO_MANIFEST_DIR");
     let what = what.to_owned();
     if let Err(e) = g.configure_sandbox(unsharek::SandboxConfig::new().grant([0, 1, 2])).and_then(|c| unsharek::lockdown(c).map_err(Into::into)) {
@@ -323,6 +333,40 @@ fn run_fn(m: Mode, what: &str) -> unsharek::Error {
 
 /// The gate's `syscall` instruction, found in the binary's code: `mov r9, [rsp + 8]; syscall;
 /// ret` (unsharek-rt's `trap::gate`), as a compromised program would find it.
+/// The fs plugin's `openat` from the gate after lockdown (what a compromised runtime could make),
+/// its root a temporary directory: a file inside opens; one outside is Landlock's EACCES, or,
+/// with `no_landlock` (`what`), opens too (the opt-out confines nothing).
+fn landlock(m: Mode, what: &str) -> unsharek::Error {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("inside"), "x").unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let inside = std::ffi::CString::new(root.join("inside").into_os_string().into_encoded_bytes()).unwrap();
+    let outside = std::ffi::CString::new(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+    let files = unsharek::plugin::Files::new().root(&root, unsharek::plugin::Fs::ReadOnly).no_landlock(what == "no_landlock");
+    let mut g = boot(m);
+    if let Err(e) = g.configure_sandbox(unsharek::SandboxConfig::new().grant([0, 1, 2])).and_then(|c| unsharek::lockdown_with(c, &[&files]).map_err(Into::into)) {
+        return e.into();
+    }
+    let r = g.run(move || {
+        let gate = find_gate();
+        let open = |p: &std::ffi::CStr| {
+            gate_call4(gate, libc::SYS_openat, [i32::MAX as usize, p.as_ptr() as usize, (libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) as usize, 0])
+        };
+        check("landlock: a file under the root opens", open(&inside) >= 0);
+        let o = open(&outside);
+        if what == "no_landlock" {
+            check("landlock: opted out, a file outside opens too", o >= 0);
+        } else {
+            check("landlock: a file outside is EACCES", o == -(libc::EACCES as isize));
+        }
+        0
+    });
+    match r {
+        Ok(_) => unreachable!("the program's run returns only on failure"),
+        Err(e) => e,
+    }
+}
+
 fn find_gate() -> usize {
     unsafe extern "C" {
         static __executable_start: u8;
@@ -493,6 +537,15 @@ fn main() {
             }
             Ok(())
         }));
+        for how in ["landlock", "no_landlock"] {
+            trials.push(Trial::test(format!("fs_plugin_{how}::{mode}"), move || {
+                let (st, out, err) = run("landlock", how, mode, &[])?;
+                if st.code() != Some(0) || out.contains("FAIL") || out.matches(": ok").count() != 2 {
+                    return fail(st, &out, &err, "wanted the root's file open and the outside one as Landlock says");
+                }
+                Ok(())
+            }));
+        }
         trials.push(Trial::test(format!("run_fn::{mode}"), move || {
             let (st, out, err) = run("run_fn", "ok", mode, &[])?;
             if st.code() != Some(42) || out.contains("FAIL") || out.matches(": ok").count() != 6 {
@@ -512,7 +565,8 @@ fn main() {
     for mode in ["coroutine", "threaded"] {
         // A thread blocked reading the passed fd (open, silent) while main exits with 3, or dies
         // of SIGTERM: the process ends so, within the timeout (capnix's app hung on its fd 1000).
-        for (how, want) in [("exit", (Some(3), None)), ("signal", (None, Some(15)))] {
+        // (SIGTERM: 128 + 15, an exit: unsharek-tcb's filter has no `kill`.)
+        for (how, want) in [("exit", (Some(3), None)), ("signal", (Some(128 + 15), None))] {
             trials.push(Trial::test(format!("pass_fd_reader_{how}::{mode}"), move || {
                 use std::os::unix::process::ExitStatusExt;
                 let (st, out, err, _) = run_passfd(mode, "group_exit", &format!("fd1000,futex {how}"), None)?;
@@ -565,7 +619,7 @@ fn main() {
                 "CHILD 1 creds status Some(0) signal None",
                 "CHILD 2 hello status Some(0) signal None",
                 "CHILD 3 exit_status status Some(42) signal None",
-                "CHILD 4 exit_status status None signal Some(6)",
+                "CHILD 4 exit_status status Some(134) signal None",
             ];
             if st.code() != Some(0) || statuses != want || !out.contains("HELLO_OK") {
                 return fail(st, &out, &err, "wanted five children, their statuses theirs");

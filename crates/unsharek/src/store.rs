@@ -123,7 +123,7 @@ fn closure_in(program: Option<&Path>, allow_paths: &[PathBuf], live: &[PathBuf],
     // An allowed directory inside another is already in the outer one's image.
     let outer: BTreeSet<PathBuf> =
         host.iter().filter(|d| !host.iter().any(|o| o != *d && d.starts_with(o))).cloned().collect();
-    // A directory served live (virtiofs: the CLI's `--ro DIR`, `--rw DIR`) isn't imaged; one the
+    // A directory served live (virtiofs: the CLI's `--mount DIR:ro`, `DIR:rw`) isn't imaged; one the
     // program is in is still scanned for its references, so its libraries are in the closure (a
     // program built against the store). Others aren't: a big tree's walk at every run, for
     // nothing the program needs.
@@ -370,8 +370,22 @@ pub struct Cache {
     builds: AtomicUsize,
 }
 
-/// Distinguishes this process's temporary files from each other (the pid, from other processes').
+/// Distinguishes this process's temporary files from each other ([`tmp_id`], from other processes').
 static TMP_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+/// This process's part of a temporary file's name: random, not the pid. Two sandboxes in pid
+/// namespaces of their own (bwrap's, a container's) are each pid 2 there, and a shared cache
+/// gave them the same name: the second's create_new was EEXIST, and it failed.
+fn tmp_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let mut b = [0u8; 8];
+        // SAFETY: getrandom into a local buffer.
+        let n = unsafe { libc::getrandom(b.as_mut_ptr() as *mut libc::c_void, b.len(), 0) };
+        let r = if n == 8 { u64::from_ne_bytes(b) } else { (process::id() as u64) << 32 ^ std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64) };
+        format!("{r:016x}")
+    })
+}
 
 impl Cache {
     pub fn new(dir: &Path) -> Cache {
@@ -408,7 +422,7 @@ impl Cache {
     }
 
     /// [`Cache::closures`], but a host directory brings only the closures of the store paths its
-    /// files reference, not an image of its own (the CLI's `--closure`: the directory is shown
+    /// files reference, not an image of its own (the CLI's `--mount DIR:closure`: the directory is shown
     /// live, by `--ro`, if at all).
     pub fn store_refs(&self, paths: &[PathBuf]) -> Result<Store> {
         let mut c = closure_in(None, paths, &[], Some(self))?;
@@ -623,7 +637,7 @@ impl Cache {
         fs::create_dir_all(dir).map_err(io_err(dir))?;
         reclaim(dir);
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp = |p: &Path| with_suffix(p, &format!(".{}-{seq}.tmp", process::id()));
+        let tmp = |p: &Path| with_suffix(p, &format!(".{}-{seq}.tmp", tmp_id()));
         let (image, layout) = (tmp(&mount.image), tmp(&mount.layout));
         let guard = Tmp(vec![layout.clone(), image.clone()]);
         let held = File::options().write(true).create_new(true).open(&image).map_err(io_err(&image))?;
@@ -698,7 +712,7 @@ fn reclaim(dir: &Path) {
     let now = std::time::SystemTime::now();
     const IMAGE: &[u8] = b".erofs.";
     let at_image = |name: &[u8]| name.windows(IMAGE.len()).position(|w| w == IMAGE);
-    // The layouts of held images' temporaries (`<base>.erofs.<pid>-<seq>.tmp`): kept.
+    // The layouts of held images' temporaries (`<base>.erofs.<id>-<seq>.tmp`): kept.
     let mut busy = BTreeSet::new();
     let mut gone = Vec::new();
     for p in &tmps {
@@ -764,7 +778,7 @@ fn write_list<'a>(path: &Path, lines: impl IntoIterator<Item = &'a [u8]>) -> Res
     }
     data.extend_from_slice(b"end\n");
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = with_suffix(path, &format!(".{}-{seq}.tmp", process::id()));
+    let tmp = with_suffix(path, &format!(".{}-{seq}.tmp", tmp_id()));
     let written = fs::write(&tmp, &data).and_then(|()| fs::rename(&tmp, path));
     if written.is_err() {
         let _ = fs::remove_file(&tmp);

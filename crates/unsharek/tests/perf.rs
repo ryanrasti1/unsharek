@@ -55,6 +55,14 @@ const BUILD_RATIO: f64 = 4.0;
 /// The same work on one host thread (coroutine mode): four threads' worth of CPU, serialised.
 const COROUTINE_PARALLEL_RATIO: f64 = 6.0;
 
+/// A `--mount` argument: `path:ty`, at its own path.
+fn mount(path: impl AsRef<std::path::Path>, ty: &str) -> std::ffi::OsString {
+    let mut m = path.as_ref().as_os_str().to_owned();
+    m.push(":");
+    m.push(ty);
+    m
+}
+
 fn main() {
     if let Ok(mode) = env::var("UNSHAREK_PERF_TEMPLATE") {
         template_process(&mode);
@@ -81,12 +89,12 @@ fn main() {
 /// `unsharek` in `mode`, the fixtures and `extra` allowed (a store path brings its closure).
 fn sandboxed(mode: Mode, prog: &Path, extra: &[PathBuf]) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_unsharek"));
-    cmd.args(["--mode", mode.name(), "--ro"]).arg(fx::bin_dir()).arg("--closure").arg(fx::bin_dir());
+    cmd.args(["--mode", mode.name(), "--mount"]).arg(mount(fx::bin_dir(), "ro")).arg("--mount").arg(mount(fx::bin_dir(), "closure"));
     for p in extra {
-        cmd.arg("--closure").arg(p);
+        cmd.arg("--mount").arg(mount(p, "closure"));
     }
     // The environment is empty but for these: the workloads' PATH, as each caller sets it.
-    cmd.args(["--keep-env", "PATH", "--keep-env", "HOME", "--"]).arg(prog);
+    cmd.args(["--env", "PATH", "--env", "HOME", "--"]).arg(prog);
     cmd
 }
 

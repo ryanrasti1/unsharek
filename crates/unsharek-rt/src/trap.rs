@@ -56,7 +56,7 @@
 //! target hook and the dispatcher both run with the runtime's.
 
 use core::mem::offset_of;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use rustix::io::Errno;
 
@@ -74,18 +74,56 @@ pub const NR_WRITE: u32 = 1;
 pub const NR_RT_SIGRETURN: u32 = 15;
 pub const NR_CLONE: u32 = 56;
 pub const NR_EXIT: u32 = 60;
-pub const NR_KILL: u32 = 62;
 pub const NR_EXIT_GROUP: u32 = 231;
 pub const NR_PPOLL: u32 = 271;
-pub const NR_RECVMSG: u32 = 47;
 pub const NR_CLOSE: u32 = 3;
 
 /// The one flag set a host thread is made with (include/uapi/linux/sched.h): `CLONE_VM |
 /// CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM | CLONE_CHILD_CLEARTID`.
 /// The child-cleared tid word is how the runtime learns a thread's slot is free.
 pub const CLONE_HOST_THREAD: u64 = 0x100 | 0x200 | 0x400 | 0x800 | 0x1_0000 | 0x4_0000 | 0x20_0000;
-/// The most pollfds one `ppoll` from the gate passes (the idle wait).
-pub const PPOLL_FDS: u64 = 8;
+/// The most pollfds one `ppoll` from the gate passes (the idle wait) under the core filter's row.
+pub const PPOLL_FDS: u32 = 8;
+/// The most any filter row allows (the network plugin's, unsharek-tcb's `Net::PPOLL_FDS`): what
+/// the poll buffers and the watch tables are sized for. The bound in force is [`ppoll_bound`].
+pub const PPOLL_FDS_MAX: u32 = 4096;
+/// The bound the filter in force allows ([`set_ppoll_bound`]); process-wide, inherited by forks.
+static PPOLL_BOUND: AtomicU32 = AtomicU32::new(PPOLL_FDS);
+
+/// Before lockdown: the most pollfds the filter's rows will allow one `ppoll` (the network
+/// plugin's row with it on), at most [`PPOLL_FDS_MAX`]. The idle wait then watches that many host
+/// fds at once (a server's sockets), not the core's 8.
+pub fn set_ppoll_bound(n: u32) {
+    PPOLL_BOUND.store(n.clamp(PPOLL_FDS, PPOLL_FDS_MAX), Ordering::Relaxed);
+}
+
+/// The most pollfds one `ppoll` may pass now ([`set_ppoll_bound`]).
+pub fn ppoll_bound() -> usize {
+    PPOLL_BOUND.load(Ordering::Relaxed) as usize
+}
+
+/// A pollfd buffer for one `ppoll` of up to [`ppoll_bound`] fds: a static (4096 of them is too
+/// much for a coroutine's stack), one per call site.
+pub struct PollBuf(core::cell::UnsafeCell<[PollFd; PPOLL_FDS_MAX as usize]>);
+// SAFETY: each is used by one call site at a time (with the CPU token held: one host thread).
+unsafe impl Sync for PollBuf {}
+
+impl PollBuf {
+    pub const fn new() -> PollBuf {
+        PollBuf(core::cell::UnsafeCell::new([PollFd { fd: 0, events: 0, revents: 0 }; PPOLL_FDS_MAX as usize]))
+    }
+
+    /// The buffer, [`ppoll_bound`] long.
+    ///
+    /// # Safety
+    /// No other borrow of this buffer is alive: its call site doesn't run again until this one is
+    /// dropped (the CPU token held, and the site not reentered).
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn get(&self) -> &mut [PollFd] {
+        // SAFETY: the caller's.
+        unsafe { &mut (&mut *self.0.get())[..ppoll_bound()] }
+    }
+}
 /// `SIGCHLD` (arch/x86/include/uapi/asm/signal.h): clone's flags for a plain fork.
 pub const SIGCHLD: u64 = 17;
 /// `CLONE_PARENT`: the new process is a sibling of the caller's (a child of its parent).
@@ -166,71 +204,27 @@ pub fn read(fd: u32, buf: &mut [u8]) -> Result<usize, Errno> {
     })
 }
 
-/// `close(fd)`: a fd [`recv_fds`] brought (unsharek-tcb's `close` row allows only those: at or
-/// above the floor lockdown fixed).
+/// `close(fd)`: an fd a plugin's call made (unsharek-tcb's plugins' `close` rows allow only
+/// those: at or above the floor `n`, never a kept fd).
 pub fn close(fd: u32) -> Result<usize, Errno> {
     // SAFETY: closes an fd of this process; no memory is passed.
     check(unsafe { gate(NR_CLOSE as usize, fd as usize, 0, 0, 0, 0, 0) })
 }
 
-/// The most fds one [`recv_fds`] takes from a message.
-pub const RECV_FDS_MAX: usize = 4;
-
-/// `recvmsg(fd, buf, MSG_CMSG_CLOEXEC)`: one packet from the control socket (unsharek-tcb's
-/// `Config::recv_fds`, the only fd the filter allows it on) and the fds sent with it, at most
-/// [`RECV_FDS_MAX`] (`n` of them in `fds`). Returns `(bytes, n)`; a packet or fd list the buffers
-/// cut short is EMSGSIZE (the fds that came are in `fds` all the same, never closed here).
-pub fn recv_fds(fd: u32, buf: &mut [u8], fds: &mut [i32; RECV_FDS_MAX]) -> Result<(usize, usize), Errno> {
-    #[repr(C)]
-    struct Iov {
-        base: usize,
-        len: usize,
-    }
-    #[repr(C)]
-    struct MsgHdr {
-        name: usize,
-        namelen: u32,
-        iov: *mut Iov,
-        iovlen: usize,
-        control: *mut u8,
-        controllen: usize,
-        flags: i32,
-    }
-    // cmsghdr (len: usize, level: i32, type: i32), then the fds; 8-aligned.
-    let mut control = [0u64; 2 + RECV_FDS_MAX / 2];
-    let mut iov = Iov { base: buf.as_mut_ptr() as usize, len: buf.len() };
-    let mut msg = MsgHdr {
-        name: 0,
-        namelen: 0,
-        iov: &mut iov,
-        iovlen: 1,
-        control: control.as_mut_ptr() as *mut u8,
-        controllen: core::mem::size_of_val(&control),
-        flags: 0,
-    };
-    const MSG_CMSG_CLOEXEC: usize = 0x4000_0000;
-    const MSG_TRUNC: i32 = 0x20;
-    const MSG_CTRUNC: i32 = 0x08;
-    const SOL_SOCKET: i32 = 1;
-    const SCM_RIGHTS: i32 = 1;
-    // SAFETY: the kernel writes at most `buf.len()` bytes into `buf` and `controllen` into
-    // `control`, all borrowed for the call; `msg` and `iov` are locals.
-    let n = check(unsafe { gate(NR_RECVMSG as usize, fd as usize, &mut msg as *mut MsgHdr as usize, MSG_CMSG_CLOEXEC, 0, 0, 0) })?;
-    let mut got = 0;
-    // One SCM_RIGHTS message at most (the sender's one cmsg): its fds after the 16-byte header.
-    let (len, level, kind) = (control[0] as usize, control[1] as u32 as i32, (control[1] >> 32) as i32);
-    if msg.controllen >= 16 && level == SOL_SOCKET && kind == SCM_RIGHTS && len >= 16 {
-        let words = &control[2..];
-        for (i, slot) in fds.iter_mut().enumerate().take(((len - 16) / 4).min(RECV_FDS_MAX)) {
-            *slot = (words[i / 2] >> (32 * (i % 2))) as u32 as i32;
-            got = i + 1;
-        }
-    }
-    if msg.flags & (MSG_TRUNC | MSG_CTRUNC) != 0 {
-        return Err(Errno::MSGSIZE);
-    }
-    Ok((n, got))
+/// A plugin's host call through the gate (unsharek-tcb's `plugin::fs` and `plugin::net` rows:
+/// the file and socket calls, each fd at or above the floor): `nr(a…)`, raw.
+///
+/// # Safety
+/// As [`gate`]: whatever `nr` does with the arguments (the memory they point to).
+pub unsafe fn plugin_call(nr: u32, a: [usize; 6]) -> Result<usize, Errno> {
+    // SAFETY: the caller's.
+    check(unsafe { gate(nr as usize, a[0], a[1], a[2], a[3], a[4], a[5]) })
 }
+
+/// The directory fd of a plugin's path call (`openat` and the rest, always an absolute path, which
+/// ignores it): at or above the floor, as unsharek-tcb's fs rows require (never `AT_FDCWD`, never
+/// a kept fd), and never an open one's number either (the largest an fd can be).
+pub const ABS_DIRFD: usize = i32::MAX as usize;
 
 /// `struct pollfd`.
 #[repr(C)]
@@ -254,11 +248,11 @@ pub fn ppoll(fd: Option<&mut PollFd>, timeout: Option<&Timespec>) -> Result<usiz
     check(unsafe { gate(NR_PPOLL as usize, fds, n, ts, 0, 8, 0) })
 }
 
-/// `ppoll` on up to [`PPOLL_FDS`] fds at once, no signal mask (the filter pins
+/// `ppoll` on up to [`ppoll_bound`] fds at once, no signal mask (the filter pins
 /// both): the idle wait over the fds coroutines and the hooks' executor wait on. `timeout` `None`
 /// waits forever. Returns how many are ready, each one's `revents` set.
 pub fn ppoll_fds(fds: &mut [PollFd], timeout: Option<&Timespec>) -> Result<usize, Errno> {
-    let n = fds.len().min(PPOLL_FDS as usize);
+    let n = fds.len().min(ppoll_bound());
     let p = if n == 0 { 0 } else { fds.as_mut_ptr() as usize };
     let ts = timeout.map_or(0, |t| t as *const Timespec as usize);
     // SAFETY: the kernel reads the timespec and reads/writes the n pollfds, all borrowed.

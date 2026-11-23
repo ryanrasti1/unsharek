@@ -103,7 +103,7 @@ struct Case {
     flags: Vec<&'static str>,
     env: Vec<(&'static str, &'static str)>,
     /// Programs from nixpkgs the case runs besides its own (devshell variables naming them): their
-    /// store paths are given (`--closure`), closures and all.
+    /// store paths are given (`--mount …:closure`), closures and all.
     uses: Vec<&'static str>,
     stdin: Option<&'static str>,
     /// Stdin a pipe held open and silent for the whole run (a reader blocks on it).
@@ -116,7 +116,7 @@ struct Case {
     check: Option<fn(&str) -> Result<(), String>>,
     /// `--rw` the run's own directory (`Arg::MarkerDir`): a host directory served live.
     rw_dir: bool,
-    /// `--immutable` a directory of the run's own holding a file `data` ([`immutable_data`]):
+    /// `--mount …:map` a directory of the run's own holding a file `data` ([`immutable_data`]):
     /// `Some(None)` at its own path, `Some(Some(at))` at `at`.
     immutable: Option<Option<&'static str>>,
 }
@@ -158,6 +158,13 @@ impl Case {
         self.native = native;
         self
     }
+    /// Natively a death by `sig` (in the sandbox it is an exit, 128 + `sig`).
+    fn native_signal(mut self, sig: i32) -> Self {
+        if let Some(n) = &mut self.native {
+            n.status = Status::Signal(sig);
+        }
+        self
+    }
     fn flags(mut self, flags: &[&'static str]) -> Self {
         self.flags = flags.to_vec();
         self
@@ -187,7 +194,8 @@ fn runtime_panic(from: &'static str) -> Case {
     let expect = Expect {
         stderr: vec!["the runtime panicked: "],
         not_stdout: vec!["RUNTIME_PANIC_OK"],
-        ..status(Status::Signal(6))
+        // 128 + SIGABRT: unsharek-tcb's filter has no `kill`, so a death by a signal is an exit.
+        ..status(Status::Code(128 + 6))
     };
     Case {
         native: Some(ok("RUNTIME_PANIC_OK")),
@@ -210,8 +218,10 @@ fn cases() -> Vec<Case> {
             .args(vec![Arg::Lit("exit42")]),
         // A death by a signal is the sandbox's too (the guest's default action, then `kill` of
         // itself), as natively.
-        case("abort", Prog::Fixture("exit_status"), ALL, status(Status::Signal(6))).args(vec![Arg::Lit("abort")]),
-        case("sigterm", Prog::Fixture("exit_status"), ALL, status(Status::Signal(15))).args(vec![Arg::Lit("term")]),
+        // A death by a signal ends the sandbox with 128 + the signal, as a shell shows it (unsharek-tcb's
+        // filter has no `kill`: the host's own death by the signal, its core, is given up).
+        case("abort", Prog::Fixture("exit_status"), ALL, status(Status::Code(128 + 6))).args(vec![Arg::Lit("abort")]).native_signal(6),
+        case("sigterm", Prog::Fixture("exit_status"), ALL, status(Status::Code(128 + 15))).args(vec![Arg::Lit("term")]).native_signal(15),
         Case {
             stdin: Some("through stdin\n"),
             ..case("stdin", Prog::Fixture("exit_status"), ALL, ok("through stdin")).args(vec![Arg::Lit("cat")])
@@ -288,8 +298,8 @@ fn cases() -> Vec<Case> {
         // signal's default action, and by an itimer's while every thread waits so.
         group_exit("group_exit_futex", "futex", "exit", Status::Code(3)),
         group_exit("group_exit_stdin", "stdin", "exit", Status::Code(3)),
-        group_exit("group_exit_signal", "futex,stdin", "signal", Status::Signal(15)),
-        group_exit("group_exit_alarm", "futex,stdin", "alarm", Status::Signal(14)),
+        group_exit("group_exit_signal", "futex,stdin", "signal", Status::Code(128 + 15)).native_signal(15),
+        group_exit("group_exit_alarm", "futex,stdin", "alarm", Status::Code(128 + 14)).native_signal(14),
         // A thread blocked reading a host fd must not keep its process from exiting (capnix).
         Case { hold_stdin: true, ..fixture("hostfd_thread", ALL).args(vec![Arg::Lit("exit")]) },
         Case { hold_stdin: true, ..fixture("hostfd_thread", ALL).renamed("hostfd_thread_sleep").args(vec![Arg::Lit("sleep")]) },
@@ -398,22 +408,22 @@ fn cases() -> Vec<Case> {
                 .uses(&["UNSHAREK_TEST_CARGO", "UNSHAREK_TEST_RUSTC", "UNSHAREK_TEST_GCC", "UNSHAREK_TEST_COREUTILS"])
         },
         // The CLI's environment is empty by default: the run's own variables reach the program only
-        // when kept (the suite keeps its UNSHAREK_TEST_* ones), `--setenv`'s do, and one the host
+        // when kept (the suite keeps its UNSHAREK_TEST_* ones), `--env NAME=VALUE`'s do, and one the host
         // sets but nobody keeps doesn't. Before, the program got all of the host's.
         fixture("env_dump", ALL)
-            .flags(&["--setenv", "SET_BY_FLAG=1"])
+            .flags(&["--env", "SET_BY_FLAG=1"])
             .native(None)
             .expect_also(&["SET_BY_FLAG=1", "UNSHAREK_TEST_MODE="], &["UNSHAREK_TEST_HOST_ONLY"]),
-        // Host directories served live (the CLI's --ro DIR and --rw DIR: virtio-fs, served by
-        // unsharek-fs-server's process). The suite's own --ro of the fixtures' directory is one
-        // already: every fixture runs from it.
+        // Host directories served live (the CLI's `--mount DIR:ro` and `DIR:rw`: virtio-fs, served
+        // in process by the host's file calls under Landlock). The suite's own `ro` mount of the
+        // fixtures' directory is one already: every fixture runs from it.
         Case {
             rw_dir: true,
             ..case("hostdir_write", Prog::Fixture("hostdir"), ALL, Expect { creates: Some(true), ..ok("HOSTDIR_WRITE") })
         }
         .args(vec![Arg::Lit("write"), Arg::MarkerDir]),
-        // A read-only directory refuses every change (the server's early EROFS, and Landlock's
-        // read-only rules under it): on the fixture's own binary, in the suite's --ro directory.
+        // A read-only directory refuses every change (the passthrough's early EROFS, and Landlock's
+        // read-only rules under it): on the fixture's own binary, in the suite's `ro` directory.
         // Not natively: there the file is writable, and it would be changed.
         fixture("hostdir", ALL)
             .renamed("hostdir_ro")
@@ -528,7 +538,7 @@ fn static_programs() -> Vec<Case> {
         Case { stdin: Some("b\nc\na\n"), ..bb("busybox_sort", ALL, &["sort"], ok("a\nb\nc\n")) },
         Case { stdin: Some("one two\nthree\n"), ..bb("busybox_wc", ALL, &["wc", "-lw"], ok("2         3")) },
         Case { stdin: Some("through cat\n"), ..bb("busybox_cat", ALL, &["cat"], ok("through cat")) },
-        // A host directory shown read-only without a copy (`--immutable DIR[:AT]`): its metadata
+        // A host directory shown read-only without a copy (`--mount DIR[:AT]:map`): its metadata
         // an image (cached), each file's data mapped in place from the host's file. A file of
         // four pages, the last cut short, read whole: each page the file's own, zeros past its
         // end not read as data. At its own path (natively too), and elsewhere.
@@ -705,31 +715,31 @@ fn run(c: &Case, mode: Mode, secret: &PathBuf) -> Result<(), Failed> {
     } else {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_unsharek"));
         // The fixtures' directory, live, and the store paths its programs reference.
-        cmd.args(["--mode", mode.name(), "--ro"]).arg(fx::bin_dir()).arg("--closure").arg(fx::bin_dir());
+        cmd.args(["--mode", mode.name(), "--mount"]).arg(mount(fx::bin_dir(), "ro")).arg("--mount").arg(mount(fx::bin_dir(), "closure"));
         // A program from the store (an external case's): its closure, given as any other is.
         if prog.starts_with("/nix/store") {
-            cmd.arg("--closure").arg(&prog);
+            cmd.arg("--mount").arg(mount(&prog, "closure"));
         }
         for var in &c.uses {
             let Some(p) = env::var_os(var) else { return Err(format!("{var} unset: run in the devshell (cargo xtask test)").into()) };
             let p = PathBuf::from(p);
             // Its store path (`/nix/store/<hash>-<name>`), which brings its closure.
             let store = p.ancestors().find(|a| a.parent() == Some(std::path::Path::new("/nix/store"))).unwrap_or(&p);
-            cmd.arg("--closure").arg(store);
+            cmd.arg("--mount").arg(mount(store, "closure"));
         }
         // The environment is empty but for what's kept: the variables this run sets below, the
         // programs the case uses (its scripts name them: `$UNSHAREK_TEST_GCC`), and the
         // devshell's PATH and HOME (programs that run others, like cargo and bash, need them).
         let fixed = ["UNSHAREK_TEST_MODE", "UNSHAREK_TEST_SECRET", "UNSHAREK_TEST_TARGET", "PATH", "HOME"];
         for k in fixed.into_iter().chain(c.env.iter().map(|e| e.0)).chain(c.uses.iter().copied()) {
-            cmd.arg("--keep-env").arg(k);
+            cmd.arg("--env").arg(k);
         }
         if c.rw_dir {
-            cmd.arg("--rw").arg(marker_dir.path());
+            cmd.arg("--mount").arg(mount(marker_dir.path(), "rw"));
         }
         match c.immutable {
-            Some(None) => drop(cmd.arg("--immutable").arg(&imm_dir)),
-            Some(Some(at)) => drop(cmd.arg("--immutable").arg(format!("{}:{at}", imm_dir.display()))),
+            Some(None) => drop(cmd.arg("--mount").arg(mount(&imm_dir, "map"))),
+            Some(Some(at)) => drop(cmd.arg("--mount").arg(format!("{}:{at}:map", imm_dir.display()))),
             None => {}
         }
         cmd.args(&c.flags).arg("--").arg(&prog);
@@ -802,4 +812,12 @@ impl std::fmt::Debug for DebugStatus {
             Status::Any => write!(f, "any"),
         }
     }
+}
+
+/// A `--mount` argument: `path:ty`, at its own path.
+fn mount(path: impl AsRef<std::path::Path>, ty: &str) -> std::ffi::OsString {
+    let mut m = path.as_ref().as_os_str().to_owned();
+    m.push(":");
+    m.push(ty);
+    m
 }

@@ -26,8 +26,6 @@ let
       ../crates/unsharek-tcb/README.md
       # seccomp-fn, the filter's compiler and proof (its own repository, a submodule)
       (fs.difference ../seccomp-fn (fs.maybeMissing ../seccomp-fn/target))
-      # capnweb-rs, vendored with the network plugin's transport (vendor/capnweb-rs/PATCHES.md)
-      ../vendor
       # A workspace member: cargo loads every member's manifest, built or not (the
       # package failed to build without it).
       (fs.difference ../examples (fs.fileFilter (f: f.hasExt "md") ../examples))
@@ -49,8 +47,6 @@ let
     cargoLock = ../Cargo.lock;
     runs = [
       [ "-p" "unsharek-tcb" "-j" "--output-format=terse" ]
-      # the fs plugin's server filter (its policy alone: no fuse-backend-rs)
-      [ "-p" "unsharek-fs-server" "--no-default-features" "-j" "--output-format=terse" ]
     ];
   };
 

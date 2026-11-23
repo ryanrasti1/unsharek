@@ -21,6 +21,8 @@
 //   churn IP PORT N       N connections one after another, each a ping echoed and closed, then
 //                         a pause on stdin's EOF... (the host counts the sandbox's fds)
 //   serve PORT            a listen on 0.0.0.0:PORT: one connection, "ping" read, "pong" written
+//   idle N IP PORT        N connections held idle and polled at once (a server's wait): the one
+//                         the host writes "go" on, the last, wakes the poll and answers "ack"
 //   fork N CASE ARGS...   CASE in a process N forks down (fork mode's forked processes)
 //                         (the network plugin's --publish: crates/unsharek/tests/netplugin.rs)
 #include "unsharek_test.h"
@@ -311,6 +313,26 @@ static void churn(char **a)
 		;
 }
 
+static void idle(char **a)
+{
+	int n = atoi(a[0]);
+	struct pollfd *p = calloc(n, sizeof(*p));
+	CHECK(p, "calloc");
+	for (int i = 0; i < n; i++)
+		p[i] = (struct pollfd){ .fd = connect_to(addr(a[1], a[2])), .events = POLLIN };
+	printf("idle: %d connections\n", n);
+	int r = poll(p, n, -1);
+	CHECK(r == 1, "poll: %d (%s)", r, strerror(errno));
+	CHECK(p[n - 1].revents & POLLIN, "the last connection isn't the ready one");
+	char buf[2];
+	read_all(p[n - 1].fd, buf, 2);
+	CHECK(!memcmp(buf, "go", 2), "read %.2s", buf);
+	CHECK(write(p[n - 1].fd, "ack", 3) == 3, "write: %s", strerror(errno));
+	for (int i = 0; i < n; i++)
+		close(p[i].fd);
+	free(p);
+}
+
 static void serve(char **a)
 {
 	int l = socket(AF_INET, SOCK_STREAM, 0);
@@ -365,6 +387,8 @@ int main(int argc, char **argv)
 		churn(a);
 	else if (!strcmp(c, "serve"))
 		serve(a);
+	else if (!strcmp(c, "idle"))
+		idle(a);
 	else if (!strcmp(c, "denied"))
 		fails(a, EACCES);
 	else if (!strcmp(c, "reset"))

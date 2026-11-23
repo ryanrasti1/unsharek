@@ -2,7 +2,7 @@
 # nextest's run-wrapper for the guest tests (.config/nextest.toml): `run-in-guest MODE TEST-BINARY
 # ARGS...` runs one test (nextest's ARGS: `--exact <name> --nocapture`) in a sandbox of its own.
 #
-# --ro takes directories, and the binary's own (target/<profile>/deps) holds every test
+# an ro mount takes directories, and the binary's own (target/<profile>/deps) holds every test
 # binary and rlib of the workspace. So the binary is hard-linked into a directory of its own,
 # target/<profile>/guest-tests/<binary>/, and only that is allowed; its closure (glibc,
 # libgcc_s) unsharek finds from its store references.
@@ -34,7 +34,7 @@ mkdir -p "$dir"
   if [[ ! $link -ef $bin ]]; then
     ln -f "$bin" "$link.new" && mv -f "$link.new" "$link" || exit 125
     # The image, built once for the binary's tests (and the binary seen to start in the guest).
-    out=$("$unsharek" --mode "$mode" --ro "$dir" --closure "$dir" -- "$link" --list 2>&1)
+    out=$("$unsharek" --mode "$mode" --mount "$dir:ro" --mount "$dir:closure" -- "$link" --list 2>&1)
     st=$?
     if ((st != 0)); then
       rm -f "$link"
@@ -47,5 +47,5 @@ export UNSHAREK_TEST_MODE=$mode
 # The sandbox's environment is empty but for what's kept: here all of this one's (nextest's and
 # the harness's variables, which the tests' natively run selves see too).
 keep=()
-while IFS= read -r -d '' kv; do keep+=(--keep-env "${kv%%=*}"); done < <(env -0)
-exec "$unsharek" --mode "$mode" --ro "$dir" --closure "$dir" "${keep[@]}" -- "$link" "$@"
+while IFS= read -r -d '' kv; do keep+=(--env "${kv%%=*}"); done < <(env -0)
+exec "$unsharek" --mode "$mode" --mount "$dir:ro" --mount "$dir:closure" "${keep[@]}" -- "$link" "$@"

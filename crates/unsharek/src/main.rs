@@ -1,4 +1,4 @@
-//! The unsharek CLI: arguments to an [`unsharek::Config`], then [`unsharek::run`].
+//! The unsharek CLI: arguments to an [`unsharek::Config`], then [`unsharek::run_with`].
 
 use std::ffi::OsString;
 use std::process::ExitCode;
@@ -7,10 +7,10 @@ use clap::{Parser, ValueEnum};
 
 #[path = "cli/fs.rs"]
 mod fs;
-#[path = "cli/net.rs"]
-mod net;
 #[path = "cli/tty.rs"]
 mod tty;
+
+use fs::{Mount, Type};
 
 /// Run a program in a sandbox of its own kernel; exits with the program's status.
 #[derive(Parser)]
@@ -18,58 +18,46 @@ mod tty;
 struct Cli {
     #[arg(long, value_enum, default_value_t = Mode::Coroutine)]
     mode: Mode,
-    /// A store path the program may see, with everything it references, read-only, each at its
-    /// own path (the program's code maps in place from them). A host directory: the store paths
-    /// its files reference (show the directory itself with --ro). Nothing is shown unless given:
-    /// not even the program's own. At most 256 store paths. Repeatable.
-    #[arg(long = "closure", value_name = "PATH")]
-    closure: Vec<std::path::PathBuf>,
-    /// A host directory the program may read, served live (at AT, default its own path).
-    /// Repeatable.
-    #[arg(long = "ro", value_name = "DIR[:AT]")]
-    ro: Vec<fs::Arg>,
-    /// A host directory the program may read and write, served live (at AT, default its own
-    /// path). Repeatable.
-    #[arg(long = "rw", value_name = "DIR[:AT]")]
-    rw: Vec<fs::Arg>,
-    /// A host directory shown read-only at AT (default its own path), its files mapped in place,
-    /// not copied: it must not change while the program runs. Provisional (hidden): the CLI's
-    /// mounts are to become one flag. Repeatable.
-    #[arg(long = "immutable", value_name = "DIR[:AT]", hide = true, value_parser = immutable)]
-    immutable: Vec<unsharek::Immutable>,
+    /// Show the program SRC at DST (default: SRC's own path). TYPE is required:
+    /// `map`: read-only, its files mapped in place, not copied (SRC must not change while the
+    /// program runs); `closure`: a store path and everything it references, each at its own
+    /// path (at most 256 store paths); `ro`, `rw` (experimental): live, read-only or
+    /// read-write, through the host's own file calls, confined by Landlock to the sources.
+    /// Nothing is shown unless mounted, not even the program's own files. Repeatable.
+    #[arg(long = "mount", value_name = "SRC[:DST]:TYPE")]
+    mounts: Vec<Mount>,
+    /// The network beyond loopback (experimental): `none`, or `host`, the host's own: the
+    /// program's sockets are host sockets, any address, any port (isolate it with a network
+    /// namespace).
+    #[arg(long, value_enum, default_value_t = Net::None)]
+    net: Net,
+    /// `ro` and `rw` mounts without Landlock: their paths confined by nothing but where this
+    /// process runs. Only where file access is already scoped (a container's filesystem).
+    #[arg(long)]
+    no_landlock: bool,
+    /// NAME=VALUE: set it in the program's environment, which is otherwise empty. NAME alone:
+    /// pass this process's NAME, if set. Repeatable; the first of a name wins.
+    #[arg(long = "env", value_name = "NAME[=VALUE]")]
+    env: Vec<OsString>,
+    /// For trying things out: the host's system directories as `ro` mounts (`/nix/store`,
+    /// `/run/current-system`, `/etc`, `/bin`, `/usr`, `/lib`, `/lib64`, `/opt`, `/sbin`, those
+    /// that exist; never home or /tmp), and the host's PATH, TERM and LANG. Anything
+    /// world-readable there, `/etc` included, is the program's to read.
+    #[arg(long)]
+    system: bool,
     /// Fork mode: the most processes alive at once.
     #[arg(long)]
     max_procs: Option<u32>,
-    /// Set a variable in the program's environment, which is otherwise empty. Repeatable.
-    #[arg(long = "setenv", value_name = "NAME=VALUE")]
-    setenv: Vec<OsString>,
-    /// Pass this process's variable NAME to the program, if set. Repeatable.
-    #[arg(long = "keep-env", value_name = "NAME")]
-    keep_env: Vec<OsString>,
-    /// For trying things out: the host's system directories, read-only and live (`/nix/store`,
-    /// `/run/current-system`, `/etc`, `/bin`, `/usr`, `/lib`, `/lib64`, `/opt`, `/sbin`, those that
-    /// exist; never home or /tmp), and the host's PATH, TERM and LANG. Anything world-readable
-    /// there, `/etc` included, is the program's to read.
-    #[arg(long)]
-    system: bool,
-    /// The network beyond loopback (plugin, experimental): `none`, `public` (public addresses
-    /// only) or `all`, dialled by a provider process under that policy.
-    #[arg(long, value_enum, default_value_t = Net::None)]
-    net: Net,
-    /// Publish a port: connections to HOST_PORT on the host (127.0.0.1 unless IP is given) reach
-    /// the program's listener on GUEST_PORT, as docker's -p. Repeatable.
-    #[arg(long, value_name = "[IP:]HOST_PORT:GUEST_PORT")]
-    publish: Vec<unsharek::provider::Publish>,
-    /// The program and its arguments: a bare name is looked up on this process's PATH.
-    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    /// The program and its arguments: a bare name is looked up on this process's PATH. (An
+    /// unknown flag before it is an error, not the program's name; its own flags are its.)
+    #[arg(required = true, trailing_var_arg = true)]
     argv: Vec<OsString>,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Net {
     None,
-    Public,
-    All,
+    Host,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -77,21 +65,6 @@ enum Mode {
     Coroutine,
     Threaded,
     Fork,
-}
-
-/// `DIR[:AT]`, AT absolute; DIR relative to the current directory.
-fn immutable(arg: &str) -> Result<unsharek::Immutable, String> {
-    let (dir, at) = match arg.split_once(':') {
-        Some((d, a)) => (std::path::PathBuf::from(d), std::path::PathBuf::from(a)),
-        None => {
-            let d = std::path::absolute(arg).map_err(|e| e.to_string())?;
-            (d.clone(), d)
-        }
-    };
-    if !at.is_absolute() {
-        return Err(format!("{}: not an absolute path", at.display()));
-    }
-    Ok(unsharek::Immutable { dir, at })
 }
 
 fn main() -> ExitCode {
@@ -104,10 +77,11 @@ fn main() -> ExitCode {
             rustix::process::Rlimit { current: Some(l), maximum: Some(l) },
         );
     }
-    let Cli { mode, closure, immutable, mut ro, rw, max_procs, setenv, mut keep_env, system, net, publish, mut argv } = Cli::parse();
+    let Cli { mode, mut mounts, net, no_landlock, mut env, system, max_procs, mut argv } = Cli::parse();
     if system {
-        ro.extend(fs::SYSTEM.iter().filter(|d| std::path::Path::new(d).is_dir()).map(|d| fs::Arg { host: d.into(), at: None, live: true }));
-        keep_env.extend(["PATH", "TERM", "LANG"].map(OsString::from));
+        let dirs = fs::SYSTEM.iter().filter(|d| std::path::Path::new(d).is_dir());
+        mounts.extend(dirs.map(|d| Mount { src: d.into(), dst: d.into(), ty: Type::Ro }));
+        env.extend(["PATH", "TERM", "LANG"].map(OsString::from));
     }
     // The program as the host resolves it: a bare name on PATH, then any symlinks (a profile's
     // bin/ into the store), so its closure is found and its path exists in the guest.
@@ -118,53 +92,58 @@ fn main() -> ExitCode {
             return ExitCode::from(127);
         }
     }
+    let mut closures = vec![];
+    let mut immutable = vec![];
+    let mut host_dirs = vec![];
+    // Plugin: host directories, live (unsharek-tcb's `Files`, its roots the sources).
+    let mut files = unsharek::plugin::Files::new().no_landlock(no_landlock);
+    for m in &mounts {
+        match m.ty {
+            Type::Closure => closures.push(m.src.clone()),
+            Type::Map => immutable.push(unsharek::Immutable { dir: m.src.clone(), at: m.dst.clone() }),
+            Type::Ro | Type::Rw => {
+                // The served root is the directory itself, not a symlink to it
+                // (`/run/current-system`), mounted at the path as given.
+                let dir = match std::fs::canonicalize(&m.src) {
+                    Ok(d) if d.is_dir() => d,
+                    Ok(_) => return usage(format!("{}: not a directory", m.src.display())),
+                    Err(e) => return usage(format!("{}: {e}", m.src.display())),
+                };
+                let writable = m.ty == Type::Rw;
+                let access = if writable { unsharek::plugin::Fs::ReadWrite } else { unsharek::plugin::Fs::ReadOnly };
+                files = files.root(&dir, access);
+                host_dirs.push(unsharek::HostDir { dir, at: m.dst.clone(), writable });
+            }
+        }
+    }
+    if no_landlock && !host_dirs.is_empty() {
+        eprintln!("unsharek: --no-landlock: the ro and rw mounts' paths are confined only by where unsharek runs");
+    }
     // An interactive terminal (cli/tty.rs): fork mode, stdin a terminal. This process becomes the
     // terminal's supervisor, outside the sandbox; its child goes on.
     let tty = if matches!(mode, Mode::Fork) && tty::is_tty() { Some(tty::supervise()) } else { None };
-    // Plugin: host directories, live (cli/fs.rs). A store path's place is --closure.
-    if let Some(a) = ro.iter().find(|a| !a.live && !fs::live(&a.host)) {
-        let p = a.host.display();
-        let why = if a.host.is_dir() { "a store path: use --closure" } else { "not a directory" };
-        eprintln!("unsharek: --ro {p}: {why}");
-        return ExitCode::from(125);
-    }
-    let host_dirs = match fs::spawn(&ro, &rw) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("unsharek: a host directory's server: {e}");
-            return ExitCode::from(125);
-        }
-    };
-    // Plugin: the network, through a provider (cli/net.rs).
-    let policy = match net {
-        Net::None => None,
-        Net::Public => Some(unsharek::provider::Policy::Public),
-        Net::All => Some(unsharek::provider::Policy::All),
-    };
-    let net = match net::spawn(&net::Args { policy, publish }) {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("unsharek: the network provider: {e}");
-            return ExitCode::from(125);
-        }
-    };
     // An empty environment, but what was asked for: the host's variables (tokens, keys) stay out
-    // unless kept by name. `--setenv` first: getenv(3) takes a name's first entry.
-    let mut env = setenv;
-    env.extend(keep_env.iter().filter_map(|k| {
-        let v = std::env::var_os(k)?;
-        let mut kv = k.clone();
-        kv.push("=");
-        kv.push(v);
-        Some(kv)
-    }));
+    // unless kept by name. In order: getenv(3) takes a name's first entry.
+    let env = env
+        .into_iter()
+        .filter_map(|e| {
+            if e.as_encoded_bytes().contains(&b'=') {
+                return Some(e);
+            }
+            let v = std::env::var_os(&e)?;
+            let mut kv = e;
+            kv.push("=");
+            kv.push(v);
+            Some(kv)
+        })
+        .collect();
     let config = unsharek::Config {
         mode: match mode {
             Mode::Coroutine => unsharek::Mode::Coroutine,
             Mode::Threaded => unsharek::Mode::Threaded,
             Mode::Fork => unsharek::Mode::Fork,
         },
-        closures: closure,
+        closures,
         max_procs,
         argv,
         env,
@@ -173,21 +152,27 @@ fn main() -> ExitCode {
         host_dirs: host_dirs.clone(),
         tty,
     };
-    let prepare = |g: &mut unsharek::Guest| {
-        if let Some(n) = &net {
-            n.install(g)?;
-        }
-        Ok(())
-    };
-    let grants = |c: unsharek::SandboxConfig| {
-        let c = fs::grant(&host_dirs, c);
-        match &net {
-            Some(n) => n.grant(c),
-            None => c,
-        }
-    };
-    let Err(e) = unsharek::run_with(config, prepare, grants);
+    // Plugins (experimental): unsharek-tcb's, each behind its flag.
+    let sockets = (net == Net::Host).then_some(unsharek::plugin::Net);
+    let mut plugins: Vec<&dyn unsharek::Plugin> = vec![];
+    if !host_dirs.is_empty() {
+        plugins.push(&files);
+    }
+    if let Some(n) = &sockets {
+        plugins.push(n);
+    }
+    let prepare = |g: &mut unsharek::Guest| if net == Net::Host { unsharek::hostnet::install(g) } else { Ok(()) };
+    let Err(e) = unsharek::run_with(config, prepare, |c| c, &plugins);
     eprintln!("unsharek: {e}");
+    if e.to_string().contains("landlock") {
+        // The library's words are its API's (`Files::no_landlock`); the CLI's are flags.
+        eprintln!("unsharek: for the CLI: --no-landlock (where file access is already scoped), or a `map` mount instead of `ro`");
+    }
     // As env(1) and container runtimes: the sandbox itself failed, not the program.
+    ExitCode::from(125)
+}
+
+fn usage(msg: String) -> ExitCode {
+    eprintln!("unsharek: --mount {msg}");
     ExitCode::from(125)
 }

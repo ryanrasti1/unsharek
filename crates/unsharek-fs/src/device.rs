@@ -1,8 +1,8 @@
 //! The virtio-fs device: virtio-mmio (version 2) registers, two split virtqueues (hiprio and one
 //! request queue), and the config space `tag`. The driver's queue notify is served in the call:
-//! each available chain's device-readable buffers are the request, sent whole to the device's
-//! server over its socket ([`Host::rpc`]); the reply read back is scattered into the chain's
-//! device-writable buffers, then the used ring and the interrupt. No optional features (event
+//! each available chain's device-readable buffers are the request, served whole in this process
+//! ([`Host::rpc`]: the passthrough, [`crate::passthrough`]); the reply is scattered into the
+//! chain's device-writable buffers, then the used ring and the interrupt. No optional features (event
 //! index, indirect descriptors, notification data): VERSION_1 only, which virtio-mmio v2 requires.
 //!
 //! The guest's addresses are the host's (LKL has no MMU: the ring's and buffers' addresses are
@@ -12,14 +12,13 @@
 //! writel are [`iomem_access`] calls), and the kernel runs on one guest CPU: in coroutine mode one
 //! host thread, in threaded and fork mode whichever thread holds the CPU token. So calls never
 //! overlap, and the device's state needs no lock (a lock's wait would be a futex, which the filter
-//! doesn't allow). The server's round trip is made in the notify, the CPU held: the guest waits
-//! for each file operation, as for a disk without a queue.
+//! doesn't allow). Each request is served in the notify, the CPU held: the guest waits for each
+//! file operation, as for a disk without a queue.
 //!
 //! **Fork mode.** A guest fork is a host fork, and any process may run the kernel next: the
 //! devices' state ([`Devices`]) is in the runtime's shared section (mapped shared before the
-//! first fork), and the server's socket is the same fd number in every process (one open
-//! file: the round trip is whole before another process can run the kernel). The request and
-//! reply buffers are each process's own, used only within one call.
+//! first fork), and so is what serves it (the passthrough's nodes, in the kernel's pool). The
+//! request and reply buffers are each process's own, used only within one call.
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering, fence};
@@ -29,9 +28,9 @@ use core::sync::atomic::{AtomicUsize, Ordering, fence};
 pub struct Host {
     /// Raise the device's interrupt (`lkl_trigger_irq`).
     pub trigger_irq: fn(u32),
-    /// One round trip with the server on `fd` ([`crate::wire`]): `request` sent, the reply read
-    /// into `reply`; its length, or an errno.
-    pub rpc: fn(fd: i32, request: &[u8], reply: &mut [u8]) -> Result<usize, i32>,
+    /// Serve one request of the device whose server state is `state` (the passthrough's,
+    /// [`crate::passthrough::serve`]): the reply's length in `reply` (0: none), or an errno.
+    pub rpc: fn(state: usize, request: &[u8], reply: &mut [u8]) -> Result<usize, i32>,
 }
 
 const MAGIC: u32 = 0x7472_6976; // "virt"
@@ -64,13 +63,13 @@ struct Queue {
 
 const QUEUE0: Queue = Queue { num: 0, ready: 0, desc: 0, avail: 0, used: 0, last_avail: 0 };
 
-/// A virtio-fs device: its registers and its server's socket. Plain data (no heap): it lives in
+/// A virtio-fs device: its registers and its server's state. Plain data (no heap): it lives in
 /// the shared section.
 #[derive(Clone, Copy)]
 struct Device {
     tag: [u8; 36],
     irq: u32,
-    fd: i32,
+    state: usize,
     host: Option<Host>,
     status: u32,
     device_features_sel: u32,
@@ -84,7 +83,7 @@ struct Device {
 const DEVICE0: Device = Device {
     tag: [0; 36],
     irq: 0,
-    fd: -1,
+    state: 0,
     host: None,
     status: 0,
     device_features_sel: 0,
@@ -133,19 +132,25 @@ fn devices() -> Option<&'static Devices> {
 }
 
 /// A request's or a reply's largest size: a FUSE write's or read's data (the server's max_write,
-/// [`crate::wire::MAX_DATA`]) and its headers.
-pub const BUF: usize = crate::wire::MAX_DATA + 4096;
+/// [`crate::MAX_DATA`]) and its headers.
+pub const BUF: usize = crate::MAX_DATA + 4096;
 struct Buf(UnsafeCell<[u8; BUF]>);
 // SAFETY: as Devices's: one call at a time, in each process (these are private, not shared).
 unsafe impl Sync for Buf {}
 static REQUEST: Buf = Buf(UnsafeCell::new([0; BUF]));
+/// A chain's writable buffers ([`Device::notify`]): as many as a reply's pages and headers.
+struct Writable(UnsafeCell<[(*mut u8, usize); WRITABLE_MAX]>);
+// SAFETY: as Buf's.
+unsafe impl Sync for Writable {}
+const WRITABLE_MAX: usize = BUF / 4096 + 8;
+static WRITABLE: Writable = Writable(UnsafeCell::new([(core::ptr::null_mut(), 0); WRITABLE_MAX]));
 static REPLY: Buf = Buf(UnsafeCell::new([0; BUF]));
 
 /// A device `tag` (mounted in the guest as `mount -t virtiofs <tag>`), interrupting on `irq`,
-/// whose server is on socket `fd`: its MMIO window's address and size, for
+/// served from `state` ([`Host::rpc`]'s): its MMIO window's address and size, for
 /// `virtio_mmio_device_add(base, size, irq)` (the caller's: LKL's syscall). Host code, before the
 /// first fork.
-pub fn add(tag: &str, irq: u32, fd: i32, host: Host) -> Option<(usize, usize)> {
+pub fn add(tag: &str, irq: u32, state: usize, host: Host) -> Option<(usize, usize)> {
     let d = devices()?;
     let i = d.count.load(Ordering::Relaxed);
     if i == MAX_DEVICES || tag.len() > 36 {
@@ -154,7 +159,7 @@ pub fn add(tag: &str, irq: u32, fd: i32, host: Host) -> Option<(usize, usize)> {
     let mut t = [0u8; 36];
     t[..tag.len()].copy_from_slice(tag.as_bytes());
     // SAFETY: slot i isn't registered yet: nothing else reads it.
-    unsafe { (*d.table.get())[i] = Device { tag: t, irq, fd, host: Some(host), ..DEVICE0 } };
+    unsafe { (*d.table.get())[i] = Device { tag: t, irq, state, host: Some(host), ..DEVICE0 } };
     d.count.store(i + 1, Ordering::Release);
     Some((BASE + i * 0x1000, MMIO_SIZE))
 }
@@ -268,7 +273,10 @@ impl Device {
                 let head = core::ptr::read_volatile(avail.add(2 + last as usize % num));
                 // the chain: readable buffers (the request, gathered), then writable ones
                 let mut len = 0;
-                let mut writable: [(*mut u8, usize); 32] = [(core::ptr::null_mut(), 0); 32];
+                // A read's reply is a header and up to max_pages (256) pages, each its own
+                // descriptor: a shorter list cut the reply, a short read the guest took for EOF
+                // (a 1.4 MB file read as 124 KiB: 32 descriptors, a 128 KiB readahead's 33).
+                let writable = &mut *WRITABLE.0.get();
                 let mut nw = 0;
                 let mut i = head as usize;
                 for _ in 0..num {
@@ -293,9 +301,9 @@ impl Device {
                     i = next as usize;
                 }
                 let room = writable[..nw].iter().map(|w| w.1).sum::<usize>().min(BUF);
-                let n = match (host.rpc)(self.fd, &request[..len], &mut reply[..room]) {
+                let n = match (host.rpc)(self.state, &request[..len], &mut reply[..room]) {
                     Ok(n) => n,
-                    // The server is gone or failed: the request fails (EIO), if it wants a reply.
+                    // The server failed: the request fails (EIO), if it wants a reply.
                     Err(_) => error_reply(&request[..len], reply, room),
                 };
                 // scatter the reply into the writable buffers

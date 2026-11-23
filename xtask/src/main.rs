@@ -6,10 +6,14 @@
 //!   seccomp-fn's workspace, unless args picked tests. E.g. `-E 'test(/::fork$/)'` (one mode of
 //!   the suite), `-E 'binary(guest_fork)'`, `-E 'test(/^escape/)'`, `--no-fail-fast`.
 //! - `perf [nextest args]`: the performance budgets (crates/unsharek/tests/perf.rs), release.
+//! - `test-docker`: unsharek in a Docker image (examples/docker/test.sh): under Docker's default
+//!   seccomp profile, a map, ro and ro --no-landlock mount and --net host; skipped without a
+//!   daemon.
 //! - `prove [kani args]`: Kani's proofs, each `policy!` harness (seccomp-fn's examples,
-//!   unsharek-tcb's filter, a harness per mode; the fs plugin's server filter; the network
-//!   provider's filter); minutes.
+//!   unsharek-tcb's filter, a harness per mode); minutes.
 //! - `vs-native [args]`: each mode against native on build workloads (bench/quick.py).
+//! - `calls`: unsharek-tcb's typed syscall table (crates/unsharek-tcb/src/calls.rs) from mainline
+//!   Linux's sources (calls.rs, nix/linux-syscalls.nix).
 //! - `stats [args]`: the headline numbers (memory, startup, a syscall, CPU) into bench/STATS.md
 //!   (bench/stats.py); minutes, on a quiet machine.
 //!
@@ -18,10 +22,21 @@
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
+mod calls;
+
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let task = args.next().unwrap_or_default();
     let rest: Vec<String> = args.collect();
+    if task == "calls" {
+        return match calls::run(&root()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("xtask calls: {e}");
+                ExitCode::from(1)
+            }
+        };
+    }
     let steps: Vec<Command> = match task.as_str() {
         "test" => {
             let mut s = vec![cargo(&["nextest", "run", "--workspace", "--no-tests=warn"], &rest)];
@@ -37,18 +52,15 @@ fn main() -> ExitCode {
         "prove" => vec![
             cargo(&["kani", "--manifest-path", "seccomp-fn/Cargo.toml", "-p", "seccomp-fn", "--tests", "-j", "--output-format=terse"], &rest),
             cargo(&["kani", "-p", "unsharek-tcb", "-j", "--output-format=terse"], &rest),
-            // The fs plugin's server filter: its policy alone, not the server (fuse-backend-rs)
-            cargo(&["kani", "-p", "unsharek-fs-server", "--no-default-features", "-j", "--output-format=terse"], &rest),
-            // the network plugin's provider's own filter
-            cargo(&["kani", "-p", "unsharek-net", "-j", "--output-format=terse"], &rest),
         ],
+        "test-docker" => vec![Command::new(root().join("examples/docker/test.sh"))],
         "vs-native" | "stats" => {
             let mut c = Command::new(root().join(if task == "stats" { "bench/stats" } else { "bench/quick" }));
             c.args(&rest);
             vec![c]
         }
         _ => {
-            eprintln!("usage: cargo xtask test|perf|prove|vs-native|stats [args] (xtask/src/main.rs)");
+            eprintln!("usage: cargo xtask test|test-docker|perf|prove|calls|vs-native|stats [args] (xtask/src/main.rs)");
             return ExitCode::from(2);
         }
     };

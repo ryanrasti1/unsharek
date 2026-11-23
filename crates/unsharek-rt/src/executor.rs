@@ -142,14 +142,25 @@ static E: Exec = Exec {
 /// kernel. Touched only with the CPU token held. Entries go when they fire; a watch past the
 /// table's end is dropped (one per host fd: there are as many as the sandbox was given).
 #[unsafe(link_section = "unsharek_shared")]
-static HOSTFDS: HostFds = HostFds([const { Cell::new((0, 0)) }; 16]);
-struct HostFds([Cell<(i32, i16)>; 16]);
+static HOSTFDS: HostFds = HostFds([const { Cell::new((0, 0)) }; HOSTFDS_MAX]);
+struct HostFds([Cell<(i32, i16)>; HOSTFDS_MAX]);
 // SAFETY: touched with the CPU token held (one host thread at a time).
 unsafe impl Sync for HostFds {}
 
+/// The table's size: half the largest poll any row allows (`trap::PPOLL_FDS_MAX`).
+const HOSTFDS_MAX: usize = crate::trap::PPOLL_FDS_MAX as usize / 2;
+
 impl HostFds {
+    /// The entries in use under the bound in force: 16 under the core's (8: one idle wait
+    /// doesn't watch them all, the executor's own polls do), half of a larger one (the network
+    /// plugin's: a server's sockets, each watched by the idle wait itself).
+    fn active(&self) -> &[Cell<(i32, i16)>] {
+        let b = crate::trap::ppoll_bound();
+        &self.0[..if b <= crate::trap::PPOLL_FDS as usize { 16 } else { b / 2 }]
+    }
+
     fn each(&self) -> impl Iterator<Item = (i32, i16)> + '_ {
-        self.0.iter().map(Cell::get).filter(|x| x.1 != 0)
+        self.active().iter().map(Cell::get).filter(|x| x.1 != 0)
     }
     fn is_empty(&self) -> bool {
         self.each().next().is_none()
@@ -481,7 +492,7 @@ impl Future for FdReady {
 /// A passed fd the guest polls whose host fd isn't ready: watched until it is, then the kernel
 /// is told (`tsi`'s `hostfd_poll`).
 pub fn watch_hostfd(fd: i32, events: i16) {
-    let h = &HOSTFDS.0;
+    let h = HOSTFDS.active();
     match h.iter().find(|x| x.get().1 != 0 && x.get().0 == fd).or_else(|| h.iter().find(|x| x.get().1 == 0)) {
         Some(x) => x.set((fd, x.get().1 | events)),
         None => return,
@@ -550,7 +561,7 @@ fn fd_fired(fd: i32, revents: i16) {
     }
     let mut fired = false;
     if let Ok(mut r) = E.hostfds_ready.try_borrow_mut() {
-        for x in &HOSTFDS.0 {
+        for x in HOSTFDS.active() {
             let (xfd, events) = x.get();
             if events != 0 && xfd == fd && events & any != 0 {
                 x.set((0, 0));
@@ -567,7 +578,10 @@ fn fd_fired(fd: i32, revents: i16) {
 
 /// Every watched fd, polled without waiting (the executor's turn, and [`busy_poll`]).
 fn poll_watches() {
-    let mut fds = [PollFd::default(); crate::trap::PPOLL_FDS as usize];
+    static FDS: crate::trap::PollBuf = crate::trap::PollBuf::new();
+    // SAFETY: only this function uses FDS, and it doesn't reenter itself (fd_fired wakes; it
+    // runs nothing).
+    let fds = unsafe { FDS.get() };
     loop {
         // In batches: more fds than one ppoll takes are polled in several.
         let all: Vec<(i32, i16)> = {

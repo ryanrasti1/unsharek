@@ -345,7 +345,7 @@ impl ByteStream for FdStream {
 /// A connection's stream for a forked process's socket: an fd connection served here.
 fn served(conn: Conn) -> Conn {
     match conn {
-        Conn::Fd(fd, c) => Conn::Stream(Box::pin(FdStream { fd, conn: Some(c) })),
+        Conn::Fd(fd, c) => Conn::Stream(Box::pin(FdStream { fd: crate::host::resolve_fd(fd), conn: Some(c) })),
         c => c,
     }
 }
@@ -426,6 +426,9 @@ async fn connect_task(sock: usize, pid: i32, proto: Proto, addr: SocketAddrV4, f
             done(sock, neg(e));
         }
         Some(Ok(Conn::Fd(fd, c))) => {
+            // The host's number now, marked so: a hook's fd from before lockdown may have moved,
+            // and one made after it may have taken a moved fd's old number (host::FRESH).
+            let fd = crate::host::resolve_fd(fd) | crate::host::FRESH;
             // SAFETY: a sock the kernel lent us, given back once (with the fd, or not taken).
             if kernel(|| unsafe { l::lkl_net_done_fd(sock as *mut c_void, fd as core::ffi::c_long) }) == 0 {
                 R.fds.borrow_mut().push((fd, c));
@@ -522,6 +525,8 @@ async fn listen_task(sock: usize, pid: i32, addr: SocketAddrV4, forwarded: bool)
         let a = sockaddr(peer);
         let stream = match conn {
             Conn::Fd(fd, c) => {
+                // As a connect's (connect_task): the host's number now, marked so.
+                let fd = crate::host::resolve_fd(fd) | crate::host::FRESH;
                 // SAFETY: the lent sock; the address is a sockaddr_in.
                 let r = kernel(|| unsafe {
                     l::lkl_net_accept_fd(sock as *mut c_void, a.as_ptr() as *const l::lkl_sockaddr, 16, fd as core::ffi::c_long)
@@ -573,7 +578,7 @@ pub unsafe extern "C" fn net_fd_close(fd: core::ffi::c_long) {
     // to end; this process's copy of the fd (the fork's) closed (a received fd: the close row's).
     if elsewhere() {
         forward(Fwd::FdClose { fd: fd as i32 });
-        let _ = crate::trap::close(fd as u32);
+        let _ = crate::trap::close(crate::host::host_number(fd as i32) as u32);
         return;
     }
     let c = {
@@ -623,6 +628,7 @@ fn ready(obj: usize) {
 /// # Safety
 /// A host op: called by the kernel, with its pointers valid for the call.
 pub unsafe extern "C" fn hostfd_poll(fd: c_int, events: c_uint) -> c_uint {
+    let fd = crate::host::host_number(fd);
     let events = events as i16 & (executor::POLLIN | executor::POLLOUT);
     let ready = executor::fd_ready(fd, events);
     if ready & events != events && executor::installed() {

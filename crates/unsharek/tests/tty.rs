@@ -97,7 +97,7 @@ fn bash() -> String {
 
 #[test]
 fn interactive_bash_on_a_guest_pty() {
-    let (m, pid) = spawn(&["--mode", "fork", "--closure", &bash(), "--", &bash(), "--norc", "-i"]);
+    let (m, pid) = spawn(&["--mode", "fork", "--mount", &format!("{}:closure", bash()), "--", &bash(), "--norc", "-i"]);
     let mut out = vec![];
     let t = Duration::from_secs(5);
     assert!(wait_for(&m, &mut out, "# ", t), "no prompt: {}", String::from_utf8_lossy(&out));
@@ -120,9 +120,9 @@ fn interactive_bash_on_a_guest_pty() {
 }
 
 /// The network from the interactive shell: on a terminal the program is a child of the pty's init
-/// (src/pty_init.c), and a forked process had no network (the provider's fds are init's process's):
-/// a typed command's connect was ENETUNREACH. Forwarded to init's executor now, it echoes through
-/// the provider (`--net all`) to a host server.
+/// (src/pty_init.c), and a forked process had no network (a host socket is init's process's): a
+/// typed command's connect was ENETUNREACH. Forwarded to init's executor now, it echoes through the
+/// host's own network (`--net host`) to a host server.
 #[test]
 fn interactive_shell_has_the_network() {
     use std::io::{Read, Write};
@@ -148,7 +148,8 @@ fn interactive_shell_has_the_network() {
     });
     let bin_dir = unsharek_fixtures::bin_dir().display().to_string();
     let (m, pid) = spawn(&[
-        "--mode", "fork", "--net", "all", "--ro", &bin_dir, "--closure", &bin_dir, "--closure", &bash(), "--", &bash(), "--norc", "-i",
+        "--mode", "fork", "--net", "host", "--mount", &format!("{bin_dir}:ro"), "--mount", &format!("{bin_dir}:closure"),
+        "--mount", &format!("{}:closure", bash()), "--", &bash(), "--norc", "-i",
     ]);
     let mut out = vec![];
     let t = Duration::from_secs(5);
@@ -165,7 +166,7 @@ fn interactive_shell_has_the_network() {
 /// isn't on a terminal is as ever: no pty (the suite's cases, whose stdin is a pipe or /dev/null).
 #[test]
 fn terminal_settings_restored() {
-    let script = "stty -g > /dev/null; before=$(stty -g); X --mode fork --closure B -- B -c 'exit 3'; s=$?; after=$(stty -g); \
+    let script = "stty -g > /dev/null; before=$(stty -g); X --mode fork --mount B:closure -- B -c 'exit 3'; s=$?; after=$(stty -g); \
                   [ \"$before\" = \"$after\" ] && echo SAME-$s || echo DIFFERENT-$s";
     let script = script.replace('X', env!("CARGO_BIN_EXE_unsharek")).replace('B', &bash());
     let (m, pid) = spawn_host_shell(&script);

@@ -248,6 +248,20 @@ pub fn set_init_pidfd(fd: i32) {
     LOCAL.init_pidfd.store(fd, Ordering::Relaxed);
 }
 
+/// Before lockdown, after the caller moved the kept fds to `0..n` ([`crate::guest::moved`]): the
+/// CPU tokens' and init's pidfd's new numbers.
+pub fn moved(new: impl Fn(i32) -> i32) {
+    for h in &PAR.slots {
+        if h.efd.get() != u32::MAX {
+            h.efd.set(new(h.efd.get() as i32) as u32);
+        }
+    }
+    let p = LOCAL.init_pidfd.load(Ordering::Relaxed);
+    if p >= 0 {
+        LOCAL.init_pidfd.store(new(p), Ordering::Relaxed);
+    }
+}
+
 /// A fork's child process, at its start: its number.
 pub fn become_child(id: u32) {
     LOCAL.id.store(id, Ordering::Relaxed);
@@ -534,11 +548,13 @@ fn sched_loop(arg: usize) -> usize {
         // executor's ([`host::idle_fds`]); a program busy enough that it never idles has them
         // looked at between hand-offs, at most once a millisecond (as coroutine mode's
         // `executor::busy_poll`).
-        let mut fds = [PollFd::default(); crate::trap::PPOLL_FDS as usize];
+        static FDS: crate::trap::PollBuf = crate::trap::PollBuf::new();
+        // SAFETY: only the kernel/idler thread runs this, one turn at a time, and only it uses FDS.
+        let fds = unsafe { FDS.get() };
         if idle_watching() && s.now().saturating_sub(LAST_LOOK.0.get()) >= BUSY_LOOK_NS {
             // (a wake makes a coroutine runnable: the hand-off below runs it)
             LAST_LOOK.0.set(s.now());
-            let n = crate::host::idle_fds(&mut fds);
+            let n = crate::host::idle_fds(fds);
             let zero = Timespec { tv_sec: 0, tv_nsec: 0 };
             if n > 0 && trap::ppoll_fds(&mut fds[..n], Some(&zero)).is_ok_and(|r| r > 0) {
                 crate::host::idle_ready(&fds[..n]);

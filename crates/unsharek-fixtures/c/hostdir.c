@@ -1,11 +1,11 @@
-// A host directory served live (the CLI's --ro DIR and --rw DIR: virtio-fs, unsharek-fs-server).
-// `hostdir <op> <path> [<path>]`, each op ending in HOSTDIR_OK:
-//   write DIR       (--rw DIR) create, rename, mkdir, symlink, hard link, truncate, chmod,
-//                   unlink, rmdir: each seen back; then DIR/created-by-the-program, the suite's
-//                   marker, checked on the host
-//   ro FILE         (FILE in a --ro directory) every change refused: an O_WRONLY or O_TRUNC
+// A host directory served live (the CLI's `--mount DIR:ro` and `DIR:rw`: virtio-fs, served in
+// process by unsharek-fs's passthrough). `hostdir <op> <path> [<path>]`, each op ending in HOSTDIR_OK:
+//   write DIR       (an rw mount) create, rename, mkdir, symlink, truncate, chmod, unlink, rmdir:
+//                   each seen back, and a hard link refused (EPERM: the fs plugin has no linkat
+//                   row); then DIR/created-by-the-program, the suite's marker, checked on the host
+//   ro FILE         (FILE in an ro mount) every change refused: an O_WRONLY or O_TRUNC
 //                   open, a create, mkdir, unlink, rename, truncate, chmod, a symlink and a link
-//   escape DIR OUT  (--rw DIR; OUT a host file outside it) a symlink and a hard link to OUT from
+//   escape DIR OUT  (an rw mount; OUT a host file outside it) a symlink and a hard link to OUT from
 //                   inside DIR don't reach it: the guest resolves the link in its own tree, where
 //                   OUT isn't
 //   big DIR         a 16 MiB file written in odd-sized pieces and read back, checked
@@ -51,12 +51,18 @@ static void op_write(const char *dir)
 	CHECK(mkdir(sub, 0755) == 0, "mkdir: %s", strerror(errno));
 	CHECK(symlink("b", s) == 0, "symlink: %s", strerror(errno));
 	CHECK(readlink(s, buf, sizeof buf) == 1 && buf[0] == 'b', "readlink");
-	CHECK(link(b, h) == 0, "link: %s", strerror(errno));
+	// Natively a hard link is made (and removed); in the sandbox it is refused.
+	const char *mode = getenv("UNSHAREK_TEST_MODE");
+	int native = mode && !strcmp(mode, "native");
+	int l = link(b, h);
+	CHECK(native ? l == 0 : l < 0 && errno == EPERM, "link: %d, %s", l, strerror(errno));
+	if (native)
+		CHECK(unlink(h) == 0, "unlink the hard link: %s", strerror(errno));
 	struct stat st;
-	CHECK(stat(b, &st) == 0 && st.st_nlink == 2, "nlink %ld", (long)st.st_nlink);
+	CHECK(stat(b, &st) == 0 && st.st_nlink == 1, "nlink %ld", (long)st.st_nlink);
 	CHECK(truncate(b, 4) == 0 && stat(b, &st) == 0 && st.st_size == 4, "truncate");
 	CHECK(chmod(b, 0600) == 0 && stat(b, &st) == 0 && (st.st_mode & 0777) == 0600, "chmod");
-	CHECK(unlink(s) == 0 && unlink(h) == 0 && unlink(b) == 0, "unlink: %s", strerror(errno));
+	CHECK(unlink(s) == 0 && unlink(b) == 0, "unlink: %s", strerror(errno));
 	CHECK(rmdir(sub) == 0, "rmdir: %s", strerror(errno));
 	CHECK(access(b, F_OK) != 0, "b still there");
 	path(a, dir, "created-by-the-program");

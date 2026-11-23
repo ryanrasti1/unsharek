@@ -196,7 +196,9 @@ fn write_file(path: &CStr, mut data: &[u8]) -> io::Result<()> {
 /// `unsharek::Guest::pass_fd` does this, and its lockdown grants the host fd,
 /// which calling this alone doesn't.
 pub fn host_fd(host: RawFd, guest: RawFd) -> io::Result<()> {
-    let fd = sys(l::__lkl__NR_host_fd, [host as usize, libc::O_RDWR as usize, 0, 0, 0, 0])?;
+    // Marked as made before lockdown (unsharek-rt's `host::KEPT`): the caller may move the host fd
+    // to `0..n` before lockdown, and the mark says to look its new number up.
+    let fd = sys(l::__lkl__NR_host_fd, [(host | unsharek_rt::host::KEPT) as usize, libc::O_RDWR as usize, 0, 0, 0, 0])?;
     if fd != guest as usize {
         let r = sys(l::__lkl__NR_dup3, [fd, guest as usize, 0, 0, 0, 0]);
         close(fd);

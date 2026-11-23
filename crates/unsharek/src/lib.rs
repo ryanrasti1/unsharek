@@ -38,8 +38,8 @@ pub mod alloc;
 mod image;
 mod memory;
 pub mod hostfs;
+pub mod hostnet;
 pub mod net;
-pub mod provider;
 pub mod pty;
 pub mod setup;
 pub mod store;
@@ -47,7 +47,48 @@ pub mod store;
 pub use unsharek_tcb as tcb;
 /// Lockdown, unsharek-tcb's own: re-exported, not wrapped. It uses its config and nothing else; the
 /// guest's part of it is [`Guest::configure_sandbox`]'s.
-pub use unsharek_tcb::{Config as SandboxConfig, lockdown};
+pub use unsharek_tcb::{Plugin, plugin};
+
+/// unsharek-tcb's lockdown of `c` ([`Guest::configure_sandbox`]'s), without plugins.
+pub fn lockdown(c: unsharek_tcb::Config) -> Result<(), unsharek_tcb::Error> {
+    lockdown_with(c, &[])
+}
+
+/// [`lockdown`], with `plugins` (experimental: [`plugin`]).
+pub fn lockdown_with(c: unsharek_tcb::Config, plugins: &[&dyn Plugin]) -> Result<(), unsharek_tcb::Error> {
+    unsharek_tcb::lockdown(c, plugins)?;
+    LOCKED.store(true, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
+/// The process locked down ([`lockdown`] succeeded): [`Guest::run`]'s closure is the program.
+static LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The caller's part of the sandbox's config: the host fds it grants the program (read and write,
+/// as their own modes allow), before [`Guest::configure_sandbox`] adds the guest's own and puts
+/// them all at `0..n` for unsharek-tcb's lockdown.
+#[derive(Clone, Debug, Default)]
+pub struct SandboxConfig {
+    grants: Vec<RawFd>,
+}
+
+impl SandboxConfig {
+    /// Nothing granted.
+    pub fn new() -> Self {
+        SandboxConfig::default()
+    }
+
+    /// Grant `fds` (fds 0-2 like any other: none is by default).
+    pub fn grant(mut self, fds: impl IntoIterator<Item = RawFd>) -> Self {
+        self.grants.extend(fds);
+        self
+    }
+
+    /// `f(self)`: a step of the caller's in the chain (`.pipe(|c| guest.configure_sandbox(c))?`).
+    pub fn pipe<T>(self, f: impl FnOnce(Self) -> T) -> T {
+        f(self)
+    }
+}
 pub use image::Image;
 pub use net::{Cx, GuestSocket, HeldFd, NetError, OnConnect, OnListen, Proto};
 /// How the sandbox runs the program's threads and processes. Each mode's host allowlist is a
@@ -92,7 +133,7 @@ pub enum Error {
     #[error("lockdown: {0}")]
     Lockdown(#[from] tcb::Error),
     /// The program's path is in nothing the guest is shown ([`run_with`]).
-    #[error("{}: the program isn't in the sandbox: add --closure <its store path> or --system", .0.display())]
+    #[error("{}: the program isn't in the sandbox: add --mount <its store path>:closure, or --system", .0.display())]
     ProgramNotInSandbox(PathBuf),
     /// Other host threads at lockdown (the guest's check, before the TCB's own).
     #[error("{0}")]
@@ -756,7 +797,7 @@ impl Guest {
     pub fn run<R: 'static>(&mut self, f: impl FnOnce() -> R) -> Result<R, Error> {
         // After `configure_sandbox` (setup's last step) a setup run would hang on the routing it
         // turned off: an error instead, below.
-        if tcb::locked_down() {
+        if LOCKED.load(std::sync::atomic::Ordering::SeqCst) {
             self.link.start()?;
             guest::run_fn(move || status(f()));
         }
@@ -777,14 +818,34 @@ impl Guest {
     /// fds as grants. Untrusted code before lockdown, as all of this crate is: lockdown checks what
     /// it leaves behind. After it no setup [`Guest::run`] works ([`Error::NotLockedDown`]): call
     /// [`lockdown`] next.
-    pub fn configure_sandbox(&mut self, c: SandboxConfig) -> Result<SandboxConfig, Error> {
+    pub fn configure_sandbox(&mut self, c: SandboxConfig) -> Result<unsharek_tcb::Config, Error> {
         self.own()?;
         self.link.prepare()?;
         let st = self.link.st.borrow();
-        Ok(c.mode(self.link.mode)
-            .guest_fds(st.host_fds.iter().copied())
-            .gate(unsharek_rt::trap::gate_ip())
-            .grant(st.passed.iter().chain(&st.held).copied()))
+        // The kept fds: the grants, the passed and held ones, and the guest's own (the CPU tokens,
+        // init's pidfd, each declared its kind). Lockdown takes them only at 0..n, contiguous:
+        // they are moved there (those already below n stay), and the runtime told their numbers.
+        let tokens: Vec<RawFd> = st.host_fds.iter().copied().filter(|&fd| fd_link(fd) == "anon_inode:[eventfd]").collect();
+        let pidfds: Vec<RawFd> = st.host_fds.iter().copied().filter(|&fd| fd_link(fd) == "anon_inode:[pidfd]").collect();
+        let plain: Vec<RawFd> = c.grants.iter().chain(&st.passed).chain(&st.held).copied().collect();
+        let mut keep: Vec<RawFd> = plain.iter().chain(&tokens).chain(&pidfds).copied().collect();
+        keep.sort_unstable();
+        keep.dedup();
+        // The host directories' cached fds closed first: one may sit at a number a kept fd moves
+        // to (the next request opens again, above the floor).
+        unsharek_fs::passthrough::close_cached();
+        let map = to_floor(&keep)?;
+        unsharek_rt::guest::moved(&map).map_err(Error::Guest)?;
+        let new = |fd: &RawFd| map.iter().find(|m| m.0 == *fd).map_or(*fd, |m| m.1);
+        // How the runtime writes them, looked at again at their new numbers.
+        let mut plumbing: Vec<RawFd> = (0..3).collect();
+        plumbing.extend(st.passed.iter().chain(&st.held).map(new));
+        unsharek_rt::host::note_host_fds(&plumbing);
+        Ok(unsharek_tcb::Config::new(unsharek_rt::trap::gate_ip())
+            .mode(self.link.mode)
+            .grant(plain.iter().map(new))
+            .grant_as(unsharek_tcb::Kind::Eventfd, tokens.iter().map(new))
+            .grant_as(unsharek_tcb::Kind::Pidfd, pidfds.iter().map(new)))
     }
 
     /// A host fork of the guest's process, before lockdown: a template's instance. The child is a
@@ -916,7 +977,7 @@ pub fn wait(pid: u32) -> std::io::Result<std::process::ExitStatus> {
 #[derive(Clone, Debug, Default)]
 pub struct Config {
     pub mode: Mode,
-    /// What the guest is shown of the store, read-only (the CLI's `--closure`): a store path (or a
+    /// What the guest is shown of the store, read-only (the CLI's `--mount …:closure`): a store path (or a
     /// path in one) brings its closure; a host directory, the closures of the store paths its
     /// files reference (the directory itself is `host_dirs`' to show). Nothing implicit: not even
     /// the program's own.
@@ -934,21 +995,22 @@ pub struct Config {
     pub immutable: Vec<Immutable>,
     /// Where store images are cached; None: [`store::Cache::default_dir`].
     pub image_cache: Option<PathBuf>,
-    /// Host directories served live, through virtio-fs ([`hostfs`]): each a server's socket (the
-    /// CLI's `--ro` and `--rw`, `unsharek-fs-server`), mounted at its guest path.
+    /// Host directories served live, through virtio-fs ([`hostfs`]: in this process, by the host's
+    /// file calls), each mounted at its guest path. The caller passes unsharek-tcb's
+    /// `plugin::Files` with them as its roots to [`run_with`] (the CLI's `--mount …:ro|rw`).
     pub host_dirs: Vec<HostDir>,
     /// Fork mode: the program on a terminal of the guest's own, of this size ([`pty`]), for a
     /// caller whose stdin is a terminal; `None`: the host's stdio as it is.
     pub tty: Option<pty::Size>,
 }
 
-/// A host directory served to the guest by a server on the other end of `fd` (a unix stream:
-/// unsharek-fs's `wire`), mounted at `at`. The fd is the caller's, open until the program ends
-/// (the caller grants it: [`run_with`]'s `grants`).
+/// A host directory (absolute and canonical) served live to the guest, mounted at `at`,
+/// read-write if `writable` ([`hostfs`]).
 #[derive(Clone, Debug)]
 pub struct HostDir {
-    pub fd: RawFd,
+    pub dir: PathBuf,
     pub at: PathBuf,
+    pub writable: bool,
 }
 
 /// A host directory shown read-only at `at` without a copy ([`Config::immutable`]).
@@ -979,16 +1041,18 @@ pub fn store(config: &Config) -> Result<store::Store, Error> {
 /// (fds 0-2), the program [`execve`]d in [`Guest::run`]. Returns only on failure before the
 /// program starts; the process ends with the program's status.
 pub fn run(config: Config) -> Result<Infallible, Error> {
-    run_with(config, |_| Ok(()), |c| c)
+    run_with(config, |_| Ok(()), |c| c, &[])
 }
 
-/// [`run`], with the caller's two additions: `prepare`, on the booted guest before setup (hooks,
-/// held fds: a plugin's), and `grants`, on the sandbox's config after stdio's (the fds `config`'s
-/// host directories use, a plugin's control socket). Nothing here knows a plugin.
+/// [`run`], with the caller's two additions: `prepare`, on the booted guest before setup (hooks:
+/// a plugin's, [`hostnet::install`]), and `grants`, on the sandbox's config after stdio's; and
+/// `plugins`, unsharek-tcb's, passed to lockdown as they are (`plugin::Files` for `config`'s host
+/// directories, `plugin::Net` for [`hostnet`]'s calls).
 pub fn run_with(
     config: Config,
     prepare: impl FnOnce(&mut Guest) -> Result<(), Error>,
     grants: impl FnOnce(SandboxConfig) -> SandboxConfig,
+    plugins: &[&dyn Plugin],
 ) -> Result<Infallible, Error> {
     let store = store(&config)?;
     let mut g = Guest::boot(GuestConfig { mode: config.mode, max_procs: config.max_procs.unwrap_or(0), ..Default::default() })?;
@@ -1003,7 +1067,7 @@ pub fn run_with(
     }
     argv[0] = program.into_os_string();
     for (i, d) in config.host_dirs.iter().enumerate() {
-        hostfs::add(&format!("host{i}"), d.fd).map_err(Error::io("a host directory's device"))?;
+        hostfs::add(&format!("host{i}"), &d.dir, d.writable, config.mode == Mode::Fork).map_err(Error::io(format!("{}'s device", d.dir.display())))?;
     }
     prepare(&mut g)?;
     let dirs: Vec<PathBuf> = config.host_dirs.iter().map(|d| d.at.clone()).collect();
@@ -1023,7 +1087,7 @@ pub fn run_with(
         Ok(())
     })??;
     let c = grants(SandboxConfig::new().grant([0, 1, 2])).pipe(|c| g.configure_sandbox(c))?;
-    lockdown(c)?;
+    lockdown_with(c, plugins)?;
     let env = config.env;
     // After lockdown the closure is the program: this returns only if the run itself failed.
     match g.run(move || execve(&argv, &env)) {
@@ -1042,5 +1106,37 @@ mod tests {
     fn the_runtimes_shapes() {
         assert_eq!(tcb::CLONE_THREAD_FLAGS, unsharek_rt::trap::CLONE_HOST_THREAD);
         assert_eq!(tcb::PPOLL_FDS, unsharek_rt::trap::PPOLL_FDS);
+        assert_eq!(tcb::plugin::Net::PPOLL_FDS, unsharek_rt::trap::PPOLL_FDS_MAX);
     }
+}
+
+/// `fd`'s `/proc/self/fd` link (empty if it has none).
+fn fd_link(fd: RawFd) -> String {
+    std::fs::read_link(format!("/proc/self/fd/{fd}")).map(|l| l.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// The kept fds (`keep`, sorted, distinct) moved to `0..n`, lockdown's rule: those below `n` stay,
+/// the others go to the free numbers below it, lowest first, each `dup3`'d there, close-on-exec as
+/// it was (whatever stray fd held the number is replaced; lockdown closes the old numbers, at or
+/// above `n`). Returns (old, new) for each kept fd. Untrusted, as all of this crate: lockdown
+/// checks what it leaves.
+fn to_floor(keep: &[RawFd]) -> Result<Vec<(RawFd, RawFd)>, Error> {
+    let n = keep.len() as RawFd;
+    let mut free = (0..n).filter(|fd| keep.binary_search(fd).is_err());
+    let mut map = Vec::with_capacity(keep.len());
+    for &fd in keep {
+        // SAFETY: fcntl on this process's fd.
+        let fl = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        // A kept fd that isn't open stays where it is: lockdown refuses it.
+        let new = if fd < n || fl < 0 { fd } else { free.next().expect("as many free numbers below n as kept fds above it") };
+        if new != fd {
+            let cloexec = if fl & libc::FD_CLOEXEC != 0 { libc::O_CLOEXEC } else { 0 };
+            // SAFETY: dup3 on this process's fds; `new` isn't a kept one.
+            if unsafe { libc::dup3(fd, new, cloexec) } != new {
+                return Err(Error::io(format!("moving kept fd {fd} to {new}"))(std::io::Error::last_os_error()));
+            }
+        }
+        map.push((fd, new));
+    }
+    Ok(map)
 }

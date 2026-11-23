@@ -93,6 +93,10 @@
         UNSHAREK_TEST_HTTPBIN = "${tp.httpbin}/bin/go-httpbin";
         UNSHAREK_TEST_BUSYBOX = "${tp.busybox}/bin/busybox";
         UNSHAREK_GLIBC_STATIC = "${pkgs.glibc.static}/lib";
+        # An outer jail for unsharek (crates/unsharek/tests/jails.rs, examples/bwrap)
+        UNSHAREK_TEST_BWRAP = "${pkgs.bubblewrap}/bin/bwrap";
+        # `cargo xtask calls`: mainline Linux's syscall table and definitions (nix/linux-syscalls.nix).
+        UNSHAREK_LINUX_SYSCALLS = "${import ./nix/linux-syscalls.nix { inherit pkgs; }}";
       };
     };
 }

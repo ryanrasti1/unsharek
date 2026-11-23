@@ -658,19 +658,34 @@ unsafe extern "C" fn memmove(d: *mut c_void, s: *const c_void, n: c_ulong) -> *m
 /// which wakes the waiter. In the shared section: a forked process's threads wait here too.
 /// Touched only with the CPU token held (coroutine mode: always).
 #[unsafe(link_section = "unsharek_shared")]
-static FD_WAITS: FdWaits = FdWaits([const { Cell::new((0, 0, 0)) }; FD_WAITERS]);
-struct FdWaits([Cell<(i32, i16, u64)>; FD_WAITERS]);
+static FD_WAITS: FdWaits = FdWaits([const { Cell::new((0, 0, 0)) }; FD_WAITERS_MAX]);
+struct FdWaits([Cell<(i32, i16, u64)>; FD_WAITERS_MAX]);
 // SAFETY: as the pools'.
 unsafe impl Sync for FdWaits {}
-/// Waiters the idle wait watches at once (of its `PPOLL_FDS`: the others are the hooks' fds and
-/// the threaded idler's eventfd). One past them is woken by its deadline alone.
-const FD_WAITERS: usize = 4;
+
+impl FdWaits {
+    /// The entries in use under the bound in force ([`fd_waiters`]).
+    fn active(&self) -> &[Cell<(i32, i16, u64)>] {
+        &self.0[..fd_waiters()]
+    }
+}
+
+/// The table's size: a quarter of the largest poll any row allows (`trap::PPOLL_FDS_MAX`).
+const FD_WAITERS_MAX: usize = crate::trap::PPOLL_FDS_MAX as usize / 4;
+
+/// Waiters the idle wait watches at once: 4 of the core's 8 pollfds (the others are the hooks'
+/// fds and the threaded idler's eventfd); with the network plugin's larger bound a quarter of it
+/// (the executor's watched host fds take half). One past them is woken by its deadline alone.
+fn fd_waiters() -> usize {
+    let b = crate::trap::ppoll_bound();
+    if b <= crate::trap::PPOLL_FDS as usize { 4 } else { b / 4 }
+}
 
 const POLLIN: i16 = 1;
 const POLLOUT: i16 = 4;
 /// How long a waiting coroutine waits before looking again itself, the fd ready or not (the idle
 /// wait may not be watching it: the program keeps the CPU busy and idle doesn't run, or there are
-/// more waiters than [`FD_WAITERS`]). With nothing done yet the call is then restarted.
+/// more waiters than [`fd_waiters`]). With nothing done yet the call is then restarted.
 const FD_REPOLL_NS: u64 = 5_000_000;
 
 /// The most of a write to a host fd that may block given to one write(2): a pipe that polls
@@ -684,6 +699,61 @@ const PIPE_BUF: usize = 4096;
 /// time, each piece after a poll says it is writable: the host's write(2) never waits. Set before
 /// the first fork, then only read (each process has its copy).
 static WHOLE: [AtomicI32; 16] = [const { AtomicI32::new(-1) }; 16];
+
+/// The host fds the caller moved before lockdown (unsharek's `configure_sandbox`: the kept fds
+/// at `0..n`, which lockdown requires), (old, new): a guest file made by `host_fd` before keeps
+/// its old number, which [`host_number`] turns into the new one. Set once, before lockdown.
+/// Every fd made after lockdown is at or above `n`, and so may take an old number again (the fs
+/// and net plugins' fds): so only a number marked [`KEPT`] is looked up here, never a plain one.
+static MOVED: [(AtomicI32, AtomicI32); 32] = [const { (AtomicI32::new(-1), AtomicI32::new(-1)) }; 32];
+
+/// Record the caller's moves ([`MOVED`]); false if there are more than it holds.
+pub fn moved(map: &[(i32, i32)]) -> bool {
+    let mut slots = MOVED.iter();
+    for &(o, n) in map.iter().filter(|(o, n)| o != n) {
+        let Some(slot) = slots.next() else { return false };
+        slot.0.store(o, Ordering::Relaxed);
+        slot.1.store(n, Ordering::Relaxed);
+    }
+    for slot in slots {
+        slot.0.store(-1, Ordering::Relaxed);
+    }
+    true
+}
+
+/// The mark on a guest file's host fd number made before lockdown (setup's `host_fd`): its
+/// number then, which [`host_number`] translates by [`MOVED`]. A host fd the kernel is given
+/// after lockdown (a plugin's socket) carries no mark, and is used as it is.
+pub const KEPT: i32 = 1 << 24;
+
+/// The mark on a host fd number that is already the host's own now ([`resolve_fd`]'s): a socket a
+/// plugin made after lockdown (unsharek's `hostnet`), never looked up in [`MOVED`].
+pub const FRESH: i32 = 1 << 25;
+
+/// A guest file's host fd as the host numbers it now: a [`KEPT`] one moved by the caller
+/// ([`MOVED`]), a [`FRESH`] one as it is, any other (fds 0-2) as it is.
+pub fn host_number(fd: i32) -> i32 {
+    if fd & FRESH != 0 {
+        fd & !FRESH
+    } else if fd & KEPT != 0 {
+        moved_number(fd & !KEPT)
+    } else {
+        fd
+    }
+}
+
+/// A hook's host fd for a connection (`tsi`'s `Conn::Fd`) as the host numbers it now: a
+/// [`FRESH`] one (made after lockdown, whose number may be one a kept fd had before it moved) as
+/// it is; any other is a hook's fd from before lockdown, which the caller may have moved
+/// ([`MOVED`]). The kernel is given it marked [`FRESH`]: resolved once, here.
+pub fn resolve_fd(fd: i32) -> i32 {
+    if fd & FRESH != 0 { fd & !FRESH } else { moved_number(fd & !KEPT) }
+}
+
+/// A host fd kept from before lockdown (a guest file's, a held one's) as the host numbers it now.
+pub fn moved_number(fd: i32) -> i32 {
+    MOVED.iter().find(|m| m.0.load(Ordering::Relaxed) == fd).map_or(fd, |m| m.1.load(Ordering::Relaxed))
+}
 
 /// Before lockdown: look at the host fds the guest's files are made of (fds 0-2, passed fds), for
 /// how [`hostfd_rw`] writes them (`fstat`: after lockdown the filter allows none).
@@ -716,14 +786,14 @@ fn written_whole(fd: i32) -> bool {
 /// Whether a coroutine waits on a host fd: threaded mode's idler is then handed the CPU token to
 /// watch it (`par`'s `give`), as for a timer.
 pub fn fd_waiting() -> bool {
-    FD_WAITS.0.iter().any(|w| w.get().2 != 0)
+    FD_WAITS.active().iter().any(|w| w.get().2 != 0)
 }
 
 /// The fds the idle wait watches, into `out` (as many as fit): the host fds coroutines wait on,
 /// then the hooks' executor's (`executor::idle_fds`). Returns how many.
 pub fn idle_fds(out: &mut [crate::trap::PollFd]) -> usize {
     let mut n = 0;
-    for w in &FD_WAITS.0 {
+    for w in FD_WAITS.active() {
         let (fd, events, tid) = w.get();
         if tid == 0 {
             continue;
@@ -741,7 +811,7 @@ pub fn idle_fds(out: &mut [crate::trap::PollFd]) -> usize {
 /// The idle wait's results for the fds [`idle_fds`] gave: whoever waits on a ready one is woken
 /// (a host fd's waiter, to look again; the executor's tasks and passed fds, its own way).
 pub fn idle_ready(fds: &[crate::trap::PollFd]) {
-    for w in &FD_WAITS.0 {
+    for w in FD_WAITS.active() {
         let (fd, _, tid) = w.get();
         if tid != 0 && fds.iter().any(|p| p.fd == fd && p.revents != 0) {
             sched().wake(Tid::from_raw(tid));
@@ -764,7 +834,7 @@ fn wait_fd(fd: i32, events: i16) {
     let s = sched();
     let deadline = s.now().saturating_add(FD_REPOLL_NS);
     s.set_interruptible(true);
-    let entry = FD_WAITS.0.iter().find(|w| w.get().2 == 0);
+    let entry = FD_WAITS.active().iter().find(|w| w.get().2 == 0);
     if let Some(w) = entry {
         w.set((fd, events, s.current().raw()));
     }
@@ -810,6 +880,7 @@ fn wait_fd(fd: i32, events: i16) {
 /// runs the call again, back here. (The kernel-side fix would be hostfd.c waiting interruptibly
 /// and the host op being told to give up: see the item-8 notes in `guest`.)
 unsafe extern "C" fn hostfd_rw(fd: c_int, buf: *mut c_void, len: c_ulong, flags: c_int) -> core::ffi::c_long {
+    let fd = host_number(fd);
     let write = flags & HOSTFD_WRITE != 0;
     let nonblock = flags & HOSTFD_NONBLOCK != 0;
     let events = if write { POLLOUT } else { POLLIN };
@@ -913,8 +984,10 @@ impl Host for SysHost {
         // Through the gate (the filter's one wait; rustix's poll would trap in setup and after
         // lockdown), watching the host fds coroutines wait for and the fds the hooks'
         // executor waits on ([`idle_fds`]). EINTR (a signal) is a wake-up like any other.
-        let mut fds = [crate::trap::PollFd::default(); crate::trap::PPOLL_FDS as usize];
-        let n = idle_fds(&mut fds);
+        static FDS: crate::trap::PollBuf = crate::trap::PollBuf::new();
+        // SAFETY: the idle wait isn't reentered (it runs no coroutine), and only it uses FDS.
+        let fds = unsafe { FDS.get() };
+        let n = idle_fds(fds);
         if let Ok(ready) = crate::trap::ppoll_fds(&mut fds[..n], ts.as_ref())
             && ready > 0
         {
@@ -1280,55 +1353,12 @@ pub fn trigger_irq(irq: u32) {
     unsafe { lkl_sys::lkl_trigger_irq(irq as c_int) };
 }
 
-/// A host-backed device's round trip with its server (unsharek-fs's virtio-fs: `wire`'s framing,
-/// a `u32` length then the bytes, each way): `request` written to `fd`, the reply read into
-/// `reply` (a larger reply is read, dropped, and EIO). Through the gate (read and write on a granted fd: the filter's rows), and blocking:
-/// the guest's CPU waits for the server, as for a disk with no queue. EINTR (a host signal, fork
-/// mode's SIGCHLD) is retried; the server's end (EOF) is EIO.
-pub fn device_rpc(fd: i32, request: &[u8], reply: &mut [u8]) -> Result<usize, i32> {
-    use rustix::io::Errno;
-    let eio = Errno::IO.raw_os_error();
-    let write_all = |mut b: &[u8]| -> Result<(), i32> {
-        while !b.is_empty() {
-            match crate::trap::write(fd as u32, b) {
-                Ok(0) => return Err(eio),
-                Ok(k) => b = &b[k..],
-                Err(Errno::INTR) => {}
-                Err(e) => return Err(e.raw_os_error()),
-            }
-        }
-        Ok(())
-    };
-    let read_exact = |b: &mut [u8]| -> Result<(), i32> {
-        let mut got = 0;
-        while got < b.len() {
-            match crate::trap::read(fd as u32, &mut b[got..]) {
-                Ok(0) => return Err(eio),
-                Ok(k) => got += k,
-                Err(Errno::INTR) => {}
-                Err(e) => return Err(e.raw_os_error()),
-            }
-        }
-        Ok(())
-    };
-    write_all(&(request.len() as u32).to_le_bytes())?;
-    write_all(request)?;
-    let mut h = [0u8; 4];
-    read_exact(&mut h)?;
-    let n = u32::from_le_bytes(h) as usize;
-    if n > reply.len() {
-        // Read and dropped, so the next round trip starts at a header.
-        let mut left = n;
-        while left > 0 {
-            let k = left.min(reply.len());
-            if k == 0 {
-                return Err(eio);
-            }
-            read_exact(&mut reply[..k])?;
-            left -= k;
-        }
-        return Err(eio);
+/// A host-backed device's host call: a plugin's call through the gate (unsharek-tcb's fs rows),
+/// raw: `-errno` on failure.
+pub fn device_sys(nr: u32, a: [usize; 6]) -> isize {
+    // SAFETY: the device's own calls, on its own buffers (unsharek-fs's passthrough).
+    match unsafe { crate::trap::plugin_call(nr, a) } {
+        Ok(v) => v as isize,
+        Err(e) => -(e.raw_os_error() as isize),
     }
-    read_exact(&mut reply[..n])?;
-    Ok(n)
 }
