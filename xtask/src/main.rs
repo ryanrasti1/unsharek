@@ -2,17 +2,18 @@
 //! from the workspace's root inside the devshell (direnv's `.envrc`, or `nix develop -c`):
 //!
 //! - `test [nextest args]`: every test, incremental, seconds warm: the unit tests, the in-guest
-//!   tests (a sandbox per test) and the host-side suite, natively and in each mode; then
-//!   seccomp-fn's workspace, unless args picked tests. E.g. `-E 'test(/::fork$/)'` (one mode of
+//!   tests (a sandbox per test) and the host-side suite, natively and in each mode (seccomp-fn-verify's
+//!   among them: a member). E.g. `-E 'test(/::fork$/)'` (one mode of
 //!   the suite), `-E 'binary(guest_fork)'`, `-E 'test(/^escape/)'`, `--no-fail-fast`.
 //! - `perf [nextest args]`: the performance budgets (crates/unsharek/tests/perf.rs), release.
 //! - `test-docker`: unsharek in a Docker image (examples/docker/test.sh): under Docker's default
 //!   seccomp profile, a map, ro and ro --no-landlock mount and --net host; skipped without a
 //!   daemon.
-//! - `prove [kani args]`: Kani's proofs, each `policy!` harness (seccomp-fn's examples,
-//!   unsharek-tcb's filter, a harness per mode); minutes.
+//! - `prove [kani args]`: Kani's proofs: seccomp-fn-verify's (its compiler, proven once for every
+//!   tree, and the tree's lemmas) and unsharek-tcb's `tree_is_policy` (a harness per mode and
+//!   plugin choice); minutes.
 //! - `vs-native [args]`: each mode against native on build workloads (bench/quick.py).
-//! - `calls`: unsharek-tcb's typed syscall table (crates/unsharek-tcb/src/calls.rs) from mainline
+//! - `calls`: seccomp-fn-verify's typed syscall table (seccomp-fn-verify/src/calls.rs) from mainline
 //!   Linux's sources (calls.rs, nix/linux-syscalls.nix).
 //! - `stats [args]`: the headline numbers (memory, startup, a syscall, CPU) into bench/STATS.md
 //!   (bench/stats.py); minutes, on a quiet machine.
@@ -39,19 +40,16 @@ fn main() -> ExitCode {
     }
     let steps: Vec<Command> = match task.as_str() {
         "test" => {
-            let mut s = vec![cargo(&["nextest", "run", "--workspace", "--no-tests=warn"], &rest)];
-            // seccomp-fn, its own workspace (its fast checks, and run_bpf against the kernel)
-            if rest.is_empty() {
-                s.push(cargo(&["nextest", "run", "--manifest-path", "seccomp-fn/Cargo.toml", "--workspace", "--no-tests=warn"], &[]));
-            }
-            s
+            // (seccomp-fn, the macro, is its own workspace and repository: its tests are its own;
+            // here it is a path dependency, exercised by unsharek-tcb's.)
+            vec![cargo(&["nextest", "run", "--workspace", "--no-tests=warn"], &rest)]
         }
         // The budgets are release numbers, measured one at a time (nextest's perf profile).
         "perf" => vec![cargo(&["nextest", "run", "--workspace", "--no-tests=warn", "--profile", "perf", "--release"], &rest)],
         // -j: the harnesses in parallel (one per mode and shape; each a minute or two alone)
         "prove" => vec![
-            cargo(&["kani", "--manifest-path", "seccomp-fn/Cargo.toml", "-p", "seccomp-fn", "--tests", "-j", "--output-format=terse"], &rest),
-            cargo(&["kani", "-p", "unsharek-tcb", "-j", "--output-format=terse"], &rest),
+            cargo(&["kani", "-p", "seccomp-fn-verify", "-j", "2", "--output-format=terse", "--no-assertion-reach-checks"], &rest),
+            cargo(&["kani", "-p", "unsharek-tcb", "-j", "2", "--output-format=terse"], &rest),
         ],
         "test-docker" => vec![Command::new(root().join("examples/docker/test.sh"))],
         "vs-native" | "stats" => {

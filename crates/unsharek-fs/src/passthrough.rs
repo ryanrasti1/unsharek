@@ -61,15 +61,12 @@ const NR_UTIMENSAT: u32 = 280;
 const NR_RENAMEAT2: u32 = 316;
 
 const O_RDONLY: usize = 0;
-const O_WRONLY: usize = 1;
 const O_RDWR: usize = 2;
 const O_ACCMODE: u32 = 3;
 const O_CREAT: usize = 0o100;
 const O_EXCL: usize = 0o200;
 const O_TRUNC: usize = 0o1000;
 const O_NONBLOCK: usize = 0o4000;
-const O_DIRECTORY: usize = 0o200000;
-const O_NOFOLLOW: usize = 0o400000;
 const O_CLOEXEC: usize = 0o2000000;
 /// Every open's: never waits (a FIFO's, a device's), never inherited.
 const O_NB: usize = O_NONBLOCK | O_CLOEXEC;
@@ -522,12 +519,14 @@ fn openat(path: &[u8; PATH_MAX + 1], flags: usize, mode: u32) -> Result<i32, i32
     call(NR_OPENAT, [ABS_DIRFD, path.as_ptr() as usize, flags | O_NB, mode as usize, 0, 0]).map(|fd| fd as i32)
 }
 
-/// What an `Access` opens with (flags the filter's rows take).
+/// What an `Access` opens with: the filter's rows take `O_RDONLY` and, read-write, `O_RDWR`
+/// (each with `O_NONBLOCK | O_CLOEXEC`), nothing else: a write-only open is a read-write one (the
+/// guest keeps the program's own access mode), a truncation is `ftruncate`, an append is the
+/// guest's offset.
 fn flags(a: Access) -> usize {
     match a {
-        Access::Read => O_RDONLY | O_NOFOLLOW,
-        Access::Write => O_WRONLY,
-        Access::ReadWrite => O_RDWR,
+        Access::Read => O_RDONLY,
+        Access::Write | Access::ReadWrite => O_RDWR,
     }
 }
 
@@ -550,18 +549,16 @@ impl Root {
         Ok(fd)
     }
 
-    /// Node `id`'s attributes: `fstat` of an fd of it; a symlink's (which `O_NOFOLLOW` won't
-    /// open) made up from `readlinkat`'s length.
+    /// Node `id`'s attributes: a symlink's (`readlinkat` succeeds on one alone) made up from its
+    /// target's length; any other's, `fstat` of an fd of it. (No `O_NOFOLLOW` or `O_PATH`: no row
+    /// of the filter's takes them; an open follows a symlink, so a symlink is told first.)
     fn attr(&mut self, id: u64) -> Result<Attr, i32> {
-        match self.fd(id, Access::Read) {
-            Ok(fd) => fstat(fd).map(|s| Attr::of(&s)),
-            Err(ELOOP) => {
-                let p = scratch(PFD);
-                self.path(id, None, p)?;
-                let t = scratch(PT);
-                let n = call(NR_READLINKAT, [ABS_DIRFD, p.as_ptr() as usize, t.as_mut_ptr() as usize, t.len(), 0, 0])?;
-                Ok(Attr { ino: 0x8000_0000_0000_0000 | id, size: n as u64, mode: S_IFLNK | 0o777, nlink: 1, ..Attr::default() })
-            }
+        let p = scratch(PFD);
+        self.path(id, None, p)?;
+        let t = scratch(PT);
+        match call(NR_READLINKAT, [ABS_DIRFD, p.as_ptr() as usize, t.as_mut_ptr() as usize, t.len(), 0, 0]) {
+            Ok(n) => Ok(Attr { ino: 0x8000_0000_0000_0000 | id, size: n as u64, mode: S_IFLNK | 0o777, nlink: 1, ..Attr::default() }),
+            Err(EINVAL) => fstat(self.fd(id, Access::Read)?).map(|s| Attr::of(&s)),
             Err(e) => Err(e),
         }
     }
@@ -986,13 +983,21 @@ fn handle(r: &mut Root, op: u32, node: u64, rd: &mut Reader, w: &mut Writer) -> 
             let name = rd.name()?;
             let p = scratch(P0);
             r.path(node, Some(name), p)?;
+            // Made read-write whatever the program asked (the rows' only creating opens:
+            // `O_RDWR | O_CREAT`, with `O_EXCL` or not); `O_TRUNC` is an `ftruncate` after.
             let excl = if fl as usize & O_EXCL != 0 { O_EXCL } else { 0 };
-            let (access, base) = match fl & O_ACCMODE {
-                0 => (Access::Read, O_RDONLY),
-                1 => (Access::Write, O_WRONLY | if fl as usize & O_TRUNC != 0 && excl == 0 { O_TRUNC } else { 0 }),
-                _ => (Access::ReadWrite, O_RDWR | if fl as usize & O_TRUNC != 0 && excl == 0 { O_TRUNC } else { 0 }),
+            let access = match fl & O_ACCMODE {
+                0 => Access::Read,
+                1 => Access::Write,
+                _ => Access::ReadWrite,
             };
-            let fd = openat(p, base | O_CREAT | excl, mode & !umask & MODE_MAX)?;
+            let fd = openat(p, O_RDWR | O_CREAT | excl, mode & !umask & MODE_MAX)?;
+            if fl as usize & O_TRUNC != 0 && excl == 0
+                && let Err(e) = call(NR_FTRUNCATE, [fd as usize, 0, 0, 0, 0, 0])
+            {
+                close(fd);
+                return Err(e);
+            }
             let s = match fstat(fd) {
                 Ok(s) => s,
                 Err(e) => {
@@ -1003,8 +1008,7 @@ fn handle(r: &mut Root, op: u32, node: u64, rd: &mut Reader, w: &mut Writer) -> 
             let id = r.lookup(node as u32, name)?;
             let me = r as *const Root as usize;
             let generation = r.generation(id as u64);
-            // A read fd is O_NOFOLLOW's (the cache's Read kind): this one, opened without it, is
-            // only kept for writes.
+            // A read-only create's fd isn't kept (the cache's Read kind is `O_RDONLY`'s).
             if access == Access::Read {
                 close(fd);
             } else {
@@ -1101,7 +1105,8 @@ fn readdir(r: &mut Root, node: u64, rd: &mut Reader, w: &mut Writer) -> Result<(
         None => {
             let p = scratch(P0);
             r.path(node, None, p)?;
-            let fd = openat(p, O_RDONLY | O_DIRECTORY, 0)?;
+            // (No `O_DIRECTORY`: no row takes it; `getdents64` of a non-directory is ENOTDIR.)
+            let fd = openat(p, O_RDONLY, 0)?;
             // A free slot, or the first one's (closed).
             let i = cache.dirs.iter().position(Option::is_none).unwrap_or(0);
             if let Some(old) = cache.dirs[i].take() {

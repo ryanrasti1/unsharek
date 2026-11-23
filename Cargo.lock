@@ -513,7 +513,6 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "seccomp-fn"
 version = "0.0.0"
-source = "git+ssh://git@github.com/ryanrasti1/seccomp-fn.git?branch=structural-call#c187ba06f041e8ac37db23c022bb31951cd367fb"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -524,7 +523,6 @@ dependencies = [
 [[package]]
 name = "seccomp-fn-verify"
 version = "0.0.0"
-source = "git+ssh://git@github.com/ryanrasti1/seccomp-fn-verify.git?branch=structural-call#65cda212a373d2f811fdcfd532de82c8066a39be"
 dependencies = [
  "libc",
 ]

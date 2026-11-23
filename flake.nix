@@ -8,22 +8,23 @@
   # unsharek's side of it, in one commit.
   inputs.self.submodules = true;
 
-  # seccomp-fn (its own repository, the submodule seccomp-fn/): the filter's compiler, Kani and the proof's check.
-  inputs.seccomp-fn = { url = "path:./seccomp-fn"; inputs.nixpkgs.follows = "nixpkgs"; };
+  # seccomp-fn-verify (its own repository, the submodule seccomp-fn-verify/): the filter's proven
+  # compiler, Kani and kaniCheck. (seccomp-fn, the macro, is a plain path dependency: no flake.)
+  inputs.seccomp-fn-verify = { url = "path:./seccomp-fn-verify"; inputs.nixpkgs.follows = "nixpkgs"; };
 
-  outputs = { self, nixpkgs, seccomp-fn }:
+  outputs = { self, nixpkgs, seccomp-fn-verify }:
     let
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
       inherit (pkgs) lib;
 
       # unsharekKernel and mkUnsharek: nix/lib.nix, also importable without flakes (default.nix).
-      unsharek = import ./nix/lib.nix { inherit pkgs; seccompFn = seccomp-fn.lib; };
+      unsharek = import ./nix/lib.nix { inherit pkgs; seccompFnVerify = seccomp-fn-verify; };
       inherit (unsharek) unsharekKernel mkUnsharek;
       # Programs the suite and the smoke check run: nix/test-programs.nix.
       tp = import ./nix/test-programs.nix { inherit pkgs; };
-      # Kani, the model checker the filter's proof runs on (seccomp-fn/flake.nix).
-      kani = seccomp-fn.packages.${system}.kani;
+      # Kani, the model checker the filter's proof runs on (seccomp-fn-verify/flake.nix).
+      kani = seccomp-fn-verify.lib.kani;
     in
     {
       lib = { inherit unsharekKernel mkUnsharek; };

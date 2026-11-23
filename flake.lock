@@ -19,21 +19,21 @@
     "root": {
       "inputs": {
         "nixpkgs": "nixpkgs",
-        "seccomp-fn": "seccomp-fn"
+        "seccomp-fn-verify": "seccomp-fn-verify"
       }
     },
-    "seccomp-fn": {
+    "seccomp-fn-verify": {
       "inputs": {
         "nixpkgs": [
           "nixpkgs"
         ]
       },
       "locked": {
-        "path": "./seccomp-fn",
+        "path": "./seccomp-fn-verify",
         "type": "path"
       },
       "original": {
-        "path": "./seccomp-fn",
+        "path": "./seccomp-fn-verify",
         "type": "path"
       },
       "parent": []

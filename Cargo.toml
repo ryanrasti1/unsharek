@@ -1,9 +1,10 @@
 [workspace]
 resolver = "3"
-members = ["examples", "xtask", "crates/unsharek-tcb", "crates/unsharek-build", "crates/unsharek-erofs", "crates/unsharek", "crates/unsharek-fixtures", "crates/guest-tests", "crates/lkl-sys", "crates/unsharek-rt", "crates/unsharek-fs"]
-# seccomp-fn is its own repository and workspace (the submodule seccomp-fn/, no longer used by any
-# member); unsharek-tcb, also a submodule, depends on seccomp-fn and seccomp-fn-verify by pinned
-# git commits.
+members = ["examples", "xtask", "crates/unsharek-tcb", "crates/unsharek-build", "crates/unsharek-erofs", "crates/unsharek", "crates/unsharek-fixtures", "crates/guest-tests", "crates/lkl-sys", "crates/unsharek-rt", "crates/unsharek-fs", "seccomp-fn-verify"]
+# The filter's compiler and its proof, each its own repository, here as submodules: the submodules'
+# commits are the pins (unsharek-tcb takes both from [workspace.dependencies], by path).
+# seccomp-fn's repository is a workspace of its own (its crate is seccomp-fn/seccomp-fn), so it
+# is a path dependency, not a member.
 exclude = ["seccomp-fn"]
 
 [workspace.package]
@@ -13,6 +14,8 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/ryanrasti/exobox"
 
 [workspace.dependencies]
+seccomp-fn = { path = "seccomp-fn/seccomp-fn" }
+seccomp-fn-verify = { path = "seccomp-fn-verify" }
 clap = { version = "4", features = ["derive"] }
 # raw Linux syscalls, no libc: the runtime after lockdown
 rustix = { version = "1", default-features = false }
@@ -33,3 +36,8 @@ debug = 1
 
 [profile.release]
 panic = "abort"
+
+# seccomp-fn's own workspace names seccomp-fn-verify by git (for building it alone): here it is
+# the submodule, the one the tcb compiles with, so nothing is fetched.
+[patch."ssh://git@github.com/ryanrasti1/seccomp-fn-verify.git"]
+seccomp-fn-verify = { path = "seccomp-fn-verify" }

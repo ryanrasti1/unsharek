@@ -844,8 +844,8 @@ impl Guest {
         Ok(unsharek_tcb::Config::new(unsharek_rt::trap::gate_ip())
             .mode(self.link.mode)
             .grant(plain.iter().map(new))
-            .grant_as(unsharek_tcb::Kind::Eventfd, tokens.iter().map(new))
-            .grant_as(unsharek_tcb::Kind::Pidfd, pidfds.iter().map(new)))
+            .grant_as(unsharek_tcb::Expect::is("anon_inode:[eventfd]"), tokens.iter().map(new))
+            .grant_as(unsharek_tcb::Expect::is("anon_inode:[pidfd]"), pidfds.iter().map(new)))
     }
 
     /// A host fork of the guest's process, before lockdown: a template's instance. The child is a

@@ -2,8 +2,9 @@
 # `unsharekKernel` and `mkUnsharek`, the same functions the flake's `lib` has (flake.nix imports this).
 # The kernel's default source is the submodule crates/lkl-sys/linux: a checkout of unsharek used this way needs
 # it checked out (`git submodule update --init crates/lkl-sys/linux`, or a recursive clone).
-# `seccompFn` is seccomp-fn's flake's `lib` (Kani, kaniCheck); the flake passes its input's.
-{ pkgs, seccompFn ? (builtins.getFlake (toString ../seccomp-fn)).lib }:
+# `seccompFnVerify` is seccomp-fn-verify's flake (the submodule's: Kani, kaniCheck, its own
+# proofs); the flake passes its input.
+{ pkgs, seccompFnVerify ? builtins.getFlake (toString ../seccomp-fn-verify) }:
 let
   inherit (pkgs) lib;
   fs = lib.fileset;
@@ -22,10 +23,13 @@ let
         (fs.fileFilter (f: f.hasExt "md") ../crates)
         (fs.maybeMissing ../crates/lkl-sys/linux)
       ]))
-      # unsharek-tcb's README: a test checks its allowlist table against the filter
+      # unsharek-tcb's READMEs: a test checks their allowlist tables against the filter
       ../crates/unsharek-tcb/README.md
-      # seccomp-fn, the filter's compiler and proof (its own repository, a submodule)
+      ../crates/unsharek-tcb/src/plugin/README.md
+      # the filter's compiler (seccomp-fn) and its proof (seccomp-fn-verify): each its own
+      # repository, a submodule, a path dependency of the workspace
       (fs.difference ../seccomp-fn (fs.maybeMissing ../seccomp-fn/target))
+      (fs.difference ../seccomp-fn-verify (fs.maybeMissing ../seccomp-fn-verify/target))
       # A workspace member: cargo loads every member's manifest, built or not (the
       # package failed to build without it).
       (fs.difference ../examples (fs.fileFilter (f: f.hasExt "md") ../examples))
@@ -34,20 +38,23 @@ let
     ];
   };
 
-  # The filter's proof: unsharek-tcb's policy equal to its program, for every input and every
-  # param, by seccomp-fn's kaniCheck; with seccomp-fn's own examples' proofs. The package
-  # requires both (mkUnsharek), so a release's filter is proven.
+  # The filter's proof, in two parts, both required by the package (mkUnsharek), so a release's
+  # filter is proven: seccomp-fn-verify's own (its compiler, proven once for every tree, and the
+  # tree's lemmas: its checks.kani), and unsharek-tcb's `tree_is_policy` harnesses (the filter's
+  # tree equal to `policy()`, for every call, per mode and plugin choice), each expected by name.
   kaniCheck = pkgs.runCommand "unsharek-kani-proof" { } ''
     mkdir $out
-    cat ${seccompFn.proof}/summary ${tcbProof}/summary > $out/summary
+    cat ${seccompFnVerify.checks.${system}.kani}/summary ${tcbProof}/summary > $out/summary
   '';
-  tcbProof = seccompFn.kaniCheck {
+  tcbProof = seccompFnVerify.lib.kaniCheck {
     name = "unsharek-tcb-proof";
     inherit src;
     cargoLock = ../Cargo.lock;
     runs = [
-      [ "-p" "unsharek-tcb" "-j" "--output-format=terse" ]
+      [ "-p" "unsharek-tcb" "-j" "2" "--output-format=terse" ]
     ];
+    # src/filter.rs's `mod proof`: a harness per mode, file access and network
+    expectHarnesses = lib.concatMap (m: lib.concatMap (f: map (n: "filter::proof::${m}_${f}${n}") [ "" "_net" ]) [ "off" "ro" "rw" ]) [ "coroutine" "threaded" "fork" ];
   };
 
   # The kernel, built once by crates/lkl-sys/Makefile as its own derivation, in the layout lkl-sys's
