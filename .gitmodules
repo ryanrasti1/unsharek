@@ -9,7 +9,7 @@
 [submodule "crates/unsharek-tcb"]
 	path = crates/unsharek-tcb
 	url = git@github.com:ryanrasti1/unsharek-tcb.git
-	branch = preview
+	branch = main
 [submodule "seccomp-fn-verify"]
 	path = seccomp-fn-verify
 	url = git@github.com:ryanrasti1/seccomp-fn-verify.git
