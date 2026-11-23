@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# The headline numbers (bench/stats.py), in the devshell (direnv, or `nix develop -c`): builds
+# unsharek and the fixtures release, then measures. `cargo xtask stats` comes here; arguments go
+# to stats.py.
+set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$root"
+# shellcheck source=build_unsharek.sh
+source "$root/bench/build_unsharek.sh"
+build_unsharek
+cargo build --release -q -p unsharek-fixtures
+exec python3 "$root/bench/stats.py" "$@"

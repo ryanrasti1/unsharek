@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# The build benchmarks (bench/build_bench.py), in the devshell (direnv, or `nix develop -c`):
+# builds unsharek release, runs. Arguments go to build_bench.py, e.g.:
+#   bench/run --work rustc,xz --modes native,coroutine,threaded --reps 3
+#   bench/run --work make,cargo --modes native,fork
+#   bench/run --work rustc --modes native,fork,fork:stats --variant stats   (the counters)
+set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$root"
+# shellcheck source=build_unsharek.sh
+source "$root/bench/build_unsharek.sh"
+build_unsharek "$@"
+exec python3 "$root/bench/build_bench.py" "$@"

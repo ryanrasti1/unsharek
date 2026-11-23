@@ -1,0 +1,499 @@
+//! Performance budgets: what each mode costs, checked against native measured in the same run, or
+//! against an absolute budget where native has no equivalent (memory per sandbox, startup).
+//! Run with `cargo xtask perf` (its own nextest profile; not part of the default loop). Every trial
+//! prints its measurements; budgets come from capnix's tier A (noted at each) with headroom for a
+//! loaded machine, so a failure is a regression, not noise.
+
+use std::ffi::OsString;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+use std::{env, fs, thread};
+
+use unsharek_fixtures as fx;
+use libtest_mimic::{Arguments, Failed, Trial};
+
+mod common;
+use common::spawn_bounded;
+
+#[derive(Clone, Copy)]
+enum Mode {
+    Coroutine,
+    Threaded,
+    Fork,
+}
+
+impl Mode {
+    fn name(self) -> &'static str {
+        match self {
+            Mode::Coroutine => "coroutine",
+            Mode::Threaded => "threaded",
+            Mode::Fork => "fork",
+        }
+    }
+}
+
+const ALL: [Mode; 3] = [Mode::Coroutine, Mode::Threaded, Mode::Fork];
+
+/// Per-operation budgets (ns) for syscall_bench. Tier A: an LKL-served syscall ~1.5 µs (coroutine
+/// and parallel), a pipe write+read 3-30 µs, a futex ping-pong round trip 3-6 µs.
+const SYSCALL_BUDGET_NS: &[(&str, f64)] =
+    &[("getppid", 3_000.0), ("sigprocmask", 3_000.0), ("signal", 15_000.0), ("pingpong", 30_000.0)];
+/// Start to READY, median of 5. Tier A, cold boot with the small config: ~10 ms; fork of a
+/// template: 1.3-2.9 ms.
+const STARTUP_BUDGET: Duration = Duration::from_millis(30);
+const TEMPLATE_STARTUP_BUDGET: Duration = Duration::from_millis(10);
+/// PSS per idle sandbox, 8 at once. Tier A: ~4.2 MB cold with the small config (the kernel's pool
+/// and data are each sandbox's own); 1.8-2.9 MB forked from a template (fork mode the most).
+const MEM_STANDALONE_BUDGET_KB: u64 = 5 * 1024;
+const MEM_TEMPLATE_BUDGET_KB: u64 = 3 * 1024;
+/// Wall time against native for parallel work. Tier A: xz -T4 4.9 s against 5.1 native (lazy host
+/// threads); make -j4 of GNU hello 2.8 s against 0.8 (fork and exec dominate).
+const PARALLEL_RATIO: f64 = 1.5;
+const BUILD_RATIO: f64 = 4.0;
+/// The same work on one host thread (coroutine mode): four threads' worth of CPU, serialised.
+const COROUTINE_PARALLEL_RATIO: f64 = 6.0;
+
+/// A `--mount` argument: `path:ty`, at its own path.
+fn mount(path: impl AsRef<std::path::Path>, ty: &str) -> std::ffi::OsString {
+    let mut m = path.as_ref().as_os_str().to_owned();
+    m.push(":");
+    m.push(ty);
+    m
+}
+
+fn main() {
+    if let Ok(mode) = env::var("UNSHAREK_PERF_TEMPLATE") {
+        template_process(&mode);
+    }
+    let args = Arguments::from_args();
+    let mut trials = vec![];
+    for mode in ALL {
+        let m = mode.name();
+        trials.push(Trial::test(format!("syscalls::{m}"), move || syscalls(mode)));
+        trials.push(Trial::test(format!("startup::{m}"), move || startup(mode)));
+        trials.push(Trial::test(format!("mem_standalone::{m}"), move || mem_standalone(mode)));
+        // Fork mode: a template's children would need copies of the kernel's shared memory.
+        trials.push(Trial::test(format!("template::{m}"), move || template(mode)).with_ignored_flag(matches!(mode, Mode::Fork)));
+        trials.push(Trial::test(format!("compute::{m}"), move || compute(mode)));
+    }
+    // Coroutine mode too: its exit hung, a thread parked in an emulated futex when main ended.
+    trials.push(Trial::test("xz::coroutine", || xz(Mode::Coroutine)));
+    trials.push(Trial::test("xz::threaded", || xz(Mode::Threaded)));
+    trials.push(Trial::test("xz::fork", || xz(Mode::Fork)));
+    trials.push(Trial::test("make::fork", make));
+    libtest_mimic::run(&args, trials).exit();
+}
+
+/// `unsharek` in `mode`, the fixtures and `extra` allowed (a store path brings its closure).
+fn sandboxed(mode: Mode, prog: &Path, extra: &[PathBuf]) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_unsharek"));
+    cmd.args(["--mode", mode.name(), "--mount"]).arg(mount(fx::bin_dir(), "ro")).arg("--mount").arg(mount(fx::bin_dir(), "closure"));
+    for p in extra {
+        cmd.arg("--mount").arg(mount(p, "closure"));
+    }
+    // The environment is empty but for these: the workloads' PATH, as each caller sets it.
+    cmd.args(["--env", "PATH", "--env", "HOME", "--"]).arg(prog);
+    cmd
+}
+
+/// `cmd` exec'd in a user namespace of its own, which this process (its owner, in the parent
+/// namespace) holds every capability in: so it may read a sandbox's `/proc/<pid>/smaps_rollup`,
+/// which lockdown's `PR_SET_DUMPABLE` 0 closes to its plain owner (the PSS budgets' reading).
+fn own_userns(mut cmd: Command) -> Command {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: unshare between fork and exec, async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| if libc::unshare(libc::CLONE_NEWUSER) < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) });
+    }
+    cmd
+}
+
+fn external(var: &str) -> Result<PathBuf, Failed> {
+    env::var_os(var).map(PathBuf::from).ok_or_else(|| format!("{var} unset: run in the devshell (cargo xtask perf)").into())
+}
+
+/// The store path a program in the store belongs to (`/nix/store/<hash>-<name>`).
+fn store_path(p: &Path) -> PathBuf {
+    p.ancestors().find(|a| a.parent() == Some(Path::new("/nix/store"))).unwrap_or(p).to_path_buf()
+}
+
+/// Runs to the end; fails on a nonzero status. Returns stdout and the wall time.
+fn run_ok(mut cmd: Command, timeout: Duration) -> Result<(String, Duration), Failed> {
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let t = Instant::now();
+    let (status, _, out, err) = spawn_bounded(cmd, None, timeout)?;
+    let wall = t.elapsed();
+    if !status.success() {
+        return Err(format!("{status:?}\n--- stdout:\n{out}\n--- stderr:\n{err}").into());
+    }
+    Ok((out, wall))
+}
+
+/// The best wall time of `n` runs.
+fn best_of(n: usize, mut make: impl FnMut() -> Command, timeout: Duration) -> Result<Duration, Failed> {
+    let mut best = Duration::MAX;
+    for _ in 0..n {
+        best = best.min(run_ok(make(), timeout)?.1);
+    }
+    Ok(best)
+}
+
+fn ratio_check(what: &str, sandboxed: Duration, native: Duration, budget: f64) -> Result<(), Failed> {
+    let r = sandboxed.as_secs_f64() / native.as_secs_f64();
+    println!("{what}: {sandboxed:?} sandboxed, {native:?} native: {r:.2}x (budget {budget}x)");
+    if r > budget { Err(format!("{what}: {r:.2}x native, over {budget}x").into()) } else { Ok(()) }
+}
+
+fn syscalls(mode: Mode) -> Result<(), Failed> {
+    let prog = fx::bin("syscall_bench");
+    let (native, _) = run_ok(Command::new(&prog), Duration::from_secs(10))?;
+    let (out, _) = run_ok(sandboxed(mode, &prog, &[]), Duration::from_secs(10))?;
+    let parse = |s: &str, op: &str| -> Option<f64> {
+        s.lines().find_map(|l| l.strip_prefix(op)?.strip_prefix(' ')?.parse().ok())
+    };
+    let mut over = vec![];
+    for &(op, budget) in SYSCALL_BUDGET_NS {
+        let got = parse(&out, op).ok_or_else(|| format!("no {op} line in:\n{out}"))?;
+        let nat = parse(&native, op).unwrap_or(f64::NAN);
+        println!("{op}: {got:.0} ns ({nat:.0} native; budget {budget:.0})");
+        if got > budget {
+            over.push(format!("{op} {got:.0} ns > {budget:.0}"));
+        }
+    }
+    if over.is_empty() { Ok(()) } else { Err(over.join("; ").into()) }
+}
+
+/// Starts `cmd` (stdin and stdout piped) and waits for READY on its stdout.
+fn spawn_ready(mut cmd: Command) -> Result<(Child, Duration), Failed> {
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+    let t = Instant::now();
+    let mut child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
+    let out = child.stdout.take().unwrap();
+    let ready = wait_ready(out, Duration::from_secs(5));
+    let elapsed = t.elapsed();
+    if let Err(e) = ready {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+    }
+    Ok((child, elapsed))
+}
+
+fn wait_ready(r: impl std::io::Read + Send + 'static, timeout: Duration) -> Result<(), Failed> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut line = String::new();
+        let mut r = BufReader::new(r);
+        let ok = loop {
+            line.clear();
+            match r.read_line(&mut line) {
+                Ok(0) | Err(_) => break false,
+                Ok(_) if line.trim() == "READY" => break true,
+                Ok(_) => {}
+            }
+        };
+        let _ = tx.send(ok);
+        // Keep draining, so the program never blocks on a full pipe.
+        let _ = std::io::copy(&mut r, &mut std::io::sink());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("exited before READY".into()),
+        Err(_) => Err(format!("no READY within {timeout:?}").into()),
+    }
+}
+
+fn stop(mut child: Child) {
+    drop(child.stdin.take());
+    let _ = child.wait();
+}
+
+fn startup(mode: Mode) -> Result<(), Failed> {
+    let mut times = vec![];
+    for _ in 0..5 {
+        let (child, t) = spawn_ready(sandboxed(mode, &fx::bin("ready_idle"), &[]))?;
+        stop(child);
+        times.push(t);
+    }
+    times.sort();
+    let median = times[2];
+    println!("start to READY: median {median:?} of {times:?} (budget {STARTUP_BUDGET:?})");
+    if median > STARTUP_BUDGET { Err(format!("startup {median:?} > {STARTUP_BUDGET:?}").into()) } else { Ok(()) }
+}
+
+/// `key value`, appended to `$UNSHAREK_STATS_OUT` when it is set: the numbers `cargo xtask stats`
+/// (bench/stats.py) publishes, read from the same trials as the budgets.
+fn report(key: &str, value: f64) {
+    if let Some(path) = env::var_os("UNSHAREK_STATS_OUT") {
+        let line = format!("{key} {value}\n");
+        let _ = fs::OpenOptions::new().create(true).append(true).open(path).and_then(|mut f| f.write_all(line.as_bytes()));
+    }
+}
+
+/// Proportional set size of a process, in KB.
+fn pss_kb(pid: u32) -> Result<u64, Failed> {
+    let s = fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).map_err(|e| format!("smaps_rollup: {e}"))?;
+    s.lines()
+        .find_map(|l| l.strip_prefix("Pss:")?.trim().strip_suffix("kB")?.trim().parse().ok())
+        .ok_or_else(|| "no Pss line".into())
+}
+
+const N: usize = 8;
+
+fn mem_standalone(mode: Mode) -> Result<(), Failed> {
+    let measure = |make: &dyn Fn() -> Command| -> Result<u64, Failed> {
+        let mut kids = vec![];
+        for _ in 0..N {
+            kids.push(spawn_ready(make())?.0);
+        }
+        thread::sleep(Duration::from_millis(200));
+        let total: Result<u64, Failed> = kids.iter().map(|c| pss_kb(c.id())).sum();
+        kids.into_iter().for_each(stop);
+        Ok(total? / N as u64)
+    };
+    let native = measure(&|| Command::new(fx::bin("ready_idle")))?;
+    let per = measure(&|| own_userns(sandboxed(mode, &fx::bin("ready_idle"), &[])))?;
+    println!("PSS per idle sandbox, {N} at once: {per} KB ({native} KB native; budget {MEM_STANDALONE_BUDGET_KB} KB)");
+    if per > MEM_STANDALONE_BUDGET_KB {
+        return Err(format!("{per} KB per sandbox > {MEM_STANDALONE_BUDGET_KB} KB").into());
+    }
+    Ok(())
+}
+
+/// The template process (this binary re-run, `TEMPLATE` its mode): one sandbox built and set up
+/// (the fixtures' closure mounted), then a child forked per line on fd 3 (its control pipe: the
+/// children read stdin), each running `ready_idle` (stdout and stdin the template's: READY, then
+/// it waits for stdin's end). Prints `PID <pid>` per child, then waits for them all.
+fn template_process(mode: &str) -> ! {
+    let m = if mode == "threaded" { unsharek::Mode::Threaded } else { unsharek::Mode::Coroutine };
+    let prog = fx::bin("ready_idle");
+    let mut g = unsharek::Guest::boot(unsharek::GuestConfig { mode: m, ..Default::default() }).unwrap();
+    g.mount_closure(&[fx::bin_dir()]).unwrap();
+    let argv = [OsString::from(&prog)];
+    let mut kids = vec![];
+    // SAFETY: fd 3 is the control pipe the parent gave this process.
+    let mut ctl = BufReader::new(unsafe { <fs::File as std::os::fd::FromRawFd>::from_raw_fd(3) });
+    let mut line = String::new();
+    while ctl.read_line(&mut line).is_ok_and(|n| n > 0) {
+        line.clear();
+        let child = g
+            .spawn(|mut g| {
+                unsharek::lockdown(unsharek::SandboxConfig::new().grant([0, 1, 2]).pipe(|c| g.configure_sandbox(c))?)?;
+                Err(g.run(|| unsharek::execve(&argv, &[]))?)
+            })
+            .unwrap();
+        println!("PID {}", child.pid());
+        kids.push(child);
+    }
+    for k in kids {
+        let _ = k.wait();
+    }
+    std::process::exit(0)
+}
+
+/// Startup and memory of sandboxes forked from one template: start to READY per child (the
+/// template's fork, the child's own setup and exec), and PSS with `N` children at once.
+fn template(mode: Mode) -> Result<(), Failed> {
+    if matches!(mode, Mode::Fork) {
+        return Err("fork-mode templates are not implemented".into());
+    }
+    let (ctl_r, mut ctl) = std::io::pipe()?;
+    let mut cmd = Command::new(env::current_exe()?);
+    cmd.env("UNSHAREK_PERF_TEMPLATE", mode.name()).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        let fd = ctl_r.as_raw_fd();
+        // SAFETY: dup2 and fcntl between fork and exec, async-signal-safe. (If the pipe is fd 3
+        // already, dup2 does nothing and close-on-exec stays: cleared instead.)
+        unsafe {
+            cmd.pre_exec(move || {
+                let r = if fd == 3 { libc::fcntl(3, libc::F_SETFD, 0) } else { libc::dup2(fd, 3) };
+                // Its own user namespace: see `own_userns` (its children's PSS is read).
+                if r < 0 || libc::unshare(libc::CLONE_NEWUSER) < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+            });
+        }
+    }
+    let mut tmpl = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
+    drop(ctl_r);
+    let stdin = tmpl.stdin.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let out = tmpl.stdout.take().unwrap();
+    thread::spawn(move || {
+        for l in BufReader::new(out).lines() {
+            let Ok(l) = l else { break };
+            if tx.send(l).is_err() {
+                break;
+            }
+        }
+    });
+    let mut pids = vec![];
+    let mut times = vec![];
+    let result = (|| -> Result<(), Failed> {
+        for _ in 0..N {
+            let t = Instant::now();
+            writeln!(ctl, "go")?;
+            let (mut pid, mut ready) = (None, false);
+            while pid.is_none() || !ready {
+                let l = rx.recv_timeout(Duration::from_secs(5)).map_err(|_| "no READY within 5 s")?;
+                if let Some(p) = l.strip_prefix("PID ") {
+                    pid = p.parse::<u32>().ok();
+                } else if l.trim() == "READY" {
+                    ready = true;
+                }
+            }
+            times.push(t.elapsed());
+            pids.push(pid.unwrap());
+        }
+        Ok(())
+    })();
+    let per = result.and_then(|()| {
+        thread::sleep(Duration::from_millis(200));
+        let total: Result<u64, Failed> = pids.iter().map(|&p| pss_kb(p)).sum();
+        Ok(total? / N as u64)
+    });
+    drop(ctl); // the template's loop ends
+    drop(stdin); // and every child's stdin
+    let _ = tmpl.wait();
+    let per = per?;
+    times.sort();
+    let median = times[N / 2];
+    report(&format!("template_ready_ms {}", mode.name()), median.as_secs_f64() * 1e3);
+    report(&format!("template_pss_kb {}", mode.name()), per as f64);
+    println!("template children: start to READY median {median:?} of {times:?} (budget {TEMPLATE_STARTUP_BUDGET:?}); PSS {per} KB each, {N} at once (budget {MEM_TEMPLATE_BUDGET_KB} KB)");
+    let mut over = vec![];
+    if median > TEMPLATE_STARTUP_BUDGET {
+        over.push(format!("startup {median:?}"));
+    }
+    if per > MEM_TEMPLATE_BUDGET_KB {
+        over.push(format!("{per} KB per child"));
+    }
+    if over.is_empty() { Ok(()) } else { Err(over.join("; ").into()) }
+}
+
+/// Four CPU-bound threads. Host threads run them in parallel (budget against native); a
+/// coroutine sandbox runs them one at a time, which is reported, not checked.
+fn compute(mode: Mode) -> Result<(), Failed> {
+    let prog = fx::bin("par_compute");
+    let args = ["4", "100000000"];
+    let native = best_of(3, || {
+        let mut c = Command::new(&prog);
+        c.args(args);
+        c
+    }, Duration::from_secs(10))?;
+    let sb = best_of(3, || {
+        let mut c = sandboxed(mode, &prog, &[]);
+        c.args(args);
+        c
+    }, Duration::from_secs(20))?;
+    match mode {
+        Mode::Coroutine => {
+            println!("4 compute threads: {sb:?} as coroutines, {native:?} native (not checked: one host thread)");
+            Ok(())
+        }
+        _ => ratio_check("4 compute threads", sb, native, PARALLEL_RATIO),
+    }
+}
+
+/// A deterministic 16 MB of compressible text, in `dir`.
+fn xz_input(dir: &Path) -> Result<PathBuf, Failed> {
+    let f = dir.join("input.txt");
+    {
+        let mut w = std::io::BufWriter::new(fs::File::create(&f)?);
+        let mut x: u64 = 0x9e3779b97f4a7c15;
+        let words = ["sandbox", "kernel", "seccomp", "arena", "coroutine", "thread", "fork", "store", "\n"];
+        let mut n = 0;
+        while n < 16 << 20 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let word = words[(x % words.len() as u64) as usize];
+            w.write_all(word.as_bytes())?;
+            w.write_all(b" ")?;
+            n += word.len() + 1;
+        }
+    }
+    Ok(f)
+}
+
+/// xz -T4 on 16 MB: threads that compute and make syscalls. 2 MiB blocks, so the input splits
+/// across the threads (xz's default block is 3x the dictionary: 24 MB at -6, one thread here).
+fn xz(mode: Mode) -> Result<(), Failed> {
+    let xz = external("UNSHAREK_TEST_XZ")?;
+    let dir = tempfile::tempdir()?;
+    let input = xz_input(dir.path())?;
+    let args = |c: &mut Command| {
+        c.args(["-T4", "-3", "--block-size=2MiB", "-c"]).arg(&input);
+    };
+    let native = best_of(2, || {
+        let mut c = Command::new(&xz);
+        args(&mut c);
+        c
+    }, Duration::from_secs(20))?;
+    let sb = best_of(2, || {
+        let mut c = sandboxed(mode, &xz, &[store_path(&xz), input.parent().unwrap().to_path_buf()]);
+        args(&mut c);
+        c
+    }, Duration::from_secs(30))?;
+    // Coroutine mode runs the four threads on one CPU: it must finish (it hung at exit), at about
+    // the cost of xz -T1.
+    let budget = if matches!(mode, Mode::Coroutine) { COROUTINE_PARALLEL_RATIO } else { PARALLEL_RATIO };
+    ratio_check("xz -T4, 16 MB", sb, native, budget)
+}
+
+/// A C build: 16 files compiled by make -j4 (fork, exec, pipes, threads), from a copy in a
+/// writable directory.
+fn make() -> Result<(), Failed> {
+    let (bash, make, gcc, coreutils) = (
+        external("UNSHAREK_TEST_BASH")?,
+        external("UNSHAREK_TEST_MAKE")?,
+        external("UNSHAREK_TEST_GCC")?,
+        external("UNSHAREK_TEST_COREUTILS")?,
+    );
+    let tmp = tempfile::tempdir()?;
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src)?;
+    let mut objs = vec![];
+    for i in 0..16 {
+        let body: String = (0..40)
+            .map(|j| format!("int f{i}_{j}(int x) {{ int s = 0; for (int k = 0; k < x; k++) s += k * {j} ^ {i}; return s; }}\n"))
+            .collect();
+        fs::write(src.join(format!("f{i}.c")), body)?;
+        objs.push(format!("f{i}.o"));
+    }
+    fs::write(src.join("main.c"), "int main(void) { return 0; }\n")?;
+    fs::write(
+        src.join("Makefile"),
+        format!("prog: main.o {o}\n\t$(CC) -o $@ $^\n%.o: %.c\n\t$(CC) -O2 -c -o $@ $<\n", o = objs.join(" ")),
+    )?;
+    let path = [&gcc, &make, &coreutils.join("bin")]
+        .iter()
+        .map(|p| if p.is_file() { p.parent().unwrap().display().to_string() } else { p.display().to_string() })
+        .collect::<Vec<_>>()
+        .join(":");
+    let script = |work: &Path| {
+        format!(
+            "set -e; rm -rf {w}; cp -r {s} {w}; make -s -C {w} -j4 CC=gcc; {w}/prog",
+            w = work.display(),
+            s = src.display()
+        )
+    };
+    let native_work = tmp.path().join("native");
+    let native = best_of(2, || {
+        let mut c = Command::new(&bash);
+        c.env("PATH", &path).arg("-c").arg(script(&native_work));
+        c
+    }, Duration::from_secs(30))?;
+    let extra = [&bash, &make, &gcc, &coreutils].iter().map(|p| store_path(p)).chain([src.clone()]).collect::<Vec<_>>();
+    // unsharek itself needs the host's PATH (nix-store, for the closures); the program sees it after
+    // its own, where nothing is mounted.
+    let host_path = env::var("PATH").unwrap_or_default();
+    let sb = best_of(2, || {
+        let mut c = sandboxed(Mode::Fork, &bash, &extra);
+        c.env("PATH", format!("{path}:{host_path}")).arg("-c").arg(script(Path::new("/tmp/build")));
+        c
+    }, Duration::from_secs(60))?;
+    ratio_check("make -j4, 16 files", sb, native, BUILD_RATIO)
+}

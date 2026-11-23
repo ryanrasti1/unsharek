@@ -1,0 +1,39 @@
+[package]
+name = "guest-tests"
+version = "0.0.0"
+description = "Tests that run inside the guest: one test binary, one sandbox per test (nextest's run-wrapper)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# The tests' bodies live in the library (compiled once); each target below is the same list of
+# #[test]s (`guest_tests::all!`), and nextest runs each target its own way (.config/nextest.toml:
+# guest_native without a wrapper, the others under `run-in-guest MODE`).
+[lib]
+path = "src/lib.rs"
+# No unit tests of its own: its tests are the targets below.
+test = false
+
+[dependencies]
+libc.workspace = true
+
+# c/longjmp.c (build.rs)
+[build-dependencies]
+cc.workspace = true
+
+[[test]]
+name = "guest_native"
+path = "tests/guest_native.rs"
+
+[[test]]
+name = "guest_coroutine"
+path = "tests/guest_coroutine.rs"
+
+[[test]]
+name = "guest_threaded"
+path = "tests/guest_threaded.rs"
+
+[[test]]
+name = "guest_fork"
+path = "tests/guest_fork.rs"

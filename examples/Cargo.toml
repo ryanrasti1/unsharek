@@ -1,0 +1,24 @@
+[package]
+name = "unsharek-examples"
+version = "0.0.0"
+description = "Small programs showing unsharek's library API (examples/README.md walks through them)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+unsharek = { path = "../crates/unsharek" }
+# setup: an image built from a directory
+unsharek-erofs = { path = "../crates/unsharek-erofs" }
+# threads: par_compute, a small C guest
+unsharek-fixtures = { path = "../crates/unsharek-fixtures" }
+# the parents' side: fds into children, wait4 for the sandbox's rusage
+libc.workspace = true
+# net-policy: the provider's streams
+futures-io = "0.3"
+tempfile.workspace = true
+
+# the binaries' fixed-address link
+[build-dependencies]
+unsharek-build = { path = "../crates/unsharek-build" }

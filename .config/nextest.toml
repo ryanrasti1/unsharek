@@ -1,0 +1,49 @@
+# Wrapper scripts (experimental in nextest 0.9): the guest tests' run-wrappers, below.
+experimental = ["wrapper-scripts"]
+
+# Each trial bounds itself (crates/unsharek/tests/suite.rs: per-case timeouts of seconds); this is the
+# backstop for anything that doesn't, and for the unit tests.
+[profile.default]
+default-filter = "not binary(perf)"
+slow-timeout = { period = "5s", terminate-after = 4 }
+failure-output = "immediate-final"
+status-level = "fail"
+final-status-level = "fail"
+
+# cargo xtask perf: the budgets (crates/unsharek/tests/perf.rs), one at a time so they don't load each
+# other, each printing its measurements.
+[profile.perf]
+default-filter = "binary(perf)"
+test-threads = 1
+slow-timeout = { period = "30s", terminate-after = 4 }
+success-output = "immediate"
+
+# The guest tests (crates/guest-tests): one source, four test binaries. guest_native runs as is
+# (which checks the tests themselves); each of the others runs every test in a sandbox of its own,
+# in its mode. Listing (--list) runs natively: no list-wrapper.
+[scripts.wrapper.guest-coroutine]
+command = { command-line = "crates/guest-tests/run-in-guest coroutine", relative-to = "workspace-root" }
+
+[scripts.wrapper.guest-threaded]
+command = { command-line = "crates/guest-tests/run-in-guest threaded", relative-to = "workspace-root" }
+
+[scripts.wrapper.guest-fork]
+command = { command-line = "crates/guest-tests/run-in-guest fork", relative-to = "workspace-root" }
+
+[[profile.default.scripts]]
+filter = "binary(guest_coroutine)"
+run-wrapper = "guest-coroutine"
+
+[[profile.default.scripts]]
+filter = "binary(guest_threaded)"
+run-wrapper = "guest-threaded"
+
+[[profile.default.scripts]]
+filter = "binary(guest_fork)"
+run-wrapper = "guest-fork"
+
+# A guest test is bounded like a suite trial: 5 s, then killed (the default's 20 s backstop is for
+# trials that bound themselves).
+[[profile.default.overrides]]
+filter = "package(guest-tests)"
+slow-timeout = { period = "5s", terminate-after = 1 }

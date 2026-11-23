@@ -1,0 +1,77 @@
+# unsharek's kernel config (crates/lkl-sys/Makefile copies it to the build's .config and expands it with
+# olddefconfig). Started from capnix tier A's tiera_defconfig: the smallest kernel the programs
+# need. tools/lkl appends its host's kernel.config (64BIT and the like) to it.
+#
+# The arch's knobs (the series' item 14): a 1000 Hz tick (boot waits for kernel threads in
+# jiffies: 9-20 ms instead of 45-75 ms at 100; NO_HZ_IDLE keeps an idle kernel tickless either
+# way), 128 IRQs (each irq_desc is allocated at boot: 4096 cost ~1 MB), no tracing (~1 MiB of slab,
+# ~0.5 MiB of text).
+CONFIG_HZ=1000
+CONFIG_LKL_NR_IRQS=128
+# CONFIG_LKL_TRACING is not set
+# CONFIG_LOCALVERSION_AUTO is not set
+CONFIG_NO_HZ_IDLE=y
+CONFIG_HIGH_RES_TIMERS=y
+CONFIG_EXPERT=y
+# CONFIG_SYSFS_SYSCALL is not set
+# CONFIG_FUTEX is not set
+# CONFIG_SIGNALFD is not set
+# CONFIG_TIMERFD is not set
+# CONFIG_AIO is not set
+# CONFIG_ADVISE_SYSCALLS is not set
+# CONFIG_KALLSYMS is not set
+# CONFIG_PCI is not set
+# The guest store: erofs images of the program's closure on a block device over host memory
+# (memblk, crates/lkl-sys/README.md item 12), mounted at /nix/store. Nothing else of the block layer.
+CONFIG_BLOCK=y
+# CONFIG_BLOCK_LEGACY_AUTOLOAD is not set
+CONFIG_PARTITION_ADVANCED=y
+# CONFIG_MSDOS_PARTITION is not set
+# CONFIG_EFI_PARTITION is not set
+# CONFIG_MQ_IOSCHED_DEADLINE is not set
+# CONFIG_MQ_IOSCHED_KYBER is not set
+# CONFIG_BLK_DEV is not set
+CONFIG_EROFS_FS=y
+# CONFIG_EROFS_FS_XATTR is not set
+# CONFIG_EROFS_FS_ZIP is not set
+# CONFIG_EROFS_FS_BACKED_BY_FILE is not set
+# Host directories: Linux's own virtio-fs driver (FUSE over a virtqueue) on a virtio-mmio device
+# whose host side is unsharek-fs (crates/unsharek/src/hostfs.rs). Stock code: no kernel change.
+CONFIG_VIRTIO_MENU=y
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_MMIO=y
+CONFIG_FUSE_FS=y
+CONFIG_VIRTIO_FS=y
+# CONFIG_COMPAT_BRK is not set
+# CONFIG_VM_EVENT_COUNTERS is not set
+CONFIG_NET=y
+CONFIG_UNIX=y
+CONFIG_INET=y
+# CONFIG_IPV6 is not set
+# CONFIG_WIRELESS is not set
+# CONFIG_FW_LOADER is not set
+CONFIG_NETDEVICES=y
+# CONFIG_ETHERNET is not set
+# CONFIG_WLAN is not set
+CONFIG_NET_FAILOVER=y
+# CONFIG_VT is not set
+# CONFIG_DNOTIFY is not set
+# CONFIG_INOTIFY_USER is not set
+CONFIG_CRYPTO_BLAKE2B=y
+CONFIG_CRYPTO_SHA256=y
+CONFIG_CRYPTO_XXHASH=y
+CONFIG_CRYPTO_ANSI_CPRNG=y
+CONFIG_CRC16=y
+CONFIG_LIBCRC32C=y
+CONFIG_PRINTK_TIME=y
+# CONFIG_SLUB_DEBUG is not set
+# CONFIG_DEBUG_KERNEL is not set
+# CONFIG_DEBUG_MISC is not set
+# The small allocator: fewer caches and per-CPU structures, for a one-CPU kernel with a small pool.
+CONFIG_SLUB_TINY=y
+# No sysfs: 700 KB of slab and 3 ms of boot, and nothing the programs read needs it.
+# CONFIG_SYSFS is not set
+# CONFIG_IO_URING is not set
+# CONFIG_BPF_SYSCALL is not set
+# CONFIG_INET_DIAG is not set
+# CONFIG_FHANDLE is not set
